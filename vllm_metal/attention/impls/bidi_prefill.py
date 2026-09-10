@@ -130,6 +130,8 @@ def apply_bidirectional_segments(
         n_segments += 1
         for b0, b1 in active:
             a, b = max(q_lo, b0), min(q_hi, b1)
+            if b <= a:
+                continue
             k_lo = max(0, a - window + 1) if window is not None else 0
             slots = slot_indices(block_tables[i], block_size, k_lo, b)
             keys = gather_kv(k_cache, slots, head_dim)

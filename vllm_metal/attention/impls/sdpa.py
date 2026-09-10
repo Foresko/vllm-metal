@@ -43,6 +43,7 @@ from vllm_metal.attention.attention_contracts import (
 )
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
@@ -835,6 +836,30 @@ def sdpa_forward(
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
         )
+
+    # Gemma 4 vision: rows of image blocks attend bidirectionally on the
+    # adapter's layer kinds.  The kernel result stands for every other row.
+    if ctx.segment_bidi_ranges is not None:
+        kind = "sliding" if layer_sliding_window >= 0 else "full"
+        if kind in ctx.bidi_layer_kinds:
+            assert ctx.cu_seqlens is not None
+            out = apply_bidirectional_segments(
+                out,
+                q_3d,
+                kernel_k_cache,
+                kernel_v_cache,
+                block_tables=block_tables,
+                block_size=kernel_block_size,
+                cu_seqlens=ctx.cu_seqlens,
+                context_lens=ctx.context_lens,
+                ctx=ctx,
+                window=layer_sliding_window if kind == "sliding" else None,
+                scale=attn_scale,
+                head_dim=actual_head_dim,
+                softcap=attn_softcap,
+                sinks=sinks,
+                turboquant=kv_cache.turboquant,
+            )
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
