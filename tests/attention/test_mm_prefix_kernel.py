@@ -101,29 +101,48 @@ def _rows(cache: mx.array, table_row: list[int], lo: int, hi: int) -> np.ndarray
     return np.stack([arr[table_row[p // BLOCK], p % BLOCK] for p in range(lo, hi)])
 
 
-def _ref_attention(q, k, v, mask):
+def _ref_attention(q, k, v, mask, sinks=None):
     hd = q.shape[-1]
     n_rep = q.shape[1] // k.shape[1]
     k = np.repeat(k, n_rep, axis=1)
     v = np.repeat(v, n_rep, axis=1)
     scores = np.einsum("qhd,khd->hqk", q, k) * hd**-0.5
     scores = np.where(mask[None], scores, -1e30)
-    scores -= scores.max(axis=-1, keepdims=True)
-    probs = np.exp(scores)
-    probs /= probs.sum(axis=-1, keepdims=True)
+    if sinks is None:
+        m = scores.max(axis=-1, keepdims=True)
+        probs = np.exp(scores - m)
+        probs /= probs.sum(axis=-1, keepdims=True)
+    else:
+        # The sink logit joins the running max and the denominator but
+        # contributes no value row -- the softmax update the kernel runs
+        # (see tests/test_paged_attention_sinks.py).
+        sink = np.asarray(sinks, dtype=scores.dtype).reshape(-1, 1, 1)
+        m = np.maximum(scores.max(axis=-1, keepdims=True), sink)
+        probs = np.exp(scores - m)
+        probs /= probs.sum(axis=-1, keepdims=True) + np.exp(sink - m)
     return np.einsum("hqk,khd->qhd", probs, v)
 
 
 def _reference(
-    query, key_cache, value_cache, table_row, *, q_lo, seq_len, blocks, window
+    query,
+    key_cache,
+    value_cache,
+    table_row,
+    *,
+    q_lo,
+    seq_len,
+    blocks,
+    window,
+    sinks=None,
 ):
-    """fp32 attention of ``query`` rows ``[q_lo, q_lo + n)`` over keys ``[0, seq_len)``."""
+    """fp32 attention of rows ``[q_lo, q_lo + n)`` over keys ``[0, seq_len)``."""
     n = int(query.shape[0])
     return _ref_attention(
         np.array(query.astype(mx.float32)),
         _rows(key_cache, table_row, 0, seq_len),
         _rows(value_cache, table_row, 0, seq_len),
         _hf_mask(q_lo, n, seq_len, blocks, window),
+        sinks=None if sinks is None else np.array(sinks),
     )
 
 
@@ -162,9 +181,9 @@ def test_block_longer_than_window_matches_reference_and_recompute(
         window=window,
     )
     got_np, plain_np = np.array(got), np.array(plain)
-    # (б) fp32 reference with HF semantics.
+    # fp32 HF reference.
     np.testing.assert_allclose(got_np, ref, atol=ATOL, rtol=RTOL)
-    # (а) the phase-2 recompute over the same cache agrees.
+    # phase-2 recompute over the same cache agrees.
     ctx = PagedAttentionContext(
         slot_mapping=[],
         cu_seqlens=[0, n],
@@ -191,11 +210,64 @@ def test_block_longer_than_window_matches_reference_and_recompute(
     )
     mx.eval(recomputed)
     np.testing.assert_allclose(got_np, np.array(recomputed), atol=ATOL, rtol=RTOL)
-    # (г) rows before the block are bit-for-bit the plain kernel's.
+    # rows outside the block are the plain kernel's, bit for bit.
     split = block[0] - q_lo
     np.testing.assert_array_equal(got_np[:split], plain_np[:split])
-    # (е) the block rows really changed; a silently ignored buffer passes (г) alone.
+    # block rows really changed: a silently ignored buffer passes the check above.
     assert np.abs(got_np[split:] - plain_np[split:]).max() > 0.1
+
+
+def test_sinks_with_ranges_use_the_sinks_input_slot(force_tiled_prefill) -> None:
+    """Sinks and ranges together drive the ``_sk1_mp1`` pipeline.
+
+    The ranges buffer is read from ``inputs[use_sinks_ ? 7 : 6]``: with the
+    wrong index the kernel would take the sinks array for ranges and never
+    say so.  Both terms are pinned against one fp32 reference that folds the
+    sink into the softmax denominator.
+    """
+    n, seq_len, window = 256, 600, 128
+    block = (400, 600)
+    key_cache, value_cache, query, table = _setup(1, n=n, seq_len=seq_len)
+    # One non-zero logit per query head, large enough that a dropped or
+    # misread sink cannot hide inside ATOL/RTOL (it moves ~8% of the
+    # elements past the tolerance band).
+    sinks = mx.array([2.5, -1.0, 4.0, 1.5], dtype=mx.float32)
+    assert sinks.size == HEADS
+    common = {
+        "kv_lens": [seq_len],
+        "cu_seqlens_q": [0, n],
+        "window": window,
+        "sinks": sinks,
+    }
+    sinks_only = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        ranges=_range_rows([0, n], [seq_len], [[block]]),
+        **common,
+    )
+    q_lo = seq_len - n
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=q_lo,
+        seq_len=seq_len,
+        blocks=[block],
+        window=window,
+        sinks=sinks,
+    )
+    got_np, sinks_np = np.array(got), np.array(sinks_only)
+    # fp32 HF reference, sink folded into the denominator.
+    np.testing.assert_allclose(got_np, ref, atol=ATOL, rtol=RTOL)
+    split = block[0] - q_lo
+    # rows outside the block are the sinks-only kernel's, bit for bit.
+    np.testing.assert_array_equal(got_np[:split], sinks_np[:split])
+    # block rows really changed: a silently ignored buffer passes the check above.
+    assert np.abs(got_np[split:] - sinks_np[split:]).max() > 0.1
 
 
 def test_ranges_are_validated_before_dispatch() -> None:
@@ -226,6 +298,15 @@ def test_ranges_are_validated_before_dispatch() -> None:
             query.astype(mx.float32),
             key_cache,
             value_cache,
+            table,
+            ranges=ranges,
+            **common,
+        )
+    with pytest.raises(ValueError, match="tiled prefill kernel"):
+        _kernel(
+            query,
+            key_cache.astype(mx.bfloat16),
+            value_cache.astype(mx.bfloat16),
             table,
             ranges=ranges,
             **common,
@@ -449,7 +530,7 @@ def test_hybrid_block_size_translation() -> None:
 
 
 def test_all_minus_one_rows_match_the_plain_kernel_bitwise(force_tiled_prefill) -> None:
-    """(в) a buffer with no block is inert: identical tiles, identical math."""
+    """A buffer with no block is inert: identical tiles, identical math."""
     n, seq_len = 96, 300
     key_cache, value_cache, query, table = _setup(3, n=n, seq_len=seq_len)
     common = {"kv_lens": [seq_len], "cu_seqlens_q": [0, n], "window": 128}

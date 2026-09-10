@@ -336,8 +336,19 @@ def main() -> int:
     if not _run_vision_half(checkpoint, first_token):
         return 1
 
+    # Forward --checkpoint too: without it the child rebuilds workdir/tiny and
+    # the first-token comparison would run against a different model.
+    recompute_argv = [
+        sys.executable,
+        __file__,
+        "--recompute-check",
+        "--workdir",
+        str(args.workdir),
+    ]
+    if args.checkpoint:
+        recompute_argv += ["--checkpoint", str(args.checkpoint)]
     result = subprocess.run(
-        [sys.executable, __file__, "--recompute-check", "--workdir", str(args.workdir)],
+        recompute_argv,
         env={**os.environ, "VLLM_METAL_MM_PREFIX_PATH": "recompute"},
     )
     if result.returncode != 0:

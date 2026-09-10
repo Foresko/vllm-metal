@@ -78,8 +78,9 @@ warning containing `falling back to causal attention`; raise
 one step instead. `--max-num-batched-tokens` must be at least the image
 soft-token count plus two (282 by default, for the boi/eoi tokens) so a block
 fits one prefill step at all. TurboQuant KV cache compression is refused at
-load time in sidecar mode, since bidirectional image attention reads K/V back
-from the paged cache and needs it unquantized.
+load time in sidecar mode because neither image-attention path supports it: the
+tiled kernel has no TurboQuant variant, and the recompute reads K/V back from
+the paged cache unquantized.
 
 ## Text-Only Language Models
 

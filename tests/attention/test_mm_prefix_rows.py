@@ -15,7 +15,9 @@ from vllm_metal.attention.impls.mm_prefix import (
 )
 
 
-def _random_batch(rng: np.random.Generator):
+def _random_batch(
+    rng: np.random.Generator,
+) -> tuple[list[int], list[int], list[list[tuple[int, int]] | None]]:
     cu, context_lens, ranges = [0], [], []
     for _ in range(int(rng.integers(1, 5))):
         if rng.random() < 0.3:  # decode segment
