@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import mlx.core as mx
+import mlx.nn as nn
 import pytest
 import torch
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
@@ -22,10 +24,12 @@ from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.distributed.pipeline import PipelineGroup
+from vllm_metal.multimodal.gemma4 import Gemma4MultimodalAdapter, Gemma4VisionSidecar
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_lifecycle import GenerationLoadRequest, ModelLifecycle
 
 _TEXT_MODEL_ARGS = {
@@ -1505,3 +1509,142 @@ class TestResolveModelDims:
         assert runner.head_dim == 512
         assert runner.kv_heads_per_layer == [1, 1, 1, 1]
         assert runner.head_dim_per_layer == [256, 512, 256, 512]
+
+
+class _Gemma4Backbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, 8)
+        self.embed_scale = 8**0.5
+
+
+class _Gemma4TextModel:
+    """Shape of the mlx_lm ``gemma4.Model`` wrapper."""
+
+    def __init__(self) -> None:
+        # hidden_size/num_attention_heads/num_hidden_layers/num_key_value_heads
+        # are the minimum resolve_model_dims() needs beyond the brief's
+        # {"hidden_size": 8}; see task-10-report.md deviations.
+        self.args = {
+            "model_type": "gemma4",
+            "vocab_size": 16,
+            "text_config": {
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+            },
+        }
+        self.language_model = SimpleNamespace(model=_Gemma4Backbone())
+
+    def __call__(self, inputs, cache=None, input_embeddings=None):
+        return SimpleNamespace(logits=mx.zeros((1, inputs.shape[1], 16)))
+
+
+def _fake_sidecar() -> Gemma4VisionSidecar:
+    return Gemma4VisionSidecar(
+        vision_tower=object(),
+        embed_vision=object(),
+        pixel_dtype=mx.bfloat16,
+        num_parameters=1,
+        num_bytes=2,
+    )
+
+
+def _gemma4_runner_config() -> object:
+    return _runner_model_config(
+        hf_config=SimpleNamespace(
+            model_type="gemma4",
+            architectures=["Gemma4ForConditionalGeneration"],
+            text_config=SimpleNamespace(model_type="gemma4_text", hidden_size=8),
+        ),
+        is_multimodal_model=True,
+    )
+
+
+class TestTextSidecarLifecycle:
+    def _force_mode(self, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+        monkeypatch.setattr(
+            DefaultModelAdapter,
+            "multimodal_backbone_mode",
+            lambda self, model_config, speculative_config=None: mode,
+        )
+
+    def test_text_sidecar_loads_mlx_lm_backbone_and_sidecar(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        loaded_paths: list[Path] = []
+        sidecar = _fake_sidecar()
+
+        def _load(path: Path, **_: object) -> Gemma4VisionSidecar:
+            loaded_paths.append(Path(path))
+            return sidecar
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_load)
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        assert loaded_paths == [Path("stub-model")]
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Gemma4MultimodalAdapter)
+        assert runner._multimodal_adapter.text_model() is runner.model
+        assert runner._forward_model is runner.model
+        assert runner.encoder_cache is not None
+
+    def test_text_only_mode_keeps_today_s_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_only")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
+
+    def test_drafter_with_text_sidecar_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+        runner.vllm_config.speculative_config = object()
+
+        with pytest.raises(RuntimeError, match="speculative decoding"):
+            lifecycle.load()
+
+    def test_sidecar_failure_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+
+        def _boom(path: Path, **_: object) -> Gemma4VisionSidecar:
+            raise ValueError("Missing parameters: vision_tower.encoder")
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_boom)
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        with pytest.raises(ValueError, match="Missing parameters"):
+            lifecycle.load()
+
+    def test_from_runner_without_mode_method_falls_back_to_predicate(self) -> None:
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+        request = GenerationLoadRequest.from_runner(
+            runner, SimpleNamespace(should_force_text_backbone=lambda _: True)
+        )
+        assert request.backbone_mode == "text_only"
+        assert request.is_vlm is False
