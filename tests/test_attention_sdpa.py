@@ -1213,20 +1213,21 @@ class TestBidirectionalDispatch:
     """Image-block rows take the kernel path or the recompute per env."""
 
     @staticmethod
-    def _cache() -> MetalPagedKVCache:
+    def _cache(dtype: mx.Dtype = mx.float16) -> MetalPagedKVCache:
         """Gemma 4's layer mix over upstream storage: one full-attention layer
         at block 32 beside one sliding layer (window 1024) at block 16."""
+        torch_dtype = torch.float32 if dtype == mx.float32 else torch.float16
         full = FullAttentionSpec(
             block_size=32,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
-            dtype=torch.float16,
+            dtype=torch_dtype,
         )
         sliding = SlidingWindowSpec(
             block_size=16,
             num_kv_heads=_N_KV_HEADS,
             head_size=_HEAD_DIM,
-            dtype=torch.float16,
+            dtype=torch_dtype,
             sliding_window=1024,
             page_size_padded=full.page_size_bytes,
         )
@@ -1254,8 +1255,9 @@ class TestBidirectionalDispatch:
         path: str | None = None,
         supports: bool = True,
         repeat: int = 1,
+        dtype: mx.Dtype = mx.float16,
     ):
-        cache = self._cache()
+        cache = self._cache(dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
         prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
         ctx = get_context()
@@ -1331,6 +1333,15 @@ class TestBidirectionalDispatch:
         assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
         _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
         assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_float32_cache_falls_back_to_recompute(self) -> None:
+        """The tiled kernel has no float32 instantiation (the recompute path)."""
+        bidi, spy, ctx = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, dtype=mx.float32
+        )
+        assert bidi.call_count == 1
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
 
     def test_unsupported_ops_fall_back_to_recompute(self) -> None:
         bidi, spy, _ = self._run(
