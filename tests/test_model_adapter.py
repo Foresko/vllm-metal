@@ -1324,6 +1324,30 @@ class TestMultimodalBackboneMode:
             == "native"
         )
 
+    def test_text_only_env_forces_non_gemma4_models_text_only(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only")
+        reset_config()
+        sentinel = SimpleNamespace(language_model_only=False, limit_per_prompt={})
+        config = SimpleNamespace(
+            model="mlx-community/Qwen3-VL-4B-Instruct-4bit",
+            revision=None,
+            trust_remote_code=False,
+            mm_processor_kwargs=None,
+            quantization=None,
+            multimodal_config=sentinel,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_vl",
+                architectures=["Qwen3VLForConditionalGeneration"],
+                quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            ),
+        )
+
+        assert DefaultModelAdapter().multimodal_backbone_mode(config) == "text_only"
+        DefaultModelAdapter().normalize_model_config(config)
+        assert config.multimodal_config is None
+
     @pytest.mark.parametrize(
         ("kwargs", "speculative", "reason"),
         [
