@@ -30,7 +30,15 @@ from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 # ``max_soft_tokens * pooling_kernel_size**2`` patches of 3*16*16 values.
 PROFILE_NUM_PATCHES = 2520
 PROFILE_PATCH_DIM = 768
-PROFILE_GRID = (45, 56)  # (rows, cols): 45 * 56 == 2520, so no -1 padding
+# (rows, cols): 42 * 60 == 2520, so no -1 padding. mlx-vlm's VisionPooler
+# bins patches into a pooling grid *by position* (kernel_idx = floor(x / k) +
+# (max_x // k) * floor(y / k), k = pooling_kernel_size); both sides must be
+# exact multiples of k or patches from different bins alias into the same
+# output row, silently pooling to fewer than PROFILE_NUM_EMBEDS rows. 42 =
+# 3*14 and 60 = 3*20 pool cleanly to 14*20 == 280 rows. Real images never
+# hit this: Gemma4ImageProcessor always pads both dimensions to a multiple
+# of patch_size * pooling_kernel_size == 48.
+PROFILE_GRID = (42, 60)
 PROFILE_NUM_EMBEDS = 280
 
 
@@ -181,7 +189,7 @@ class Gemma4MultimodalAdapter:
         return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:
-        """One maximal image feature for ``profile_run``: a full 45x56 patch grid."""
+        """One maximal image feature for ``profile_run``: a full 42x60 patch grid."""
         rows, cols = PROFILE_GRID
         grid_y, grid_x = np.mgrid[0:rows, 0:cols]
         positions = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1).astype(np.int64)

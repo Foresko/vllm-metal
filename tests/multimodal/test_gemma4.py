@@ -278,9 +278,39 @@ class TestProfileFeatures:
         assert tuple(pixels.shape) == (2520, 768)
         assert tuple(positions.shape) == (2520, 2)
         assert int(positions.min()) == 0  # a real grid, no -1 padding
-        assert int(positions[:, 0].max()) == 55 and int(positions[:, 1].max()) == 44
+        assert int(positions[:, 0].max()) == 59 and int(positions[:, 1].max()) == 41
 
     def test_profile_feature_encodes_to_280_rows(self) -> None:
         adapter, _ = _adapter()
         [result] = adapter.encode_multimodal(adapter.profile_features())
         assert result.hidden_states.shape == (280, HIDDEN)
+
+
+class TestProfileFeaturesRealPooler:
+    def test_profile_grid_pools_to_280_rows_in_mlx_vlm_vision_tower(self) -> None:
+        from mlx_vlm.models.gemma4.config import VisionConfig
+        from mlx_vlm.models.gemma4.vision import VisionModel
+
+        tower = VisionModel(
+            VisionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=8,
+                global_head_dim=8,
+                patch_size=16,
+                pooling_kernel_size=3,
+                default_output_length=280,
+                position_embedding_size=10240,
+            )
+        )
+        adapter, _ = _adapter()
+        [feature] = adapter.profile_features()
+        pixel_values = mx.array(feature.data["pixel_values"].data.numpy())
+        positions = mx.array(feature.data["pixel_position_ids"].data.numpy())
+
+        pooled = tower(pixel_values, positions)
+
+        assert pooled.shape[:2] == (1, 280)
