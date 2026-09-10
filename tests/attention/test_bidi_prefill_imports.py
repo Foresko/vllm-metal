@@ -28,3 +28,28 @@ def test_bidi_prefill_import_boundary() -> None:
         [sys.executable, "-c", code], check=False, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_mm_prefix_import_boundary() -> None:
+    """``mm_prefix`` is a numpy-only leaf: no MLX, torch, sdpa, runner or worker."""
+    code = textwrap.dedent(
+        """
+        import sys
+
+        import vllm_metal.attention.impls.mm_prefix
+
+        for name in (
+            "mlx.core",
+            "torch",
+            "vllm_metal.attention.impls.sdpa",
+            "vllm_metal.v1.model_runner",
+            "vllm_metal.v1.worker",
+        ):
+            if name in sys.modules:
+                raise SystemExit(f"{name} was imported")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], check=False, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
