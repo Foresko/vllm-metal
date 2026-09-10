@@ -48,7 +48,7 @@ Native multimodal support currently targets image-only vision-language requests 
 | Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 (dense) | 🔵 | native multimodal paged generation | image input, no video; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, causal attention over image tokens | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
@@ -61,9 +61,22 @@ no speculative decoding is configured; otherwise the model stays text-only and
 the reason is logged. A repo id such as the example above only resolves when
 it is already fully cached locally (`hf download <repo>` first) — the sidecar
 never triggers a download itself, and an uncached repo id falls back to
-text-only with a logged reason exactly like a nonexistent local path. Image
-tokens attend causally in this version; bidirectional attention inside an
-image block is not implemented yet.
+text-only with a logged reason exactly like a nonexistent local path.
+
+Image soft tokens attend bidirectionally to each other inside their own image
+block on sliding-window layers, matching HF's
+`create_masks_for_vision_model` semantics; full-attention layers and text
+tokens stay causal. The engine logs `Metal: bidirectional image attention: N
+segment(s), M block(s), R row(s)` the first time a prefill batch recomputes an
+image block this way. An image block that does not fit inside one prefill
+step falls back to causal attention for the rest of the request, with a
+warning containing `falling back to causal attention`; raise
+`--max-num-batched-tokens` or lower `--max-num-seqs` to keep the block inside
+one step instead. `--max-num-batched-tokens` must be at least the image
+soft-token count plus two (282 by default, for the boi/eoi tokens) so a block
+fits one prefill step at all. TurboQuant KV cache compression is refused at
+load time in sidecar mode, since bidirectional image attention reads K/V back
+from the paged cache and needs it unquantized.
 
 ## Text-Only Language Models
 

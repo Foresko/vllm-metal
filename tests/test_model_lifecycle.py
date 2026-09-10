@@ -1792,3 +1792,51 @@ class TestTextSidecarLifecycle:
             return any(_reaches_sidecar_submodule(child) for child in children)
 
         assert _reaches_sidecar_submodule(runner.model) is False
+
+    def test_turboquant_with_text_sidecar_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+        monkeypatch.setattr(
+            model_lifecycle, "get_config", lambda: SimpleNamespace(turboquant=True)
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        with pytest.raises(RuntimeError, match="unquantized KV cache"):
+            lifecycle.load()
+
+    def test_softcap_with_text_sidecar_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+        model_config = _gemma4_runner_config()
+        model_config.hf_config.text_config.attn_logit_softcapping = 50.0
+        lifecycle, _ = _make_lifecycle(model_config=model_config)
+
+        with pytest.raises(RuntimeError, match="softcap"):
+            lifecycle.load()
+
+    def test_attention_sinks_with_text_sidecar_are_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        text_model.language_model.model.layers = [
+            SimpleNamespace(self_attn=SimpleNamespace(sinks=mx.zeros((2,))))
+        ]
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar,
+            "load",
+            staticmethod(lambda p, **_: _fake_sidecar()),
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        with pytest.raises(RuntimeError, match="attention sinks"):
+            lifecycle.load()

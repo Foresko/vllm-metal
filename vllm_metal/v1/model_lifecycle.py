@@ -18,6 +18,7 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
+from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
@@ -303,6 +304,20 @@ class ModelLifecycle:
                 "Gemma 4 vision sidecar cannot run with speculative decoding; "
                 "disable the drafter or set VLLM_METAL_MULTIMODAL_MODE=text-only."
             )
+        if get_config().turboquant:
+            raise RuntimeError(
+                "Gemma 4 vision sidecar needs an unquantized KV cache (bidirectional "
+                "image attention reads it back); drop turboquant from "
+                "--additional-config or run text-only"
+            )
+        text_config = (
+            getattr(request.hf_config, "text_config", None) or request.hf_config
+        )
+        if getattr(text_config, "attn_logit_softcapping", None):
+            raise RuntimeError(
+                "Gemma 4 vision sidecar: bidirectional image attention does not "
+                "support logit softcap or attention sinks"
+            )
         model, tokenizer = self._load_generation_model(
             request.model_name,
             False,
@@ -312,6 +327,13 @@ class ModelLifecycle:
             gguf_source=None,
             lazy_weights=request.lazy_weights,
         )
+        backbone = getattr(getattr(model, "language_model", None), "model", None)
+        for layer in getattr(backbone, "layers", None) or []:
+            if getattr(getattr(layer, "self_attn", None), "sinks", None) is not None:
+                raise RuntimeError(
+                    "Gemma 4 vision sidecar: bidirectional image attention does not "
+                    "support logit softcap or attention sinks"
+                )
         assert request.sidecar_checkpoint is not None  # set by from_runner
         sidecar = Gemma4VisionSidecar.load(request.sidecar_checkpoint)
         return LoadedGenerationModel(

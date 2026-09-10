@@ -41,6 +41,8 @@ wins. Outputs are unaffected.
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 - `text-only`: force the text-only backbone for every multimodal checkpoint, including Gemma 4 (the pre-sidecar behaviour).
 
+The Gemma 4 vision sidecar sets `disable_chunked_mm_input` on the scheduler config so an image block is never split across prefill steps (needed for the bidirectional image attention recompute; see [Supported Models](supported_models.md)).
+
 ## Speculative Decoding
 
 Pass `--speculative-config` with a JSON object to enable speculative decoding.
