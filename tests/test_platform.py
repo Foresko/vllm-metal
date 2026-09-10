@@ -31,6 +31,7 @@ from tests.stub_runner import make_gemma4_mixed_mha_runner
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.v1.cache_policy import WorkerCachePlanner
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -569,7 +570,7 @@ class TestMetalPlatform:
         # normalize clears multimodal_config (text-only backbone).
         monkeypatch.setattr(
             "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
-            lambda _self, mc: setattr(mc, "multimodal_config", None),
+            lambda _self, mc, **_kwargs: setattr(mc, "multimodal_config", None),
         )
         reset_config()
         try:
@@ -726,7 +727,7 @@ class TestMetalPlatform:
         # normalize leaves multimodal_config in place (genuine multimodal model).
         monkeypatch.setattr(
             "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
-            lambda _self, _mc: None,
+            lambda _self, _mc, **_kwargs: None,
         )
         reset_config()
         try:
@@ -1832,6 +1833,120 @@ class TestMetalPlatform:
         assert installed == "2000"
         assert "MLX_MAX_MB_PER_BUFFER" not in os.environ
         vm_config.reset_config()
+
+    def _sidecar_config(
+        self,
+        monkeypatch,
+        *,
+        max_num_batched_tokens: int,
+        mm_processor_kwargs=None,
+        mamba_cache_mode: str = "none",
+        is_mm_prefix_lm: bool = True,
+    ):
+        monkeypatch.setattr(
+            DefaultModelAdapter,
+            "multimodal_backbone_mode",
+            lambda self, mc, speculative_config=None: "text_sidecar",
+        )
+        monkeypatch.setattr(
+            DefaultModelAdapter,
+            "normalize_model_config",
+            lambda self, mc, speculative_config=None: None,
+        )
+        self._patch_stt_resolution(monkeypatch, False)
+        model_config = SimpleNamespace(
+            model="test-model",
+            disable_cascade_attn=False,
+            tokenizer=None,
+            max_model_len=32768,
+            multimodal_config=None,
+            hf_config=SimpleNamespace(model_type="qwen3"),
+            is_hybrid=False,
+            quantization=None,
+            is_mm_prefix_lm=is_mm_prefix_lm,
+        )
+        model_config.hf_config = SimpleNamespace(
+            model_type="gemma4",
+            text_config=SimpleNamespace(model_type="gemma4_text"),
+            vision_config=SimpleNamespace(default_output_length=280),
+        )
+        model_config.multimodal_config = SimpleNamespace()
+        model_config.mm_processor_kwargs = mm_processor_kwargs
+        return self._platform_config(
+            model_config=model_config,
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[], mamba_cache_mode=mamba_cache_mode
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=False,
+                long_prefill_token_threshold=0,
+                max_num_batched_tokens=max_num_batched_tokens,
+            ),
+        )
+
+    def test_sidecar_mode_disables_chunked_mm_input(self, monkeypatch) -> None:
+        vllm_config = self._sidecar_config(monkeypatch, max_num_batched_tokens=1024)
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is True
+
+    def test_sidecar_mode_leaves_align_mode_alone(self, monkeypatch) -> None:
+        vllm_config = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=1024, mamba_cache_mode="align"
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
+
+    def test_sidecar_mode_without_prefix_lm_leaves_the_flag_alone(
+        self, monkeypatch
+    ) -> None:
+        """No bidirectional vision attention -> upstream's gate says don't force
+        the flag, but the sidecar still needs a whole image block in one step."""
+        vllm_config = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=1024, is_mm_prefix_lm=False
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
+
+        too_small = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=281, is_mm_prefix_lm=False
+        )
+        with pytest.raises(RuntimeError, match=">= 282"):
+            MetalPlatform.check_and_update_config(too_small)
+
+    @pytest.mark.parametrize(
+        "kwargs, needed",
+        [
+            (None, 282),
+            ({"max_soft_tokens": 1120}, 1122),
+            ({"images_kwargs": {"max_soft_tokens": 1120}}, 1122),
+            ({"max_soft_tokens": 999}, 282),  # invalid value: default geometry
+        ],
+    )
+    def test_sidecar_mode_checks_the_batch_budget(
+        self, monkeypatch, kwargs, needed
+    ) -> None:
+        vllm_config = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=needed - 1, mm_processor_kwargs=kwargs
+        )
+        with pytest.raises(RuntimeError, match=f">= {needed}"):
+            MetalPlatform.check_and_update_config(vllm_config)
+        ok = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=needed, mm_processor_kwargs=kwargs
+        )
+        MetalPlatform.check_and_update_config(ok)
+
+    def test_text_only_mode_does_not_touch_the_scheduler(self, monkeypatch) -> None:
+        # 128, not the brief's 64: SchedulerConfig now validates
+        # max_num_batched_tokens >= max_num_seqs (default 128). Still well
+        # under the sidecar budget floor (282) this mode must not enforce.
+        vllm_config = self._sidecar_config(monkeypatch, max_num_batched_tokens=128)
+        monkeypatch.setattr(
+            DefaultModelAdapter,
+            "multimodal_backbone_mode",
+            lambda self, mc, speculative_config=None: "text_only",
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
 
 class TestKvBudgetBytes:

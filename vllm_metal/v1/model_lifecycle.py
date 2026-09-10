@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -17,7 +18,9 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
+from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
@@ -79,6 +82,7 @@ class GenerationLoadRequest:
     tokenizer_config: Mapping[str, Any]
     gguf_source: GGUFLoadSource | None
     lazy_weights: bool
+    backbone_mode: str = "native"
 
     @classmethod
     def from_runner(
@@ -90,7 +94,29 @@ class GenerationLoadRequest:
         # vLLM model_config shape varies across backends.
         hf_config = getattr(model_config, "hf_config", None)
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
-        if model_adapter.should_force_text_backbone(hf_config):
+        mode_fn = getattr(model_adapter, "multimodal_backbone_mode", None)
+        if mode_fn is not None:
+            backbone_mode = mode_fn(
+                model_config,
+                speculative_config=runner.vllm_config.speculative_config,
+            )
+        else:
+            backbone_mode = (
+                "text_only"
+                if model_adapter.should_force_text_backbone(hf_config)
+                else "native"
+            )
+        if (
+            getattr(model_config, "multimodal_config", None) is not None
+            and backbone_mode == "text_only"
+        ):
+            raise RuntimeError(
+                "Metal: backbone mode drifted between the API process "
+                "(multimodal_config kept) and EngineCore (text-only decided); "
+                "the checkpoint directory or VLLM_METAL_MULTIMODAL_MODE changed "
+                "between the two — restart with a stable configuration"
+            )
+        if backbone_mode == "text_only":
             is_vlm = False
         if is_vlm and model_config.quantization == "gguf":
             raise NotImplementedError(
@@ -126,6 +152,7 @@ class GenerationLoadRequest:
             tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
             gguf_source=gguf_source,
             lazy_weights=lazy_weights,
+            backbone_mode=backbone_mode,
         )
 
 
@@ -136,6 +163,7 @@ class LoadedGenerationModel:
     model: Any
     tokenizer: Any
     model_args: dict[str, Any]
+    sidecar: Any | None = None
 
 
 class ModelLifecycle:
@@ -230,6 +258,8 @@ class ModelLifecycle:
         self,
         request: GenerationLoadRequest,
     ) -> LoadedGenerationModel:
+        if request.backbone_mode == "text_sidecar" and request.is_vlm:
+            return self._load_text_sidecar(request)
         model, tokenizer = self._load_generation_model(
             request.model_name,
             request.is_vlm,
@@ -243,6 +273,58 @@ class ModelLifecycle:
             model=model,
             tokenizer=tokenizer,
             model_args=self._extract_model_args(model, request.is_vlm),
+        )
+
+    def _load_text_sidecar(
+        self, request: GenerationLoadRequest
+    ) -> LoadedGenerationModel:
+        """Gemma 4: mlx_lm text model as today, plus the mlx-vlm vision sidecar.
+
+        Everything here is fatal on failure: the frontend already accepts
+        images for this model, so a silent text-only fallback would leave
+        the engine to die on the first image request.
+        """
+        if self._runner.vllm_config.speculative_config is not None:
+            raise RuntimeError(
+                "Gemma 4 vision sidecar cannot run with speculative decoding; "
+                "disable the drafter or set VLLM_METAL_MULTIMODAL_MODE=text-only."
+            )
+        if get_config().turboquant:
+            raise RuntimeError(
+                "Gemma 4 vision sidecar needs an unquantized KV cache (bidirectional "
+                "image attention reads it back); drop turboquant from "
+                "--additional-config or run text-only"
+            )
+        text_config = (
+            getattr(request.hf_config, "text_config", None) or request.hf_config
+        )
+        if getattr(text_config, "attn_logit_softcapping", None):
+            raise RuntimeError(
+                "Gemma 4 vision sidecar: bidirectional image attention does not "
+                "support logit softcap or attention sinks"
+            )
+        model, tokenizer = self._load_generation_model(
+            request.model_name,
+            False,
+            model_config=request.model_config,
+            target_dtype=request.target_dtype,
+            tokenizer_config=request.tokenizer_config,
+            gguf_source=None,
+            lazy_weights=request.lazy_weights,
+        )
+        backbone = getattr(getattr(model, "language_model", None), "model", None)
+        for layer in getattr(backbone, "layers", None) or []:
+            if getattr(getattr(layer, "self_attn", None), "sinks", None) is not None:
+                raise RuntimeError(
+                    "Gemma 4 vision sidecar: bidirectional image attention does not "
+                    "support logit softcap or attention sinks"
+                )
+        sidecar = Gemma4VisionSidecar.load(Path(request.model_name))
+        return LoadedGenerationModel(
+            model=model,
+            tokenizer=tokenizer,
+            model_args=self._extract_model_args(model, False),
+            sidecar=sidecar,
         )
 
     def _install_encoder_pooling_model(
@@ -409,7 +491,7 @@ class ModelLifecycle:
         # Adapter state follows the effective VLM mode, not the raw config flag.
         multimodal_adapter = (
             self._model_adapter.build_multimodal_adapter(
-                loaded_model.model, request.hf_config
+                loaded_model.model, request.hf_config, sidecar=loaded_model.sidecar
             )
             if request.is_vlm
             else None

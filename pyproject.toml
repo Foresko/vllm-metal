@@ -151,4 +151,5 @@ asyncio_mode = "auto"
 # fast loop (CI already does this).
 markers = [
     "slow: opt-in performance or long-running tests",
+    "network: tests that download from Hugging Face",
 ]

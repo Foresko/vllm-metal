@@ -794,6 +794,12 @@ constant bool use_sinks [[function_constant(40)]];
 constant bool use_turboquant [[function_constant(50)]];
 constant int k_bits [[function_constant(60)]];
 constant int v_bits [[function_constant(70)]];  // V quantization bit width (default 3)
+// Gemma 4 vision (mm_prefix): the tiled prefill kernel receives, per query
+// row, the inclusive absolute [start, end] of the image block the row lies in
+// ((-1, -1) elsewhere) and unmasks that block on top of the causal rule.
+// 120 is the first index free in this translation unit (10..70 above,
+// 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
+constant bool use_mm_prefix [[function_constant(120)]];
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to

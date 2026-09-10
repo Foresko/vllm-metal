@@ -32,10 +32,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from vllm.logger import init_logger
 
+import vllm_metal.envs as envs
 from vllm_metal.attention.attention_contracts import (
     DEFAULT_ATTENTION_CONTRACT,
     AttentionContract,
@@ -43,10 +46,17 @@ from vllm_metal.attention.attention_contracts import (
 )
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
+from vllm_metal.attention.impls.mm_prefix import (
+    build_mm_prefix_rows,
+    resolve_mm_prefix_path,
+)
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
 from vllm_metal.metal import get_ops
+
+logger = init_logger(__name__)
 
 # === Metal kernel block-size support ===
 # The paged attention Metal kernel is template-instantiated for these block
@@ -218,6 +228,34 @@ def _kernel_metadata(
         )
         ctx.kernel_metadata_cache[key] = meta
     return meta
+
+
+def _mm_prefix_path(ops: Any) -> str:
+    """The configured image-block attention path for this forward.
+
+    The ``getattr`` probe guards the shape of the *ops object* -- test fakes
+    and any future ops module that does not implement the entry point -- not
+    a stale native build: both ``paged_attention_primitive`` call sites pass
+    ``mm_prefix_ranges=`` unconditionally, so a native build predating the
+    keyword fails at the call regardless of what this reports.
+    """
+    supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
+    return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
+
+
+def _mm_prefix_rows(ctx: PagedAttentionContext) -> mx.array | None:
+    """Per-row block ranges for the kernel, built once per forward (see context)."""
+    if not ctx.mm_prefix_rows_built:
+        assert ctx.segment_bidi_ranges is not None
+        assert ctx.cu_seqlens is not None
+        rows = build_mm_prefix_rows(
+            ctx.cu_seqlens, ctx.context_lens, ctx.segment_bidi_ranges
+        )
+        if rows is not None:
+            ctx.mm_prefix_row_count = int((rows[:, 0] >= 0).sum())
+            ctx.mm_prefix_rows = mx.array(rows)
+        ctx.mm_prefix_rows_built = True
+    return ctx.mm_prefix_rows
 
 
 def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
@@ -758,6 +796,29 @@ def sdpa_forward(
         )
 
     ops = get_ops()
+    # Gemma 4 vision: rows of image blocks attend bidirectionally on the
+    # adapter's layer kinds.  The kernel path hands the per-row block ranges
+    # to the tiled prefill kernel; the recompute path (phase 2, the reference)
+    # recomputes those rows after the kernel with MLX SDPA.
+    mm_prefix_ranges: mx.array | None = None
+    recompute_after_kernel = False
+    if ctx.segment_bidi_ranges is not None:
+        kind = "sliding" if layer_sliding_window >= 0 else "full"
+        if kind in ctx.bidi_layer_kinds:
+            assert ctx.cu_seqlens is not None
+            # The tiled kernel has no float32 instantiation, so float32
+            # caches keep the phase-2 recompute instead of reaching the
+            # primitive's eager ValueError mid-request.
+            if _mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
+                mm_prefix_ranges = _mm_prefix_rows(ctx)
+                if mm_prefix_ranges is not None and not ctx.bidi_logged:
+                    ctx.bidi_logged = True
+                    logger.info(
+                        "Metal: mm_prefix ranges on %d row(s)",
+                        ctx.mm_prefix_row_count,
+                    )
+            else:
+                recompute_after_kernel = True
     out = mx.array(0)
     if kv_cache.turboquant:
         # Reshape scale/zero caches for kernel block size
@@ -807,6 +868,7 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
+            mm_prefix_ranges=mm_prefix_ranges,
         )
     else:
         ops.paged_attention_primitive(
@@ -825,6 +887,27 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
+            mm_prefix_ranges=mm_prefix_ranges,
+        )
+
+    if recompute_after_kernel:
+        assert ctx.cu_seqlens is not None
+        out = apply_bidirectional_segments(
+            out,
+            q_3d,
+            kernel_k_cache,
+            kernel_v_cache,
+            block_tables=block_tables,
+            block_size=kernel_block_size,
+            cu_seqlens=ctx.cu_seqlens,
+            context_lens=ctx.context_lens,
+            ctx=ctx,
+            window=layer_sliding_window if layer_sliding_window >= 0 else None,
+            scale=attn_scale,
+            head_dim=actual_head_dim,
+            softcap=attn_softcap,
+            sinks=sinks,
+            turboquant=kv_cache.turboquant,
         )
 
     # Reshape + strip padding back to actual head_dim before o_proj.

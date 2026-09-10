@@ -4,7 +4,7 @@
 import logging
 import os
 import platform as py_platform
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import psutil
 import torch
@@ -51,6 +51,33 @@ def _pick_mb_buffer_default(
     if usable_gib >= _MB_BUFFER_MIN_USABLE_GIB:
         return _MB_BUFFER_DEFAULT
     return None
+
+
+def _apply_vision_sidecar_scheduler_policy(vllm_config: Any, model_config: Any) -> None:
+    """Gemma 4 sidecar: keep an image block inside one prefill step."""
+    from vllm_metal.multimodal.gemma4.geometry import effective_image_soft_tokens
+
+    scheduler_config = vllm_config.scheduler_config
+    # Same gate as upstream (vllm/platforms/cuda.py): only a prefix-LM
+    # multimodal model needs its image block kept whole. vLLM derives the flag
+    # for Gemma 4 from ``text_config.use_bidirectional_attention == "vision"``.
+    if (
+        getattr(model_config, "is_mm_prefix_lm", False)
+        and getattr(vllm_config.cache_config, "mamba_cache_mode", None) != "align"
+    ):
+        scheduler_config.disable_chunked_mm_input = True
+        logger.info(
+            "Metal: Gemma 4 vision sidecar keeps each image block inside one "
+            "prefill step where the scheduler allows (disable_chunked_mm_input)"
+        )
+    soft_tokens = effective_image_soft_tokens(model_config)
+    needed = soft_tokens + 2
+    if scheduler_config.max_num_batched_tokens < needed:
+        raise RuntimeError(
+            f"Gemma 4 vision sidecar needs --max-num-batched-tokens >= {needed} "
+            f"so an image block ({soft_tokens} soft tokens plus boi/eoi) fits one "
+            "prefill step"
+        )
 
 
 class MetalPlatform(Platform):
@@ -766,7 +793,20 @@ class MetalPlatform(Platform):
             model_config.disable_cascade_attn = True
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
-            DefaultModelAdapter().normalize_model_config(model_config)
+            DefaultModelAdapter().normalize_model_config(
+                model_config, speculative_config=vllm_config.speculative_config
+            )
+
+            # Backbone-mode resolution below inspects hf_config fields (e.g.
+            # architectures) that only genuinely multimodal checkpoints carry;
+            # skip it for text-only models so a bare hf_config doesn't crash
+            # config-time checks that never touch vision at all.
+            if getattr(model_config, "multimodal_config", None) is not None:
+                mode = DefaultModelAdapter().multimodal_backbone_mode(
+                    model_config, speculative_config=vllm_config.speculative_config
+                )
+                if mode == "text_sidecar":
+                    _apply_vision_sidecar_scheduler_policy(vllm_config, model_config)
 
             # DP + multimodal: the multimodal tensor-IPC queue only supports DP=1
             # (vllm/v1/engine/utils.py). Checked AFTER normalize_model_config so a

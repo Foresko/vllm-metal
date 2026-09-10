@@ -12,9 +12,11 @@ Metal kernel dispatch itself is covered by the end-to-end smoke tests,
 not here.
 """
 
+import logging
+import os
 from collections.abc import Iterator
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -633,8 +635,12 @@ class TestPrepareSDPAQKV:
 
 
 class _PagedRoutingOpsSpy:
-    def __init__(self) -> None:
+    def __init__(self, *, supports_mm_prefix: bool = True) -> None:
         self.calls: list[SimpleNamespace] = []
+        self._supports_mm_prefix = supports_mm_prefix
+
+    def supports_mm_prefix(self) -> bool:
+        return self._supports_mm_prefix
 
     def reshape_and_cache(
         self,
@@ -664,10 +670,12 @@ class _PagedRoutingOpsSpy:
         _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
+        mm_prefix_ranges: mx.array | None = None,
     ) -> None:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
+        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
 
 
 class TestSDPAForward:
@@ -1178,6 +1186,173 @@ class TestSDPAForward:
         assert cache.value_caches[0] is original_v_cache
         assert captured["key_cache"] is original_k_cache
         assert captured["value_cache"] is original_v_cache
+
+
+class TestBidirectionalDispatch:
+    """Image-block rows take the kernel path or the phase-2 recompute per env."""
+
+    def _run(
+        self,
+        kinds: frozenset[str],
+        ranges,
+        layer_idx: int,
+        *,
+        path: str | None = None,
+        supports: bool = True,
+        repeat: int = 1,
+        dtype: mx.Dtype = mx.float16,
+    ):
+        layout = MHAKVCacheLayout(
+            num_blocks=11,
+            tensor_sizes=(1, 1),
+            layers=(
+                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
+                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
+            ),
+            group_block_sizes=(32, 16),
+            slot_layers=((0,), (1,)),
+        )
+        cache = MetalPagedKVCache.from_layout(layout, dtype)
+        # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
+        prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
+        ctx = get_context()
+        assert ctx is not None
+        ctx.segment_bidi_ranges = ranges
+        ctx.bidi_layer_kinds = kinds
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        x = mx.ones((_BATCH, 3, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, 3, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        bidi = MagicMock(side_effect=lambda out, *a, **k: out)
+        spy = _PagedRoutingOpsSpy(supports_mm_prefix=supports)
+        env = {k: v for k, v in os.environ.items() if k != "VLLM_METAL_MM_PREFIX_PATH"}
+        if path is not None:
+            env["VLLM_METAL_MM_PREFIX_PATH"] = path
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, 3, _N_HEADS * _HEAD_DIM)),
+            ),
+            patch.object(sdpa_mod, "apply_bidirectional_segments", bidi),
+        ):
+            for _ in range(repeat):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=layer_idx)
+        return bidi, spy, ctx
+
+    def test_recompute_path_keeps_the_phase2_splice(self) -> None:
+        ranges = [None, [(0, 2)]]
+        bidi, spy, _ = self._run(frozenset({"sliding"}), ranges, 0, path="recompute")
+        assert bidi.call_count == 0
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 1, path="recompute")
+        assert bidi.call_count == 1
+        kwargs = bidi.call_args.kwargs
+        assert kwargs["window"] == 1024
+        assert kwargs["head_dim"] == _HEAD_DIM
+        assert kwargs["block_size"] == 16
+        assert kwargs["cu_seqlens"] == [0, 1, 3]
+        assert kwargs["turboquant"] is False
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+
+    def test_kernel_path_passes_rows_only_on_configured_layers(self) -> None:
+        ranges = [None, [(0, 2)]]
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 0)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+        bidi, spy, ctx = self._run(frozenset({"sliding"}), ranges, 1)
+        assert bidi.call_count == 0
+        rows = spy.calls[-1].mm_prefix_ranges
+        assert rows is not None and rows.dtype == mx.int32
+        assert rows.tolist() == [[-1, -1], [0, 1], [0, 1]]
+        assert ctx.mm_prefix_row_count == 2
+        assert ctx.bidi_logged is True
+
+    def test_full_kind_takes_the_kernel_path_on_full_layers(self) -> None:
+        ranges = [None, [(0, 2)]]
+        _, spy, _ = self._run(frozenset({"full"}), ranges, 0)
+        assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
+        _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_float32_cache_falls_back_to_recompute(self) -> None:
+        """The tiled kernel has no float32 instantiation (phase-2 recompute)."""
+        bidi, spy, ctx = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, dtype=mx.float32
+        )
+        assert bidi.call_count == 1
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+
+    def test_unsupported_ops_fall_back_to_recompute(self) -> None:
+        bidi, spy, _ = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, supports=False
+        )
+        assert bidi.call_count == 1
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_unknown_path_value_raises(self) -> None:
+        with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, path="kernle")
+
+    def test_rows_are_built_once_per_forward(self) -> None:
+        with patch.object(
+            sdpa_mod, "build_mm_prefix_rows", wraps=sdpa_mod.build_mm_prefix_rows
+        ) as build:
+            _, spy, ctx = self._run(
+                frozenset({"sliding"}), [None, [(0, 2)]], 1, repeat=3
+            )
+        assert build.call_count == 1
+        first = spy.calls[0].mm_prefix_ranges
+        assert all(c.mm_prefix_ranges is first for c in spy.calls)
+        assert ctx.mm_prefix_rows is first
+
+    def test_no_rows_inside_a_block_passes_none(self) -> None:
+        _, spy, ctx = self._run(frozenset({"sliding"}), [None, [(10, 12)]], 1)
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is True
+        assert ctx.bidi_logged is False
+
+    def test_no_ranges_never_enters(self) -> None:
+        bidi, spy, _ = self._run(frozenset({"sliding"}), None, 1)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_kernel_path_logs_the_row_count_once(self) -> None:
+        records: list[logging.LogRecord] = []
+
+        class _Sink(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        logger = logging.getLogger("vllm_metal.attention.impls.sdpa")
+        sink = _Sink(level=logging.INFO)
+        logger.addHandler(sink)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, repeat=2)
+        finally:
+            logger.setLevel(previous)
+            logger.removeHandler(sink)
+        lines = [
+            r.getMessage() for r in records if "mm_prefix ranges" in r.getMessage()
+        ]
+        assert lines == ["Metal: mm_prefix ranges on 2 row(s)"]
 
 
 # === Laguna g_proj per-head gating ===

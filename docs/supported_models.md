@@ -46,6 +46,41 @@ Native multimodal support currently targets image-only vision-language requests 
 | --- | --- | --- | --- | --- |
 | Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit` |
+
+Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
+selective logits, intermediate forward); only `vision_tower` and `embed_vision`
+are loaded from the checkpoint through mlx-vlm. The sidecar activates in
+`VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
+safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
+builds (the checkpoint's `processor_config.json` needs a `video_processor`
+block with transformers 5.14+), the text config has no per-layer inputs, and
+no speculative decoding is configured; otherwise the model stays text-only and
+the reason is logged. A repo id such as the example above only resolves when
+it is already fully cached locally (`hf download <repo>` first) — the sidecar
+never triggers a download itself, and an uncached repo id falls back to
+text-only with a logged reason exactly like a nonexistent local path.
+
+Image soft tokens attend bidirectionally to each other inside their own image
+block on sliding-window layers, matching HF's
+`create_masks_for_vision_model` semantics; full-attention layers and text
+tokens stay causal. By default the tiled Metal prefill kernel applies this
+mask itself from a per-row range buffer (vLLM's `mm_prefix` contract) and the
+engine logs `Metal: mm_prefix ranges on R row(s)` the first time a prefill
+batch carries image-block rows; `VLLM_METAL_MM_PREFIX_PATH=recompute` selects
+the reference path instead, which recomputes the block rows with MLX SDPA
+after the kernel and logs `Metal: bidirectional image attention: N
+segment(s), M block(s), R row(s)`. Both paths give the same mask; the kernel
+path attends each row once. An image block that does not fit inside one prefill
+step falls back to causal attention for the rest of the request, with a
+warning containing `falling back to causal attention`; raise
+`--max-num-batched-tokens` or lower `--max-num-seqs` to keep the block inside
+one step instead. `--max-num-batched-tokens` must be at least the image
+soft-token count plus two (282 by default, for the boi/eoi tokens) so a block
+fits one prefill step at all. TurboQuant KV cache compression is refused at
+load time in sidecar mode because neither image-attention path supports it: the
+tiled kernel has no TurboQuant variant, and the recompute reads K/V back from
+the paged cache unquantized.
 
 ## Text-Only Language Models
 

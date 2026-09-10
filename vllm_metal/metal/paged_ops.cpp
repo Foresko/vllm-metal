@@ -379,7 +379,8 @@ static void dispatch_paged_attention_tiled(
     const array& block_tables, const array& seq_lens,
     const array& cu_seqlens_q,
     int block_size, int max_seq_len, int sliding_window,
-    TileConfig cfg, Stream s, const array* sinks) {
+    TileConfig cfg, Stream s, const array* sinks,
+    const array* mm_prefix_ranges) {
   auto& d = metal::device(s.device);
 
   int total_q_tokens = static_cast<int>(query.shape(0));
@@ -388,6 +389,7 @@ static void dispatch_paged_attention_tiled(
 
   int total_q_blocks = total_q_tokens / cfg.BQ + num_seqs;
   bool use_sinks = sinks != nullptr;
+  bool use_mm_prefix = mm_prefix_ranges != nullptr;
 
   auto dt = dtype_to_metal(query.dtype());
   std::string base_kname =
@@ -397,12 +399,17 @@ static void dispatch_paged_attention_tiled(
       "_bq" + std::to_string(cfg.BQ) +
       "_tk" + std::to_string(cfg.TILE_KV) +
       "_nt" + std::to_string(cfg.NUM_THREADS);
-  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
+  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
+                          + "_mp" + (use_mm_prefix ? "1" : "0");
 
   auto* lib = d.get_library("paged_attention_v2_kern");
+  // Both constants are set on every dispatch: a function that references an
+  // unset function constant fails pipeline creation.  MLX caches pipelines
+  // by hash_name, so each constant combination needs its own suffix.
   auto* kernel = d.get_kernel(
       base_kname, lib, hash_name,
-      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_mm_prefix, MTL::DataType::DataTypeBool, NS::UInteger(120)}});
 
   const int t_size = static_cast<int>(query.itemsize());
   // S, O, m, l are register-resident, so no S/O/M/L threadgroup buffers.
@@ -426,6 +433,11 @@ static void dispatch_paged_attention_tiled(
   enc.set_bytes(scale, 9);
   if (use_sinks) {
     enc.set_input_array(*sinks, 18);
+  }
+  // Slot 22 is bound here, not in bind_paged_attn_buffers: that helper is
+  // shared with the per-token kernel, where slot 22 is TurboQuant's k_codes.
+  if (use_mm_prefix) {
+    enc.set_input_array(*mm_prefix_ranges, 22);
   }
 
   enc.dispatch_threadgroups(
@@ -452,7 +464,10 @@ static void dispatch_paged_attention_v2_online(
     // Attention sinks (optional): one float per query head, a learned logit
     // that joins the softmax denominator without contributing a value row.
     // nullptr for every model that has no sinks, which is the common case.
-    const array* sinks = nullptr) {
+    const array* sinks = nullptr,
+    // Gemma 4 vision image-block ranges (optional): one inclusive absolute
+    // [start, end] key range per query row, implemented in the tiled kernel.
+    const array* mm_prefix_ranges = nullptr) {
   int head_size = static_cast<int>(query.shape(2));
 
   // Tiled kernel for prefill batches, matching vLLM Triton's 2D/3D dispatch
@@ -479,7 +494,10 @@ static void dispatch_paged_attention_v2_online(
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
-    if (nax_eligible(query.dtype(), head_size, block_size)) {
+    // Image-block ranges are implemented in the tiled kernel only; NAX keeps
+    // its causal/window mask, so a batch with ranges bypasses it.
+    if (mm_prefix_ranges == nullptr
+        && nax_eligible(query.dtype(), head_size, block_size)) {
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -492,9 +510,18 @@ static void dispatch_paged_attention_v2_online(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
           block_tables, seq_lens, cu_seqlens_q,
-          block_size, max_seq_len, sliding_window, *cfg, s, sinks);
+          block_size, max_seq_len, sliding_window, *cfg, s, sinks,
+          mm_prefix_ranges);
       return;
     }
+  }
+  if (mm_prefix_ranges != nullptr) {
+    // paged_attention_primitive_fn already rejects every such batch eagerly;
+    // this guard keeps the mask from being dropped silently should a new
+    // routing condition appear above.
+    throw std::invalid_argument(
+        "mm_prefix ranges need the tiled prefill kernel, but this batch was "
+        "routed to the per-token kernel");
   }
 
   // Fallback: original per-token kernel
@@ -729,13 +756,15 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       Stream stream, int num_kv_heads, float scale, float softcap,
       int block_size, int max_seq_len, int sliding_window,
       bool use_turboquant = false, int k_bits = 8, int v_bits = 3,
-      int window_seqlen_q = 1, bool use_sinks = false)
+      int window_seqlen_q = 1, bool use_sinks = false,
+      bool use_mm_prefix = false)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
         sliding_window_(sliding_window),
         use_turboquant_(use_turboquant), k_bits_(k_bits), v_bits_(v_bits),
-        window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks) {}
+        window_seqlen_q_(window_seqlen_q), use_sinks_(use_sinks),
+        use_mm_prefix_(use_mm_prefix) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -748,12 +777,16 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
     //                 key_scale_cache, value_scale_cache, key_zero_cache, v_centroids]
     // Sinks append one array at slot 6.  TQ and sinks are mutually exclusive
     // (rejected in paged_attention_primitive_fn), so the two never collide.
+    // mm_prefix ranges (Gemma 4 vision) append one more array after
+    // everything else: slot 6 plain, slot 7 with sinks; TQ + mm_prefix is
+    // rejected in paged_attention_primitive_fn, so slot 10 never occurs.
     out.set_data(allocator::malloc(out.nbytes()));
     const array* ks = use_turboquant_ ? &inputs[6] : nullptr;
     const array* vs = use_turboquant_ ? &inputs[7] : nullptr;
     const array* kz = use_turboquant_ ? &inputs[8] : nullptr;
     const array* vc = use_turboquant_ ? &inputs[9] : nullptr;
     const array* sk = use_sinks_ ? &inputs[6] : nullptr;
+    const array* mp = use_mm_prefix_ ? &inputs[use_sinks_ ? 7 : 6] : nullptr;
     dispatch_paged_attention_v2_online(
         out,
         inputs[0],               // query
@@ -762,7 +795,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         inputs[3], inputs[4], inputs[5],  // block_tables, seq_lens, cu_seqlens_q
         block_size_, max_seq_len_, sliding_window_, window_seqlen_q_,
         stream(),
-        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk);
+        ks, vs, kz, vc, use_turboquant_, k_bits_, v_bits_, sk, mp);
   }
 
   const char* name() const override { return "PagedAttention"; }
@@ -778,7 +811,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->k_bits_ == k_bits_
         && rhs->v_bits_ == v_bits_
         && rhs->window_seqlen_q_ == window_seqlen_q_
-        && rhs->use_sinks_ == use_sinks_;
+        && rhs->use_sinks_ == use_sinks_
+        && rhs->use_mm_prefix_ == use_mm_prefix_;
   }
 
  private:
@@ -793,6 +827,7 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   int v_bits_;
   int window_seqlen_q_;
   bool use_sinks_;
+  bool use_mm_prefix_;
 };
 
 static array paged_attention_primitive_fn(
@@ -808,7 +843,8 @@ static array paged_attention_primitive_fn(
     const array* key_zero_cache = nullptr,
     const array* v_centroids = nullptr,
     int v_bits = 3, int window_seqlen_q = 1,
-    const array* sinks = nullptr) {
+    const array* sinks = nullptr,
+    const array* mm_prefix_ranges = nullptr) {
   if (sinks != nullptr) {
     // Upstream MLX refuses the same combination
     // (mlx_lm/models/base.py: "Quantized SDPA does not support attention
@@ -836,6 +872,38 @@ static array paged_attention_primitive_fn(
       throw std::invalid_argument(
           "sinks must be float32; the kernel reads them as device float and "
           "folds them into a float32 softmax accumulator");
+    }
+  }
+  if (mm_prefix_ranges != nullptr) {
+    // Every routing condition of dispatch_paged_attention_v2_online that
+    // would bypass the tiled kernel is rejected here, eagerly, so a caller
+    // gets a ValueError instead of a silently causal image block.
+    if (use_turboquant) {
+      throw std::invalid_argument(
+          "mm_prefix ranges are not supported with TurboQuant quantized KV; "
+          "the Gemma 4 vision sidecar refuses TurboQuant at load time");
+    }
+    if (mm_prefix_ranges->dtype() != int32) {
+      throw std::invalid_argument("mm_prefix_ranges must be int32");
+    }
+    const int total_q = static_cast<int>(query.shape(0));
+    if (mm_prefix_ranges->ndim() != 2
+        || static_cast<int>(mm_prefix_ranges->shape(0)) != total_q
+        || mm_prefix_ranges->shape(1) != 2) {
+      throw std::invalid_argument(
+          "mm_prefix_ranges must have shape (query rows, 2) = (" +
+          std::to_string(total_q) + ", 2)");
+    }
+    const int num_segments = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+    const int head_size_q = static_cast<int>(query.shape(2));
+    if (query.dtype() == float32 || query.dtype() != key_cache.dtype()
+        || window_seqlen_q > 1 || total_q <= num_segments
+        || !select_tile_config(head_size_q)) {
+      throw std::invalid_argument(
+          "mm_prefix ranges need the tiled prefill kernel: a non-float32 "
+          "query matching the KV cache dtype, at least one multi-token "
+          "segment, no spec-decode verification window and a head size in "
+          "{64, 96, 128, 256, 512}");
     }
   }
   // window_seqlen_q must equal the longest cu_seqlens_q segment: window-mode
@@ -902,22 +970,20 @@ static array paged_attention_primitive_fn(
       default_stream(Device::gpu),
       num_kv_heads, scale, softcap,
       block_size, max_seq_len, sliding_window,
-      use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr);
+      use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
+      mm_prefix_ranges != nullptr);
+  std::vector<array> inputs = {query, key_cache, value_cache,
+                               block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {
-    return array(
-        query.shape(), query.dtype(), std::move(prim),
-        {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
-         *key_scale_cache, *value_scale_cache, *key_zero_cache, *v_centroids});
+    inputs.insert(inputs.end(), {*key_scale_cache, *value_scale_cache,
+                                 *key_zero_cache, *v_centroids});
+  } else if (sinks != nullptr) {
+    inputs.push_back(*sinks);
   }
-  if (sinks != nullptr) {
-    return array(
-        query.shape(), query.dtype(), std::move(prim),
-        {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q,
-         *sinks});
+  if (mm_prefix_ranges != nullptr) {
+    inputs.push_back(*mm_prefix_ranges);
   }
-  return array(
-      query.shape(), query.dtype(), std::move(prim),
-      {query, key_cache, value_cache, block_tables, seq_lens, cu_seqlens_q});
+  return array(query.shape(), query.dtype(), std::move(prim), std::move(inputs));
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,6 +1717,10 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("enabled"),
         "Runtime kill-switch for the NAX prefill kernel (tests / A-B runs).");
 
+  m.def("supports_mm_prefix", []() { return true; },
+        "True when paged_attention_primitive accepts mm_prefix_ranges "
+        "(Gemma 4 vision image-block attention in the tiled prefill kernel).");
+
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
            nb::handle key_cache_h, nb::handle value_cache_h,
@@ -1803,9 +1873,12 @@ NB_MODULE(_paged_ops, m) {
            const std::string& quant_type,
            int v_bits,
            int window_seqlen_q,
-           nb::object sinks_h) {
+           nb::object sinks_h,
+           nb::object mm_prefix_ranges_h) {
           const array* sk = sinks_h.is_none()
               ? nullptr : nb::inst_ptr<array>(sinks_h);
+          const array* mp = mm_prefix_ranges_h.is_none()
+              ? nullptr : nb::inst_ptr<array>(mm_prefix_ranges_h);
           const array* ks = use_turboquant
               ? nb::inst_ptr<array>(key_scale_cache_h) : nullptr;
           const array* vs = use_turboquant
@@ -1824,7 +1897,7 @@ NB_MODULE(_paged_ops, m) {
               *nb::inst_ptr<array>(cu_seqlens_q_h),
               block_size, max_seq_len, sliding_window,
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
-              window_seqlen_q, sk);
+              window_seqlen_q, sk, mp);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
         nb::arg("query"),
@@ -1844,6 +1917,7 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("v_bits") = 3,
         nb::arg("window_seqlen_q") = 1,
         nb::arg("sinks") = nb::none(),
+        nb::arg("mm_prefix_ranges") = nb::none(),
         "Paged attention primitive (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
@@ -1851,7 +1925,13 @@ NB_MODULE(_paged_ops, m) {
         "the per-token kernel's window mode.  sinks is an optional float32 "
         "array of one learned logit per query head (GPT-OSS style attention "
         "sinks); it joins the softmax denominator without contributing a "
-        "value row, and is rejected together with TurboQuant.");
+        "value row, and is rejected together with TurboQuant.  "
+        "mm_prefix_ranges is an optional (query rows, 2) int32 array of "
+        "inclusive absolute image-block bounds per query row, (-1, -1) "
+        "elsewhere (Gemma 4 vision): the tiled prefill kernel unmasks the "
+        "block on top of the causal rule and ANDs the sliding window; "
+        "rejected with TurboQuant, float32 queries, verification windows and "
+        "pure-decode batches.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_impl,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),

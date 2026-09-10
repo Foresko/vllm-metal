@@ -80,6 +80,26 @@ class PagedAttentionContext:
     # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
     # per-segment handling entirely.
     segment_positions: list[Any] | None = None
+    # Per-segment half-open absolute prompt ranges [start, end) of image soft
+    # tokens, aligned with ``cu_seqlens`` (decode segments and text prefill
+    # are ``None``).  ``None`` for the whole field: no segment needs
+    # bidirectional attention this forward.
+    segment_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
+    # Layer kinds ("sliding", "full") on which the ranges apply; empty = never.
+    bidi_layer_kinds: frozenset[str] = frozenset()
+    # Set by the first layer that handled image-block rows this forward
+    # (either path), so the info line is emitted once per forward.
+    bidi_logged: bool = False
+    # Phase-3 kernel path: the ``(L, 2)`` int32 per-query-row image-block
+    # ranges (``impls.mm_prefix.build_mm_prefix_rows``), built lazily on the
+    # first layer that needs them this forward and shared by every KV group
+    # and layer afterwards (they do not depend on the block size).
+    # ``mm_prefix_rows_built`` separates "not built yet" from "built, and no
+    # row lies inside a block" (``None``); ``mm_prefix_row_count`` feeds the
+    # once-per-forward info line.
+    mm_prefix_rows: Any = None
+    mm_prefix_rows_built: bool = False
+    mm_prefix_row_count: int = 0
     # Longest spec-decode verification window in this batch, or 1.  Set
     # above 1 only when every multi-token segment is a decode window (no
     # prefill segments), so the kernel dispatcher may route the batch to
