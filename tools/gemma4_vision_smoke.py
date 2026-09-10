@@ -9,8 +9,9 @@ image attention`` under ``VLLM_METAL_MM_PREFIX_PATH=recompute``) and compares
 its first-token log-probs against mlx-vlm under the ``hf`` and ``causal``
 mask modes (``tools/gemma4_mask_modes.py``), then starts a second engine on
 the recompute path in a child process and checks it picks the same first
-token, and a third on the text-only variant and checks it reports the
-text-only mode.  Prints ``SMOKE PASS`` on success.
+token (or a tie within bf16 noise) with a matching distribution, and a third
+on the text-only variant and checks it reports the text-only mode.  Prints
+``SMOKE PASS`` on success.
 
 A second ``vllm.LLM`` in the same process was not attempted; the text-only
 variant runs in a child process (``--text-only-check``) instead, and the
@@ -145,6 +146,11 @@ def _expected_bidi_line() -> str:
 FIRST_TOKEN_IMAGE = ((256, 256), 7)
 FIRST_TOKEN_PROMPT = "Describe the image."
 
+# bf16 noise between the tiled kernel and MLX SDPA; on the tiny checkpoint the
+# first-token logits are nearly flat, so the argmax is a coin flip inside it.
+TIE_TOLERANCE_NATS = 0.05
+KL_TOLERANCE = 1e-3
+
 
 def _parity_check(llm, checkpoint: Path) -> dict[int, float] | None:
     """Compare the engine's first token against the hf and causal references."""
@@ -226,9 +232,11 @@ def _run_vision_half(checkpoint: Path, first_token_out: Path) -> bool:
 def _run_recompute_check(checkpoint: Path, first_token_in: Path) -> bool:
     """Start the engine on the recompute path and compare its first token.
 
-    Runs in a child process with ``VLLM_METAL_MM_PREFIX_PATH=recompute`` set by
-    the parent: the engine core is its own process, so the variable must be in
-    place before the engine starts.
+    Passes if the recompute path picks the same first token (or a tie within
+    bf16 noise) with a matching distribution. Runs in a child process with
+    ``VLLM_METAL_MM_PREFIX_PATH=recompute`` set by the parent: the engine core
+    is its own process, so the variable must be in place before the engine
+    starts.
     """
     from gemma4_mask_modes import kl_over_support
 
@@ -245,16 +253,30 @@ def _run_recompute_check(checkpoint: Path, first_token_in: Path) -> bool:
         return False
     saved = json.loads(first_token_in.read_text())["top_logprobs"]
     kernel = {int(k): float(v) for k, v in saved.items()}
+    kl = kl_over_support(kernel, recompute)
     top_kernel = max(kernel, key=kernel.get)
     top_recompute = max(recompute, key=recompute.get)
+    # A different top-1 is accepted only as a tie: the recompute path's choice
+    # ranks within TIE_TOLERANCE_NATS of the kernel path's own top-1, and the
+    # two distributions agree over the shared support.
+    tied = (
+        top_recompute in kernel
+        and kernel[top_kernel] - kernel[top_recompute] < TIE_TOLERANCE_NATS
+    )
     print(
         f"recompute check: top1 kernel={top_kernel} recompute={top_recompute} "
-        f"kl={kl_over_support(kernel, recompute)}"
+        f"kl={kl} tie={tied}"
     )
     del llm
-    if top_kernel != top_recompute:
+    if top_kernel != top_recompute and not tied:
         print(
             "FAIL: kernel and recompute paths disagree on the first token",
+            file=sys.stderr,
+        )
+        return False
+    if kl is None or abs(kl) > KL_TOLERANCE:
+        print(
+            "FAIL: kernel and recompute first-token distributions diverge",
             file=sys.stderr,
         )
         return False
