@@ -1655,6 +1655,7 @@ class TestMetalPlatform:
         max_num_batched_tokens: int,
         mm_processor_kwargs=None,
         mamba_cache_mode: str = "none",
+        is_mm_prefix_lm: bool = True,
     ):
         monkeypatch.setattr(
             DefaultModelAdapter,
@@ -1676,6 +1677,7 @@ class TestMetalPlatform:
             hf_config=SimpleNamespace(model_type="qwen3"),
             is_hybrid=False,
             quantization=None,
+            is_mm_prefix_lm=is_mm_prefix_lm,
         )
         model_config.hf_config = SimpleNamespace(
             model_type="gemma4",
@@ -1707,6 +1709,23 @@ class TestMetalPlatform:
         )
         MetalPlatform.check_and_update_config(vllm_config)
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
+
+    def test_sidecar_mode_without_prefix_lm_leaves_the_flag_alone(
+        self, monkeypatch
+    ) -> None:
+        """No bidirectional vision attention -> upstream's gate says don't force
+        the flag, but the sidecar still needs a whole image block in one step."""
+        vllm_config = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=1024, is_mm_prefix_lm=False
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.scheduler_config.disable_chunked_mm_input is False
+
+        too_small = self._sidecar_config(
+            monkeypatch, max_num_batched_tokens=281, is_mm_prefix_lm=False
+        )
+        with pytest.raises(RuntimeError, match=">= 282"):
+            MetalPlatform.check_and_update_config(too_small)
 
     @pytest.mark.parametrize(
         "kwargs, needed",

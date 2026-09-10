@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """mlx-vlm Gemma 4 mask modes for parity references.
 
+A verbatim copy lives in foresko-inference ``tools/gemma4_vision_parity.py``;
+keep both in sync.
+
 mlx-vlm 0.6.8 applies the blockwise bidirectional overlay on every layer and
 composes it as ``(causal AND window) OR block``; HF/vLLM apply it only on
 sliding layers as ``(causal OR block) AND window``.  ``hf`` reproduces HF,
