@@ -1200,6 +1200,7 @@ class TestBidirectionalDispatch:
         path: str | None = None,
         supports: bool = True,
         repeat: int = 1,
+        dtype: mx.Dtype = mx.float16,
     ):
         layout = MHAKVCacheLayout(
             num_blocks=11,
@@ -1211,7 +1212,7 @@ class TestBidirectionalDispatch:
             group_block_sizes=(32, 16),
             slot_layers=((0,), (1,)),
         )
-        cache = MetalPagedKVCache.from_layout(layout, mx.float16)
+        cache = MetalPagedKVCache.from_layout(layout, dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
         prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
         ctx = get_context()
@@ -1287,6 +1288,15 @@ class TestBidirectionalDispatch:
         assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
         _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
         assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_float32_cache_falls_back_to_recompute(self) -> None:
+        """The tiled kernel has no float32 instantiation (phase-2 recompute)."""
+        bidi, spy, ctx = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, dtype=mx.float32
+        )
+        assert bidi.call_count == 1
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
 
     def test_unsupported_ops_fall_back_to_recompute(self) -> None:
         bidi, spy, _ = self._run(

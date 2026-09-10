@@ -799,7 +799,10 @@ def sdpa_forward(
         kind = "sliding" if layer_sliding_window >= 0 else "full"
         if kind in ctx.bidi_layer_kinds:
             assert ctx.cu_seqlens is not None
-            if _mm_prefix_path(ops) == "kernel":
+            # The tiled kernel has no float32 instantiation, so float32
+            # caches keep the phase-2 recompute instead of reaching the
+            # primitive's eager ValueError mid-request.
+            if _mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True
