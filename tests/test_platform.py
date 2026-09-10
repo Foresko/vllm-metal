@@ -559,7 +559,7 @@ class TestMetalPlatform:
         # normalize clears multimodal_config (text-only backbone).
         monkeypatch.setattr(
             "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
-            lambda _self, mc: setattr(mc, "multimodal_config", None),
+            lambda _self, mc, **_kwargs: setattr(mc, "multimodal_config", None),
         )
         reset_config()
         try:
@@ -716,7 +716,7 @@ class TestMetalPlatform:
         # normalize leaves multimodal_config in place (genuine multimodal model).
         monkeypatch.setattr(
             "vllm_metal.v1.model_adapter.DefaultModelAdapter.normalize_model_config",
-            lambda _self, _mc: None,
+            lambda _self, _mc, **_kwargs: None,
         )
         reset_config()
         try:

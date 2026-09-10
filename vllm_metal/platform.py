@@ -766,7 +766,9 @@ class MetalPlatform(Platform):
             model_config.disable_cascade_attn = True
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
-            DefaultModelAdapter().normalize_model_config(model_config)
+            DefaultModelAdapter().normalize_model_config(
+                model_config, speculative_config=vllm_config.speculative_config
+            )
 
             # DP + multimodal: the multimodal tensor-IPC queue only supports DP=1
             # (vllm/v1/engine/utils.py). Checked AFTER normalize_model_config so a
