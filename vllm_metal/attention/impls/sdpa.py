@@ -231,7 +231,14 @@ def _kernel_metadata(
 
 
 def _mm_prefix_path(ops: Any) -> str:
-    """The configured image-block attention path for this forward."""
+    """The configured image-block attention path for this forward.
+
+    The ``getattr`` probe guards the shape of the *ops object* -- test fakes
+    and any future ops module that does not implement the entry point -- not
+    a stale native build: both ``paged_attention_primitive`` call sites pass
+    ``mm_prefix_ranges=`` unconditionally, so a native build predating the
+    keyword fails at the call regardless of what this reports.
+    """
     supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
     return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
 
