@@ -1523,8 +1523,10 @@ class _Gemma4TextModel:
 
     def __init__(self) -> None:
         # hidden_size/num_attention_heads/num_hidden_layers/num_key_value_heads
-        # are the minimum resolve_model_dims() needs beyond the brief's
-        # {"hidden_size": 8}; see task-10-report.md deviations.
+        # are the minimum resolve_model_dims() needs to compute a head_dim:
+        # with only hidden_size present, num_layers/num_kv_heads/head_dim all
+        # come back None and _install_runner_attention_dims raises before
+        # load() reaches any of this test's own assertions.
         self.args = {
             "model_type": "gemma4",
             "vocab_size": 16,
@@ -1551,14 +1553,19 @@ def _fake_sidecar() -> Gemma4VisionSidecar:
     )
 
 
-def _gemma4_runner_config() -> object:
+def _gemma4_runner_config(
+    *,
+    multimodal_config: object | None = None,
+    is_multimodal_model: bool = True,
+) -> object:
     return _runner_model_config(
         hf_config=SimpleNamespace(
             model_type="gemma4",
             architectures=["Gemma4ForConditionalGeneration"],
             text_config=SimpleNamespace(model_type="gemma4_text", hidden_size=8),
         ),
-        is_multimodal_model=True,
+        is_multimodal_model=is_multimodal_model,
+        multimodal_config=multimodal_config,
     )
 
 
@@ -1648,3 +1655,84 @@ class TestTextSidecarLifecycle:
         )
         assert request.backbone_mode == "text_only"
         assert request.is_vlm is False
+
+    def test_drift_to_text_only_with_multimodal_config_kept_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The API process kept `multimodal_config` (it decided text_sidecar
+        # or native earlier), but this process's own mode resolution now
+        # says text_only -- the checkpoint directory or
+        # VLLM_METAL_MULTIMODAL_MODE changed between the two processes.
+        self._force_mode(monkeypatch, "text_only")
+        runner = make_stub_runner(
+            model_config=_gemma4_runner_config(multimodal_config=SimpleNamespace())
+        )
+
+        with pytest.raises(RuntimeError, match="drifted"):
+            GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+    def test_sidecar_not_loaded_when_not_flagged_multimodal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # backbone_mode can resolve to text_sidecar while is_multimodal_model
+        # is False (e.g. a stub/adapter disagreement); is_vlm then stays
+        # False, and the sidecar must not be loaded for a request nothing
+        # will ever route images to.
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        sidecar_loads: list[Path] = []
+
+        def _load(path: Path, **_: object) -> Gemma4VisionSidecar:
+            sidecar_loads.append(Path(path))
+            return _fake_sidecar()
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_load)
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_gemma4_runner_config(is_multimodal_model=False)
+        )
+
+        lifecycle.load()
+
+        assert sidecar_loads == []
+        assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
+
+    def test_sidecar_is_not_reachable_from_runner_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec invariant (5.1/10.1): sidecar submodules never hang off
+        runner.model, or patch_model/CompiledMLPBlocks/LoRA would walk them."""
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        sidecar = _fake_sidecar()
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar,
+            "load",
+            staticmethod(lambda path, **_: sidecar),
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        visited: set[int] = set()
+
+        def _reaches_sidecar_submodule(obj: object) -> bool:
+            if id(obj) in visited:
+                return False
+            visited.add(id(obj))
+            if obj is sidecar.vision_tower or obj is sidecar.embed_vision:
+                return True
+            if isinstance(obj, dict):
+                children = obj.values()
+            elif hasattr(obj, "__dict__"):
+                children = vars(obj).values()
+            else:
+                return False
+            return any(_reaches_sidecar_submodule(child) for child in children)
+
+        assert _reaches_sidecar_submodule(runner.model) is False
