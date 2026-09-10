@@ -85,9 +85,14 @@ def _sidecar(
     )
 
 
-def _adapter(tower: _Tower | None = None) -> tuple[Gemma4MultimodalAdapter, _TextModel]:
+def _adapter(
+    tower: _Tower | None = None, *, bidirectional_attention: str | None = "vision"
+) -> tuple[Gemma4MultimodalAdapter, _TextModel]:
     text_model = _TextModel(_Backbone())
-    return Gemma4MultimodalAdapter.from_loaded(text_model, _sidecar(tower)), text_model
+    adapter = Gemma4MultimodalAdapter.from_loaded(
+        text_model, _sidecar(tower), bidirectional_attention=bidirectional_attention
+    )
+    return adapter, text_model
 
 
 def _image_item(num_patches: int) -> MultiModalKwargsItem:
@@ -144,13 +149,17 @@ class TestFlags:
 class TestFromLoaded:
     def test_missing_backbone_raises(self) -> None:
         with pytest.raises(RuntimeError, match="language_model.model"):
-            Gemma4MultimodalAdapter.from_loaded(SimpleNamespace(), _sidecar())
+            Gemma4MultimodalAdapter.from_loaded(
+                SimpleNamespace(), _sidecar(), bidirectional_attention="vision"
+            )
 
     def test_missing_embed_scale_raises(self) -> None:
         backbone = SimpleNamespace(embed_tokens=nn.Embedding(16, HIDDEN))
         text_model = SimpleNamespace(language_model=SimpleNamespace(model=backbone))
         with pytest.raises(RuntimeError, match="embed_scale"):
-            Gemma4MultimodalAdapter.from_loaded(text_model, _sidecar())
+            Gemma4MultimodalAdapter.from_loaded(
+                text_model, _sidecar(), bidirectional_attention="vision"
+            )
 
     def test_embed_scale_is_rounded_to_the_embedding_dtype(self) -> None:
         adapter, _ = _adapter()
@@ -326,3 +335,17 @@ class TestProfileFeaturesRealPooler:
         pooled = real_tower(pixel_values, positions)
 
         assert pooled.shape[:2] == (1, 280)
+
+
+class TestBidirectionalLayerKinds:
+    def test_vision_flag_selects_sliding_layers(self) -> None:
+        adapter, _ = _adapter(bidirectional_attention="vision")
+        assert adapter.bidirectional_layer_kinds == frozenset({"sliding"})
+
+    def test_missing_flag_disables_bidirectional_attention(self) -> None:
+        adapter, _ = _adapter(bidirectional_attention=None)
+        assert adapter.bidirectional_layer_kinds == frozenset()
+
+    def test_all_is_rejected(self) -> None:
+        with pytest.raises(RuntimeError, match="use_bidirectional_attention='all'"):
+            _adapter(bidirectional_attention="all")
