@@ -132,6 +132,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     device const int32_t *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
+    device const int32_t *mm_prefix_ranges
+    [[buffer(22), function_constant(use_mm_prefix)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
@@ -253,6 +255,33 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       block_tables + seq_idx * max_num_blocks_per_seq;
   const int num_kv_tiles = DIVIDE_ROUND_UP(seq_len, TILE_KV);
 
+  // Row ownership is fixed for the whole tile loop: rows >= valid_q are
+  // padding, never read the range buffer and stay masked.
+  const bool row_masked = (sg_idx * 8 + fm) >= valid_q;
+
+  // ─ mm_prefix (Gemma 4 vision) ─────────────────────────────────────────
+  // [r_start, r_end]: inclusive absolute key positions of this row's image
+  // block, (-1, -1) for text rows (in_block is then never true).  tile_stop
+  // is the threadgroup's causal frontier extended to the furthest block end
+  // among its rows, so the tile loop still visits block keys that lie right
+  // of the frontier.  valid_q is threadgroup-uniform, so every thread
+  // computes the same tile_stop without a barrier; the redundant BQ loads
+  // per thread are the price of skipping that barrier.
+  int r_start = -1;
+  int r_end = -1;
+  int tile_stop = context_len + q_pos_start + valid_q - 1;
+  if (use_mm_prefix) {
+    const int q_row_base = q_seq_start + q_pos_start;
+    if (!row_masked) {
+      const int q_row = q_row_base + sg_idx * 8 + fm;
+      r_start = mm_prefix_ranges[2 * q_row];
+      r_end = mm_prefix_ranges[2 * q_row + 1];
+    }
+    for (int r = 0; r < valid_q; r++) {
+      tile_stop = max(tile_stop, mm_prefix_ranges[2 * (q_row_base + r) + 1]);
+    }
+  }
+
   // Sliding window: every key left of the earliest row's window is masked
   // for every row of this threadgroup, so those tiles contribute nothing
   // and the loop starts at the first tile that can hold an attended key
@@ -271,9 +300,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
   for (int tile_idx = tile_idx_start; tile_idx < num_kv_tiles; tile_idx++) {
     const int tile_start = tile_idx * TILE_KV;
 
-    // Causal skip: if the entire tile is beyond the maximum q_abs_pos this
-    // threadgroup will produce, we can stop.
-    if (tile_start > context_len + q_pos_start + valid_q - 1) break;
+    // Causal skip: stop once the whole tile lies beyond every key this
+    // threadgroup can attend (the causal frontier, or the furthest image
+    // block end when mm_prefix is on).  num_kv_tiles still bounds the loop.
+    if (tile_start > tile_stop) break;
 
     // ─ Load K AND V cooperatively (paged, fused, wide-vectorized) ────
     // Both K_smem and V_smem are filled in the same loop:
@@ -377,7 +407,6 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // the window of the *last* row of the threadgroup (the tightest one):
     // then every row's window covers the whole tile.
     const int q_abs_pos = tg_min_q_abs_pos + sg_idx * 8 + fm;
-    const bool row_masked = (sg_idx * 8 + fm) >= valid_q;
     const int min_q_abs_pos = tg_min_q_abs_pos;
     const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_pos
                               && (tile_start + TILE_KV) <= seq_len
@@ -402,8 +431,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
             s = softcapping * precise::tanh(s_orig / softcapping) * M_LOG2E_F;
           }
           int kv_pos = tile_start + k * 8 + fn + jj;
+          // (causal OR same image block) AND window: HF Gemma 4 semantics.
+          // in_block folds to false when use_mm_prefix is off, and it can
+          // never open a key at or beyond seq_len.
+          const bool in_block = use_mm_prefix
+                                && (kv_pos >= r_start) && (kv_pos <= r_end);
           bool masked = row_masked
-                        || (kv_pos > q_abs_pos)
+                        || ((kv_pos > q_abs_pos) && !in_block)
                         || (kv_pos >= seq_len);
           if (sliding_window >= 0)
             masked = masked || (kv_pos < q_abs_pos + 1 - sliding_window);
@@ -569,6 +603,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
       const constant int &num_seqs [[buffer(20)]],                             \
       const constant int &sliding_window [[buffer(21)]],                       \
+      device const int32_t *mm_prefix_ranges                                   \
+      [[buffer(22), function_constant(use_mm_prefix)]],                        \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 tgp [[threadgroup_position_in_grid]],                              \
       uint3 tgpg [[threadgroups_per_grid]],                                    \
