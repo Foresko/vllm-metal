@@ -71,7 +71,11 @@ def _resolve_cached_snapshot(model_config: Any) -> Path | None:
 def _local_checkpoint_dir(model_config: Any) -> Path | None:
     from vllm_metal.utils import get_model_download_path
 
-    path = Path(get_model_download_path(model_config.model))
+    path = Path(
+        get_model_download_path(
+            model_config.model, revision=getattr(model_config, "revision", None)
+        )
+    )
     if path.is_dir():
         return path
     return _resolve_cached_snapshot(model_config)
