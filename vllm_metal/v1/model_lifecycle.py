@@ -102,6 +102,16 @@ class GenerationLoadRequest:
                 if model_adapter.should_force_text_backbone(hf_config)
                 else "native"
             )
+        if (
+            getattr(model_config, "multimodal_config", None) is not None
+            and backbone_mode == "text_only"
+        ):
+            raise RuntimeError(
+                "Metal: backbone mode drifted between the API process "
+                "(multimodal_config kept) and EngineCore (text-only decided); "
+                "the checkpoint directory or VLLM_METAL_MULTIMODAL_MODE changed "
+                "between the two — restart with a stable configuration"
+            )
         if backbone_mode == "text_only":
             is_vlm = False
         if is_vlm and model_config.quantization == "gguf":
@@ -232,7 +242,7 @@ class ModelLifecycle:
         self,
         request: GenerationLoadRequest,
     ) -> LoadedGenerationModel:
-        if request.backbone_mode == "text_sidecar":
+        if request.backbone_mode == "text_sidecar" and request.is_vlm:
             return self._load_text_sidecar(request)
         model, tokenizer = self._load_generation_model(
             request.model_name,
