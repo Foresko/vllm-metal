@@ -170,6 +170,16 @@ class RequestState:
     num_computed_tokens: int = 0
 
 
+@dataclass
+class _MMBidiState:
+    """Image-block ranges of one multimodal request (bidirectional image attention)."""
+
+    ranges: list[tuple[int, int]]  # half-open absolute soft-token ranges
+    first_prefill_start: int  # start_pos of the request's first chunk on this engine
+    # A block did not fit one step: the whole request stays causal.
+    causal_only: bool = False
+
+
 class PrefillRequest(NamedTuple):
     """Packed prefill request passed to ``_start_paged_forward``."""
 
@@ -401,6 +411,10 @@ class MetalModelRunner:
 
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
+
+        # Image-block state; lives outside RequestState because a
+        # one-step prefill has no RequestState during its forward.
+        self._mm_bidi_states: dict[str, _MMBidiState] = {}
 
         # vLLM Sampler for token sampling with temperature, top_k, top_p support
         self._sampler = Sampler()
@@ -2006,6 +2020,8 @@ class MetalModelRunner:
         deepstack_per_layer: list[list[mx.array]] = []
         deepstack_present: bool | None = None
         ctx_segment_positions: list[Any] = []
+        ctx_segment_bidi: list[list[tuple[int, int]] | None] = []
+        kinds = frozenset(getattr(adapter, "bidirectional_layer_kinds", frozenset()))
         position_ids_parts: list[mx.array] = []
         cursor = 0
 
@@ -2031,6 +2047,7 @@ class MetalModelRunner:
                 mx.array(offset_arr)[None, None, :], (3, 1, n)
             )
             ctx_segment_positions.append(seg_positions if is_mm_decode else None)
+            ctx_segment_bidi.append(None)
             position_ids_parts.append(seg_positions)
             cursor += n
 
@@ -2040,6 +2057,9 @@ class MetalModelRunner:
                 full_positions, _delta, sorted_features = mm_request_meta[pr.req_id]
                 seg_positions = full_positions[:, :, pr.start_pos : pr.start_pos + n]
                 ctx_segment_positions.append(seg_positions)
+                ctx_segment_bidi.append(
+                    self._bidi_ranges_for_chunk(pr, sorted_features) if kinds else None
+                )
                 position_ids_parts.append(seg_positions)
 
                 for feature in sorted_features:
@@ -2127,6 +2147,7 @@ class MetalModelRunner:
                     mx.array(offset_arr)[None, None, :], (3, 1, n)
                 )
                 ctx_segment_positions.append(None)
+                ctx_segment_bidi.append(None)
                 position_ids_parts.append(seg_positions)
             cursor += n
 
@@ -2160,6 +2181,10 @@ class MetalModelRunner:
                 if getattr(adapter, "supplies_segment_positions", True)
                 else None
             )
+            ctx.bidi_layer_kinds = kinds
+            ctx.segment_bidi_ranges = (
+                ctx_segment_bidi if kinds and any(ctx_segment_bidi) else None
+            )
 
         mm_prefill_deltas = {
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
@@ -2174,6 +2199,50 @@ class MetalModelRunner:
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
         return model_output, mm_prefill_deltas
+
+    def _bidi_ranges_for_chunk(
+        self, pr: PrefillRequest, features: list[MultiModalFeatureSpec]
+    ) -> list[tuple[int, int]] | None:
+        """Image-block ranges this chunk may attend bidirectionally.
+
+        A block is kept only when it is fully available to this step: it ends
+        inside the chunk, still has rows to compute, and either starts inside
+        the chunk or started before this request's first chunk (a cross-request
+        prefix hit whose head is already in the cache).  A block that reaches
+        this chunk but does not fit switches the whole request to causal
+        attention (the pre-sidecar semantics) with one warning — decided before any
+        K/V of the block is written.
+        """
+        state = self._mm_bidi_states.get(pr.req_id)
+        if state is None:
+            ranges: list[tuple[int, int]] = []
+            for feature in features:
+                for start, end in feature.mm_position.extract_embeds_range():
+                    ranges.append((int(start), int(end) + 1))
+            state = _MMBidiState(ranges=ranges, first_prefill_start=pr.start_pos)
+            self._mm_bidi_states[pr.req_id] = state
+        if state.causal_only:
+            return None
+        chunk_end = pr.start_pos + len(pr.token_ids)
+        kept: list[tuple[int, int]] = []
+        for r0, r1 in state.ranges:
+            if r1 <= pr.start_pos or r0 >= chunk_end:
+                continue  # already computed, or not reached yet
+            fits = r1 <= chunk_end and (
+                r0 >= pr.start_pos or r0 < state.first_prefill_start
+            )
+            if not fits:
+                state.causal_only = True
+                logger.warning(
+                    "Metal: image block %s of request %s does not fit one prefill "
+                    "step; falling back to causal attention for the rest of the "
+                    "request (raise --max-num-batched-tokens or lower --max-num-seqs)",
+                    (r0, r1),
+                    pr.req_id,
+                )
+                return None
+            kept.append((r0, r1))
+        return kept or None
 
     def _handle_new_requests(
         self,
@@ -2548,11 +2617,18 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
             self._state_block_ids_by_req.pop(req_id, None)
+            self._mm_bidi_states.pop(req_id, None)
 
         # In-progress prompt-logprobs state survives preemption (a resumed
         # request re-runs its prompt chunks over the same positions) and is
         # dropped only when the engine finishes the request.
         self._prompt_logprobs_tracker.discard(evicted_req_ids)
+
+        if resumed_req_ids:
+            # A resumed request recomputes from a new prefix boundary; its
+            # first_prefill_start is re-seeded by the next chunk.
+            for req_id in resumed_req_ids:
+                self._mm_bidi_states.pop(req_id, None)
 
         invalidated = set(evicted_req_ids)
         if preempted_req_ids:
