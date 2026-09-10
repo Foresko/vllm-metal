@@ -13,6 +13,7 @@ are back at the values ``embed_vision`` produced, exactly like
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -26,20 +27,14 @@ from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec, Placeholde
 from vllm_metal.multimodal.gemma4.sidecar import Gemma4VisionSidecar
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 
-# Gemma 4 image processor: every image is padded to
-# ``max_soft_tokens * pooling_kernel_size**2`` patches of 3*16*16 values.
-PROFILE_NUM_PATCHES = 2520
-PROFILE_PATCH_DIM = 768
-# (rows, cols): 42 * 60 == 2520, so no -1 padding. mlx-vlm's VisionPooler
-# bins patches into a pooling grid *by position* (kernel_idx = floor(x / k) +
-# (max_x // k) * floor(y / k), k = pooling_kernel_size); both sides must be
-# exact multiples of k or patches from different bins alias into the same
-# output row, silently pooling to fewer than PROFILE_NUM_EMBEDS rows. 42 =
-# 3*14 and 60 = 3*20 pool cleanly to 14*20 == 280 rows. Real images never
-# hit this: Gemma4ImageProcessor always pads both dimensions to a multiple
-# of patch_size * pooling_kernel_size == 48.
-PROFILE_GRID = (42, 60)
-PROFILE_NUM_EMBEDS = 280
+
+def _factor_near_sqrt(n: int) -> tuple[int, int]:
+    """Split ``n`` into ``(a, b)`` with ``a`` the largest divisor of ``n`` that
+    is ``<= sqrt(n)`` (e.g. 280 -> (14, 20))."""
+    a = math.isqrt(n)
+    while a > 1 and n % a != 0:
+        a -= 1
+    return a, n // a
 
 
 @dataclass(frozen=True)
@@ -195,16 +190,40 @@ class Gemma4MultimodalAdapter:
         return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:
-        """One maximal image feature for ``profile_run``: a full 42x60 patch grid."""
-        rows, cols = PROFILE_GRID
+        """One maximal image feature for ``profile_run``, sized from the loaded tower.
+
+        The geometry (patch count, patch dim, pooled grid) is derived from
+        ``self._sidecar.vision_tower`` rather than hardcoded, so the profiled
+        input always matches the checkpoint actually loaded. mlx-vlm's
+        ``VisionPooler`` bins patches into a pooling grid *by position*
+        (``kernel_idx = floor(x / k) + (max_x // k) * floor(y / k)``, ``k =
+        pooling_kernel_size``); both grid dimensions must be exact multiples
+        of ``k`` or patches from different bins alias into the same output
+        row, silently pooling to fewer than the expected number of rows. Real
+        images never hit this: ``Gemma4ImageProcessor`` always pads both
+        dimensions to a multiple of ``patch_size * pooling_kernel_size``.
+        """
+        tower = self._sidecar.vision_tower
+        k = int(tower.pooling_kernel_size)
+        patch = int(tower.patch_size)
+        num_embeds = int(tower.default_output_length)
+        num_patches = int(tower.max_patches)
+        a, b = _factor_near_sqrt(num_embeds)
+        rows, cols = a * k, b * k
+        if rows * cols != num_patches:
+            raise RuntimeError(
+                f"Gemma 4 vision tower geometry mismatch: a pooled grid of "
+                f"{a}x{b} cells at pooling_kernel_size={k} needs {rows * cols} "
+                f"patches, but the tower reports max_patches={num_patches} "
+                f"(default_output_length={num_embeds})."
+            )
+        patch_dim = 3 * patch * patch
         grid_y, grid_x = np.mgrid[0:rows, 0:cols]
         positions = np.stack([grid_x.ravel(), grid_y.ravel()], axis=-1).astype(np.int64)
         field = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
         pixels_elem = field.build_elems(
             "pixel_values",
-            torch.zeros(
-                (1, PROFILE_NUM_PATCHES, PROFILE_PATCH_DIM), dtype=torch.float32
-            ),
+            torch.zeros((1, num_patches, patch_dim), dtype=torch.float32),
         )[0]
         positions_elem = field.build_elems(
             "pixel_position_ids", torch.from_numpy(positions)[None]
@@ -217,7 +236,7 @@ class Gemma4MultimodalAdapter:
                 data=item,
                 modality="image",
                 identifier="gemma4-profile-image",
-                mm_position=PlaceholderRange(offset=0, length=PROFILE_NUM_EMBEDS),
+                mm_position=PlaceholderRange(offset=0, length=num_embeds),
             )
         ]
 
