@@ -9,6 +9,7 @@ import pytest
 
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
+from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
 
 BLOCK = 16
@@ -252,3 +253,213 @@ def test_ranges_are_validated_before_dispatch() -> None:
             cu_seqlens_q=[0, 1],
             window=None,
         )
+
+
+def test_two_blocks_in_one_segment(force_tiled_prefill) -> None:
+    n, seq_len, window = 256, 600, 128
+    blocks = [(360, 420), (500, 560)]
+    key_cache, value_cache, query, table = _setup(5, n=n, seq_len=seq_len)
+    common = {"kv_lens": [seq_len], "cu_seqlens_q": [0, n], "window": window}
+    plain = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        ranges=_range_rows([0, n], [seq_len], [blocks]),
+        **common,
+    )
+    q_lo = seq_len - n
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=q_lo,
+        seq_len=seq_len,
+        blocks=blocks,
+        window=window,
+    )
+    got_np, plain_np = np.array(got), np.array(plain)
+    np.testing.assert_allclose(got_np, ref, atol=ATOL, rtol=RTOL)
+    for lo, hi in [(0, 16), (76, 156), (216, n)]:  # text rows between the blocks
+        np.testing.assert_array_equal(got_np[lo:hi], plain_np[lo:hi])
+    for b0, b1 in blocks:
+        assert (
+            np.abs(
+                got_np[b0 - q_lo : b1 - q_lo] - plain_np[b0 - q_lo : b1 - q_lo]
+            ).max()
+            > 0.1
+        )
+
+
+def test_batch_with_a_decode_row_and_two_prefill_segments(force_tiled_prefill) -> None:
+    """Segments with blocks at different positions and their own block-table rows.
+
+    A segment-local row index instead of the global one would read another
+    segment's ranges; a wrong table row would attend to another request's cache.
+    """
+    window = 128
+    segments = [(1, 50, None), (128, 300, (220, 280)), (96, 200, (150, 200))]
+    cu_seqlens = [0, 1, 129, 225]
+    context_lens = [50, 300, 200]
+    mx.random.seed(7)
+    row_tables: list[list[int]] = []
+    next_block = 1
+    for _, seq_len, _ in segments:
+        count = (seq_len + BLOCK - 1) // BLOCK
+        row_tables.append(list(range(next_block, next_block + count)))
+        next_block += count
+    width = max(len(row) for row in row_tables)
+    table = mx.array(
+        [row + [0] * (width - len(row)) for row in row_tables], dtype=mx.int32
+    )
+    key_cache = mx.random.normal((next_block, BLOCK, KV_HEADS, 64)).astype(DTYPE)
+    value_cache = mx.random.normal((next_block, BLOCK, KV_HEADS, 64)).astype(DTYPE)
+    query = mx.random.normal((cu_seqlens[-1], HEADS, 64)).astype(DTYPE)
+    mx.eval(key_cache, value_cache, query, table)
+    ranges = _range_rows(
+        cu_seqlens, context_lens, [None if b is None else [b] for _, _, b in segments]
+    )
+    common = {"kv_lens": context_lens, "cu_seqlens_q": cu_seqlens, "window": window}
+    plain = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(query, key_cache, value_cache, table, ranges=ranges, **common)
+    got_np, plain_np = np.array(got), np.array(plain)
+    for i, (n, seq_len, block) in enumerate(segments):
+        lo, hi = cu_seqlens[i], cu_seqlens[i + 1]
+        ref = _reference(
+            query[lo:hi],
+            key_cache,
+            value_cache,
+            row_tables[i],
+            q_lo=seq_len - n,
+            seq_len=seq_len,
+            blocks=[] if block is None else [block],
+            window=window,
+        )
+        np.testing.assert_allclose(got_np[lo:hi], ref, atol=ATOL, rtol=RTOL)
+    for lo, hi in [(0, 1), (1, 49), (109, 129), (129, 175)]:  # decode + text rows
+        np.testing.assert_array_equal(got_np[lo:hi], plain_np[lo:hi])
+    for lo, hi in [(49, 109), (175, 225)]:  # block rows
+        assert np.abs(got_np[lo:hi] - plain_np[lo:hi]).max() > 0.1
+
+
+def test_block_head_in_context_is_read_from_the_cache(force_tiled_prefill) -> None:
+    """Prefix-hit shape: the block starts below q_lo, only its tail is in the chunk."""
+    n, seq_len, window = 64, 300, 128
+    block = (200, 300)
+    key_cache, value_cache, query, table = _setup(2, n=n, seq_len=seq_len)
+    common = {"kv_lens": [seq_len], "cu_seqlens_q": [0, n], "window": window}
+    plain = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        ranges=_range_rows([0, n], [seq_len], [[block]]),
+        **common,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=seq_len - n,
+        seq_len=seq_len,
+        blocks=[block],
+        window=window,
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+    # Every chunk row is inside the block; all but the last one gain keys.
+    assert np.abs(np.array(got)[:-1] - np.array(plain)[:-1]).max() > 0.1
+
+
+@pytest.mark.parametrize("hd", [256, 512])
+def test_wide_heads_use_their_own_tile_config(hd, force_tiled_prefill) -> None:
+    """HEAD_SIZE 256 (BQ 16) and 512 (BQ 8) instantiations carry the buffer too."""
+    n, seq_len, window = 128, 400, 128
+    block = (300, 400)
+    key_cache, value_cache, query, table = _setup(
+        9, n=n, seq_len=seq_len, hd=hd, num_blocks=32
+    )
+    common = {"kv_lens": [seq_len], "cu_seqlens_q": [0, n], "window": window}
+    plain = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        ranges=_range_rows([0, n], [seq_len], [[block]]),
+        **common,
+    )
+    q_lo = seq_len - n
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=q_lo,
+        seq_len=seq_len,
+        blocks=[block],
+        window=window,
+    )
+    got_np, plain_np = np.array(got), np.array(plain)
+    np.testing.assert_allclose(got_np, ref, atol=ATOL, rtol=RTOL)
+    split = block[0] - q_lo
+    np.testing.assert_array_equal(got_np[:split], plain_np[:split])
+    assert np.abs(got_np[split:] - plain_np[split:]).max() > 0.1
+
+
+def test_hybrid_block_size_translation() -> None:
+    """vLLM block 64 → kernel block 32: ranges are positions, tables are translated."""
+    n, seq_len, window = 128, 256, 64
+    block = (160, 256)
+    vllm_table = [3, 5, 1, 6]  # four 64-token pages = 256 positions
+    mx.random.seed(8)
+    cache64_k = mx.random.normal((8, 64, KV_HEADS, 64)).astype(DTYPE)
+    cache64_v = mx.random.normal((8, 64, KV_HEADS, 64)).astype(DTYPE)
+    query = mx.random.normal((n, HEADS, 64)).astype(DTYPE)
+    tables, kernel_bs = _build_block_tables([vllm_table], 64)
+    k_view = cache64_k.reshape(-1, kernel_bs, KV_HEADS, 64)
+    v_view = cache64_v.reshape(-1, kernel_bs, KV_HEADS, 64)
+    mx.eval(cache64_k, cache64_v, query, tables, k_view, v_view)
+    got = _kernel(
+        query,
+        k_view,
+        v_view,
+        tables,
+        ranges=_range_rows([0, n], [seq_len], [[block]]),
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, n],
+        window=window,
+        block_size=kernel_bs,
+    )
+
+    def rows64(cache: mx.array) -> np.ndarray:
+        arr = np.array(cache.astype(mx.float32))
+        return np.stack([arr[vllm_table[p // 64], p % 64] for p in range(seq_len)])
+
+    ref = _ref_attention(
+        np.array(query.astype(mx.float32)),
+        rows64(cache64_k),
+        rows64(cache64_v),
+        _hf_mask(seq_len - n, n, seq_len, [block], window),
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+
+
+def test_all_minus_one_rows_match_the_plain_kernel_bitwise(force_tiled_prefill) -> None:
+    """(в) a buffer with no block is inert: identical tiles, identical math."""
+    n, seq_len = 96, 300
+    key_cache, value_cache, query, table = _setup(3, n=n, seq_len=seq_len)
+    common = {"kv_lens": [seq_len], "cu_seqlens_q": [0, n], "window": 128}
+    plain = _kernel(query, key_cache, value_cache, table, **common)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        ranges=mx.full((n, 2), -1, dtype=mx.int32),
+        **common,
+    )
+    np.testing.assert_array_equal(np.array(got), np.array(plain))
