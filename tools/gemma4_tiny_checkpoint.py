@@ -14,6 +14,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from typing import cast
 
 import mlx.core as mx
 from huggingface_hub import hf_hub_download
@@ -87,19 +88,43 @@ def _tiny_config(source_config: dict, *, with_vision: bool) -> dict:
 
 
 def _random_weights(
-    config: dict, *, seed: int, with_vision: bool
+    config: dict, source_config: dict, *, seed: int, with_vision: bool
 ) -> dict[str, mx.array]:
+    """Instantiate the mlx-vlm composite and fill it with random weights.
+
+    The composite is always built from a config carrying the *tiny* vision
+    overrides, even when ``with_vision`` is False: ``mlx_vlm.gemma4.Model``
+    unconditionally constructs ``vision_tower``/``embed_vision`` from
+    ``model_config.vision_config``, and that field defaults to a full-size
+    ``VisionConfig()`` (hidden 768, 16 layers) whenever the dict handed to
+    ``ModelConfig.from_dict`` has no ``"vision_config"`` key. Building from
+    the real ``config`` (which omits ``vision_config`` in the text-only
+    case) would therefore still pay for a full-size vision tower just to
+    filter its weights out below. ``construct_config`` always carries a
+    vision config — the tiny one when present in ``config``, otherwise the
+    source repo's real vision config with the tiny overrides layered on —
+    so the tower mlx-vlm actually builds is tiny either way. The *saved*
+    ``config`` (and therefore ``config.json``) is untouched: it keeps
+    ``vision_config`` absent for the text-only checkpoint.
+    """
     import mlx_vlm.models.gemma4 as gemma4_module
     from mlx_vlm.utils import update_module_configs
 
-    model_config = gemma4_module.ModelConfig.from_dict(config)
+    construct_config = json.loads(json.dumps(config))
+    if "vision_config" not in construct_config:
+        construct_config["vision_config"] = dict(
+            source_config["vision_config"], **VISION_OVERRIDES
+        )
+
+    model_config = gemma4_module.ModelConfig.from_dict(construct_config)
     model_config = update_module_configs(
-        model_config, gemma4_module, config, ["text", "vision", "audio"]
+        model_config, gemma4_module, construct_config, ["text", "vision", "audio"]
     )
     model = gemma4_module.Model(model_config)
     mx.random.seed(seed)
     weights: dict[str, mx.array] = {}
-    for name, value in tree_flatten(model.parameters()):
+    params = cast("list[tuple[str, mx.array]]", tree_flatten(model.parameters()))
+    for name, value in params:
         if not with_vision and (
             name.startswith("vision_tower.") or name.startswith("embed_vision.")
         ):
@@ -132,7 +157,7 @@ def build_tiny_checkpoint(
     config = _tiny_config(source_config, with_vision=with_vision)
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
 
-    weights = _random_weights(config, seed=seed, with_vision=with_vision)
+    weights = _random_weights(config, source_config, seed=seed, with_vision=with_vision)
     shard = "model.safetensors"
     mx.save_safetensors(str(out_dir / shard), weights)
     (out_dir / "model.safetensors.index.json").write_text(
