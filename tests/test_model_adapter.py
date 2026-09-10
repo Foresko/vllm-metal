@@ -1211,7 +1211,7 @@ def _reset_mode_cache():
 
 @pytest.fixture
 def _sidecar_ready(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(model_adapter_module, "has_vision_weights", lambda _: True)
+    monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
     monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
 
 
@@ -1296,7 +1296,9 @@ class TestMultimodalBackboneMode:
     def test_missing_vision_weights_falls_back(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        monkeypatch.setattr(model_adapter_module, "has_vision_weights", lambda _: False)
+        monkeypatch.setattr(
+            model_adapter_module, "_has_vision_weights", lambda _: False
+        )
         monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
         with caplog.at_level("WARNING"):
             mode = DefaultModelAdapter().multimodal_backbone_mode(
@@ -1305,10 +1307,27 @@ class TestMultimodalBackboneMode:
         assert mode == "text_only"
         assert "no vision weights" in caplog.text
 
+    def test_vision_weight_probe_failure_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        def _boom(_path: Path) -> bool:
+            raise ValueError("bad index")
+
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", _boom)
+        monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+        assert mode == "text_only"
+        assert "could not inspect the checkpoint for vision weights: bad index" in (
+            caplog.text
+        )
+
     def test_processor_failure_falls_back(
         self, tmp_path: Path, monkeypatch, caplog
     ) -> None:
-        monkeypatch.setattr(model_adapter_module, "has_vision_weights", lambda _: True)
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
 
         def _boom(_):
             raise OSError("Can't load video processor")
@@ -1323,7 +1342,7 @@ class TestMultimodalBackboneMode:
 
     def test_result_is_cached_per_key(self, tmp_path: Path, monkeypatch) -> None:
         calls: list[int] = []
-        monkeypatch.setattr(model_adapter_module, "has_vision_weights", lambda _: True)
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
         monkeypatch.setattr(
             model_adapter_module, "_probe_processor", lambda _: calls.append(1)
         )
@@ -1370,6 +1389,35 @@ class TestMultimodalBackboneMode:
             )
             is True
         )
+
+    def test_repo_id_activates_sidecar_via_cached_snapshot(
+        self, tmp_path: Path, _sidecar_ready, monkeypatch
+    ) -> None:
+        # A Hugging Face repo id is not a local directory, so
+        # `get_model_download_path` returns it unchanged; the mode must still
+        # resolve to text_sidecar when a fully cached snapshot exists.
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda _: tmp_path
+        )
+        config = _gemma4_model_config(tmp_path, model="mlx-community/gemma-4-repo")
+
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+
+        assert mode == "text_sidecar"
+
+    def test_repo_id_without_a_cached_snapshot_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda _: None
+        )
+        config = _gemma4_model_config(tmp_path, model="mlx-community/not-cached")
+
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+
+        assert mode == "text_only"
+        assert "fully cached Hugging Face repo" in caplog.text
 
 
 class TestNormalizeModelConfigSidecar:
