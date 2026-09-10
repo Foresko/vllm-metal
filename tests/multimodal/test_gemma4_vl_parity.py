@@ -230,6 +230,8 @@ def _adapter_side(
     model_dir: Path, inputs: dict[str, np.ndarray], image_token_id: int
 ) -> tuple[Any, Any, float]:
     """Sidecar path: pre-scale input embeddings, logits, and the rounded scale."""
+    import json
+
     from mlx_lm import load as mlx_lm_load
 
     from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
@@ -237,7 +239,17 @@ def _adapter_side(
 
     text_model, _tokenizer = mlx_lm_load(str(model_dir))
     sidecar = Gemma4VisionSidecar.load(model_dir)
-    adapter = Gemma4MultimodalAdapter.from_loaded(text_model, sidecar)
+    # Same field the engine reads.  It only selects the layer kinds the paged
+    # path applies the image-block mask on; ``call_lm`` builds its own dense
+    # causal mask, so it does not affect this comparison either way.
+    text_config = json.loads((model_dir / "config.json").read_text()).get(
+        "text_config", {}
+    )
+    adapter = Gemma4MultimodalAdapter.from_loaded(
+        text_model,
+        sidecar,
+        bidirectional_attention=text_config.get("use_bidirectional_attention"),
+    )
 
     ids = inputs["input_ids"][0]
     placeholders = np.where(ids == image_token_id)[0]

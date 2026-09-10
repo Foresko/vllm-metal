@@ -83,6 +83,16 @@ class PagedAttentionContext:
     # ``(3, 1, seg_len)`` array.  ``None`` for the whole field skips
     # per-segment handling entirely.
     segment_positions: list[Any] | None = None
+    # Per-segment half-open absolute prompt ranges [start, end) of image soft
+    # tokens, aligned with ``cu_seqlens`` (decode segments and text prefill
+    # are ``None``).  ``None`` for the whole field: no segment needs
+    # bidirectional attention this forward.
+    segment_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
+    # Layer kinds ("sliding", "full") on which the ranges apply; empty = never.
+    bidi_layer_kinds: frozenset[str] = frozenset()
+    # Set by the first layer that recomputed rows this forward, so the info
+    # line is emitted once per forward.
+    bidi_logged: bool = False
     # Longest spec-decode verification window in this batch, or 1.  Set
     # above 1 only when every multi-token segment is a decode window (no
     # prefill segments), so the kernel dispatcher may route the batch to

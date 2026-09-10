@@ -1536,4 +1536,52 @@ class TestNormalizeModelConfigSidecar:
         DefaultModelAdapter().normalize_model_config(
             config, speculative_config=object()
         )
+
         assert config.multimodal_config is None
+
+
+class TestBuildMultimodalAdapterPassesBidirectionalFlag:
+    def test_flag_comes_from_text_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import vllm_metal.multimodal.gemma4 as gemma4_pkg
+
+        captured: dict[str, object] = {}
+
+        def _from_loaded(text_model, sidecar, *, bidirectional_attention):
+            captured["flag"] = bidirectional_attention
+            return SimpleNamespace(text_model=lambda: text_model)
+
+        monkeypatch.setattr(
+            gemma4_pkg.Gemma4MultimodalAdapter,
+            "from_loaded",
+            staticmethod(_from_loaded),
+        )
+        hf_config = SimpleNamespace(
+            model_type="gemma4",
+            text_config=SimpleNamespace(use_bidirectional_attention="vision"),
+        )
+        DefaultModelAdapter().build_multimodal_adapter(
+            object(), hf_config, sidecar=object()
+        )
+        assert captured["flag"] == "vision"
+
+    def test_flag_falls_back_to_top_level_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vllm_metal.multimodal.gemma4 as gemma4_pkg
+
+        captured: dict[str, object] = {}
+
+        def _from_loaded(text_model, sidecar, *, bidirectional_attention):
+            captured["flag"] = bidirectional_attention
+            return SimpleNamespace()
+
+        monkeypatch.setattr(
+            gemma4_pkg.Gemma4MultimodalAdapter,
+            "from_loaded",
+            staticmethod(_from_loaded),
+        )
+        hf_config = SimpleNamespace(model_type="gemma4_text")
+        DefaultModelAdapter().build_multimodal_adapter(
+            object(), hf_config, sidecar=object()
+        )
+        assert captured["flag"] is None

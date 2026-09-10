@@ -21,11 +21,14 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 import torch
+from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.gemma4.sidecar import Gemma4VisionSidecar
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+
+logger = init_logger(__name__)
 
 
 def _factor_near_sqrt(n: int) -> tuple[int, int]:
@@ -64,11 +67,16 @@ class Gemma4MultimodalAdapter:
         backbone: Any,
         sidecar: Gemma4VisionSidecar,
         embed_dtype: mx.Dtype,
+        bidirectional_layer_kinds: frozenset[str] = frozenset(),
     ) -> None:
         self._text_model = text_model
         self._backbone = backbone
         self._sidecar = sidecar
         self._embed_dtype = embed_dtype
+        self.bidirectional_layer_kinds = bidirectional_layer_kinds
+        """Layer kinds ("sliding", "full") whose image-block rows attend
+        bidirectionally (HF: only sliding layers when
+        ``use_bidirectional_attention == "vision"``)."""
         # mlx_lm multiplies bf16 embeddings by the python float ``embed_scale``;
         # MLX casts that scalar to the array dtype first (bf16(53.066) == 53.0
         # for the 26B model), so divide by the same rounded value.
@@ -78,9 +86,30 @@ class Gemma4MultimodalAdapter:
 
     @classmethod
     def from_loaded(
-        cls, text_model: Any, sidecar: Gemma4VisionSidecar
+        cls,
+        text_model: Any,
+        sidecar: Gemma4VisionSidecar,
+        *,
+        bidirectional_attention: str | None,
     ) -> Gemma4MultimodalAdapter:
-        """Resolve the mlx_lm backbone at load time; drift raises here."""
+        """Resolve the mlx_lm backbone at load time; drift raises here.
+
+        ``bidirectional_attention`` is the HF ``text_config.use_bidirectional_attention``
+        value; the mlx_lm ``ModelArgs`` do not carry it.
+        """
+        if bidirectional_attention == "vision":
+            kinds = frozenset({"sliding"})
+        elif bidirectional_attention is None:
+            kinds = frozenset()
+            logger.info(
+                "Metal: Gemma 4 checkpoint has no use_bidirectional_attention; "
+                "image tokens attend causally"
+            )
+        else:
+            raise RuntimeError(
+                "Gemma 4 vision sidecar: use_bidirectional_attention="
+                f"{bidirectional_attention!r} is not supported (only 'vision' or None)"
+            )
         language_model = getattr(text_model, "language_model", None)
         backbone = getattr(language_model, "model", None)
         if backbone is None:
@@ -104,6 +133,7 @@ class Gemma4MultimodalAdapter:
             backbone=backbone,
             sidecar=sidecar,
             embed_dtype=probe.dtype,
+            bidirectional_layer_kinds=kinds,
         )
 
     @property

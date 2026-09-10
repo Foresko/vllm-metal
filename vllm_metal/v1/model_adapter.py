@@ -843,9 +843,16 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         if sidecar is not None:
             from vllm_metal.multimodal.gemma4 import Gemma4MultimodalAdapter
 
+            text_config = getattr(hf_config, "text_config", None) or hf_config
             return cast(
                 MultimodalRuntimeAdapter,
-                Gemma4MultimodalAdapter.from_loaded(model, sidecar),
+                Gemma4MultimodalAdapter.from_loaded(
+                    model,
+                    sidecar,
+                    bidirectional_attention=getattr(
+                        text_config, "use_bidirectional_attention", None
+                    ),
+                ),
             )
         if hf_config is None:
             return None

@@ -1563,7 +1563,11 @@ def _gemma4_runner_config(
         hf_config=SimpleNamespace(
             model_type="gemma4",
             architectures=["Gemma4ForConditionalGeneration"],
-            text_config=SimpleNamespace(model_type="gemma4_text", hidden_size=8),
+            text_config=SimpleNamespace(
+                model_type="gemma4_text",
+                hidden_size=8,
+                use_bidirectional_attention="vision",
+            ),
         ),
         is_multimodal_model=is_multimodal_model,
         multimodal_config=multimodal_config,
@@ -1617,6 +1621,9 @@ class TestTextSidecarLifecycle:
         assert runner._multimodal_adapter.text_model() is runner.model
         assert runner._forward_model is runner.model
         assert runner.encoder_cache is not None
+        assert runner._multimodal_adapter.bidirectional_layer_kinds == frozenset(
+            {"sliding"}
+        )
 
     def test_text_only_mode_keeps_today_s_path(
         self, monkeypatch: pytest.MonkeyPatch
