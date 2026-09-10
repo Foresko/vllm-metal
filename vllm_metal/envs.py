@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_USE_PAGED_ATTENTION: bool = True
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
+    VLLM_METAL_MM_PREFIX_PATH: str | None = None
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
@@ -58,6 +59,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
         "VLLM_METAL_MULTIMODAL_MODE", "auto"
     ),
+    # Gemma 4 vision image-block attention path: "kernel" (default) hands the
+    # per-row block ranges to the tiled Metal prefill kernel; "recompute"
+    # keeps the phase-2 MLX SDPA recompute of the block rows after the kernel
+    # (the reference path).  Read per forward; any other value is rejected at
+    # first use (impls.mm_prefix.resolve_mm_prefix_path).
+    "VLLM_METAL_MM_PREFIX_PATH": lambda: os.getenv("VLLM_METAL_MM_PREFIX_PATH"),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
     # Enable lazy GDN kernels by default.
