@@ -13,6 +13,8 @@ rows, decode rows and full-attention layers never enter this module.
 
 from __future__ import annotations
 
+from typing import Any
+
 import mlx.core as mx
 import numpy as np
 from vllm.logger import init_logger
@@ -71,3 +73,102 @@ def gather_kv(cache: mx.array, slots: mx.array, head_dim: int) -> mx.array:
     """
     flat = cache.reshape(-1, cache.shape[-2], cache.shape[-1])
     return mx.take(flat, slots, axis=0)[:, :, :head_dim]
+
+
+def apply_bidirectional_segments(
+    out: mx.array,
+    q_3d: mx.array,
+    k_cache: mx.array,
+    v_cache: mx.array,
+    *,
+    block_tables: mx.array,
+    block_size: int,
+    cu_seqlens: list[int],
+    context_lens: list[int],
+    ctx: Any,
+    window: int | None,
+    scale: float,
+    head_dim: int,
+    softcap: float,
+    sinks: mx.array | None,
+    turboquant: bool,
+) -> mx.array:
+    """Recompute the image-block rows of prefill segments and splice them in.
+
+    ``out`` and ``q_3d`` are ``(L, heads, cache_head_dim)``; the caches are the
+    kernel-format arrays the kernel just read (``block_size`` is the kernel
+    block size and ``block_tables`` its tables).  Only rows inside an active
+    block are recomputed; every other row keeps the kernel result.
+    """
+    if turboquant:
+        raise RuntimeError(
+            "bidirectional image attention cannot read a TurboQuant KV cache"
+        )
+    if softcap > 0 or sinks is not None:
+        raise NotImplementedError(
+            "bidirectional image attention does not support logit softcap or "
+            "attention sinks"
+        )
+    per_segment = ctx.segment_bidi_ranges
+    if per_segment is None:
+        return out
+
+    width = int(out.shape[-1])
+    pieces: list[mx.array] = []
+    cursor = 0
+    n_segments = n_blocks = n_rows = 0
+    for i, ranges in enumerate(per_segment):
+        if not ranges:
+            continue
+        q_start, q_end = cu_seqlens[i], cu_seqlens[i + 1]
+        n = q_end - q_start
+        seq_len = int(context_lens[i])
+        q_lo, q_hi = seq_len - n, seq_len
+        active = intersecting_ranges(q_lo, q_hi, ranges)
+        if not active:
+            continue
+        n_segments += 1
+        for b0, b1 in active:
+            a, b = max(q_lo, b0), min(q_hi, b1)
+            k_lo = max(0, a - window + 1) if window is not None else 0
+            slots = slot_indices(block_tables[i], block_size, k_lo, b)
+            keys = gather_kv(k_cache, slots, head_dim)
+            values = gather_kv(v_cache, slots, head_dim)
+            mask = mx.array(build_bidi_mask(a, b - a, k_lo, b - k_lo, (b0, b1), window))
+            row_start = q_start + (a - q_lo)
+            row_end = q_start + (b - q_lo)
+            if row_start < cursor:
+                raise RuntimeError("image ranges must be sorted and disjoint")
+            q = q_3d[row_start:row_end, :, :head_dim].transpose(1, 0, 2)[None]
+            seg = (
+                mx.fast.scaled_dot_product_attention(
+                    q,
+                    keys.transpose(1, 0, 2)[None],
+                    values.transpose(1, 0, 2)[None],
+                    scale=scale,
+                    mask=mask[None, None],
+                )[0]
+                .transpose(1, 0, 2)
+                .astype(out.dtype)
+            )
+            if head_dim < width:
+                seg = mx.pad(seg, [(0, 0), (0, 0), (0, width - head_dim)])
+            pieces.append(out[cursor:row_start])
+            pieces.append(seg)
+            cursor = row_end
+            n_blocks += 1
+            n_rows += b - a
+    if not pieces:
+        return out
+    pieces.append(out[cursor:])
+    out = mx.concatenate(pieces, axis=0)
+    if not ctx.bidi_logged:
+        logger.info(
+            "Metal: bidirectional image attention: %d segment(s), %d block(s), "
+            "%d row(s)",
+            n_segments,
+            n_blocks,
+            n_rows,
+        )
+        ctx.bidi_logged = True
+    return out
