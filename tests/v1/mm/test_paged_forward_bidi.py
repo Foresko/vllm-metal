@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 
 import vllm_metal.v1.model_runner as model_runner_module
 from tests.v1.mm.test_paged_forward_mm import (
@@ -20,7 +21,8 @@ from tests.v1.mm.test_paged_forward_mm import (
 )
 from vllm_metal.attention.context import get_context
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
-from vllm_metal.v1.model_runner import PrefillRequest
+from vllm_metal.v1.model_runner import PrefillRequest, RequestState
+from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
 PROMPT = [10, 7, 99, 99, 8, 11]  # boi at 1, image tokens 2..3, eoi at 4
 
@@ -127,6 +129,8 @@ class TestRangesReachTheContext:
 
         assert captured["ranges"] is None
         assert captured["kinds"] == frozenset()
+        # No bidirectional adapter -> no per-request state to track or evict.
+        assert runner._mm_bidi_states == {}
 
     def test_text_prefill_next_to_an_image_prefill_gets_none(self) -> None:
         adapter = _BidiAdapter()
@@ -159,6 +163,46 @@ class TestRangesReachTheContext:
             scheduler_output=_scheduler_output(),
         )
         assert captured["ranges"] == [[(2, 4)], None]
+
+    def test_decode_segment_alongside_an_mm_prefill_gets_none(self) -> None:
+        """Decode segments are packed first and never carry ranges of their own."""
+        adapter = _BidiAdapter()
+        runner = _runner(adapter)
+        runner.encoder_cache.add_request("req", [_image_feature()])
+        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
+        captured = _capture(adapter)
+
+        decode_state = RequestState(
+            token_ids=[1, 2, 3, 4, 5],
+            prompt_len=4,
+            cache=[],
+            sampling_params=SamplingParams(),
+            mrope_position_delta=None,
+        )
+        runner._request_states["req-decode"] = decode_state
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=(
+                PagedDecodeSegment(
+                    req_id="req-decode",
+                    input_token_ids=(5,),
+                    start_row=0,
+                    num_query_tokens=1,
+                    draft_token_ids=(),
+                    cache_start_pos=4,
+                    block_ids=((0,),),
+                ),
+            )
+        )
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill("req", token_ids=PROMPT, prompt_len=6, full_prompt=PROMPT)
+            ],
+            decode_reqs=[("req-decode", decode_state)],
+            scheduler_output=_scheduler_output(),
+        )
+
+        assert captured["ranges"] == [None, [(2, 4)]]
 
 
 class TestKeepDropRule:
@@ -201,6 +245,54 @@ class TestKeepDropRule:
         )
         assert captured["ranges"] is None
         assert len(warnings) == 1
+
+    def test_a_split_block_drops_a_later_intact_block_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback is request-wide: image 2 fits its chunk but is still
+        dropped, and the warning is not repeated."""
+        adapter = _BidiAdapter()
+        runner = _runner(adapter)
+        prompt = [10, 7, 99, 99, 8, 7, 99, 99, 8, 11]  # blocks (2, 4) and (6, 8)
+        runner.encoder_cache.add_request(
+            "req",
+            [_image_feature("img-0", offset=1), _image_feature("img-1", offset=5)],
+        )
+        for name in ("img-0", "img-1"):
+            _put_encode(runner, name, hidden_states=mx.ones((2, adapter.hidden_size)))
+        captured = _capture(adapter)
+        warnings = _warnings(monkeypatch)
+
+        # Chunk 1 covers positions 0..2: block (2, 4) starts here but does not fit.
+        _forward(
+            runner,
+            _mm_prefill(
+                "req",
+                token_ids=prompt[:3],
+                prompt_len=None,
+                start_pos=0,
+                full_prompt=prompt,
+            ),
+        )
+        assert captured["ranges"] is None
+        assert len(warnings) == 1
+        assert "falling back to causal attention" in warnings[0]
+
+        # Chunk 2 carries the rest, block (6, 8) included: still causal, still
+        # one warning.
+        _forward(
+            runner,
+            _mm_prefill(
+                "req",
+                token_ids=prompt[3:],
+                prompt_len=10,
+                start_pos=3,
+                full_prompt=prompt,
+            ),
+        )
+        assert captured["ranges"] is None
+        assert len(warnings) == 1
+        assert runner._mm_bidi_states["req"].causal_only is True
 
     def test_prefix_hit_inside_the_block_keeps_the_tail(self) -> None:
         adapter = _BidiAdapter()

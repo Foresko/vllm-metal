@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -47,6 +50,51 @@ def _kernel(query, key_cache, value_cache, table, *, n, seq_len, window):
         mx.array([0, n], dtype=mx.int32),
         BLOCK,
         seq_len,
+        window if window is not None else -1,
+        out,
+    )
+    mx.eval(out)
+    return out
+
+
+@contextlib.contextmanager
+def _captured_bidi_logs():
+    """Records emitted by the splice module (its logger may not propagate)."""
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("vllm_metal.attention.impls.bidi_prefill")
+    sink = _Sink(level=logging.INFO)
+    logger.addHandler(sink)
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        yield records
+    finally:
+        logger.setLevel(previous)
+        logger.removeHandler(sink)
+
+
+def _kernel_multi(
+    query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window
+):
+    """``_kernel`` for a whole batch: per-segment kv lens, query offsets, tables."""
+    out = mx.array(0)
+    get_ops().paged_attention_primitive(
+        query,
+        key_cache,
+        value_cache,
+        KV_HEADS,
+        HD**-0.5,
+        0.0,
+        table,
+        mx.array(kv_lens, dtype=mx.int32),
+        mx.array(cu_seqlens_q, dtype=mx.int32),
+        BLOCK,
+        max(kv_lens),
         window if window is not None else -1,
         out,
     )
@@ -352,3 +400,109 @@ def test_narrow_head_dim_rows_are_repadded() -> None:
     np.testing.assert_allclose(
         got_np[row_start:row_end, :, :narrow], ref, atol=1.5e-2, rtol=1e-2
     )
+
+
+def test_two_segments_with_blocks_are_spliced_independently() -> None:
+    """A decode row plus two prefill segments, each with its own block-table row.
+
+    Every segment reads its own KV pages, so a splice must use segment ``i``'s
+    block table and its own ``q_lo`` — mixing them up would silently attend to
+    another request's cache.
+    """
+    window = 128
+    # (query rows, context len, image block) per segment; the decode row first.
+    segments = [(1, 50, None), (128, 300, (220, 280)), (96, 200, (150, 200))]
+    cu_seqlens = [0, 1, 129, 225]
+    context_lens = [50, 300, 200]
+    assert cu_seqlens == [0, *np.cumsum([n for n, _, _ in segments]).tolist()]
+    assert context_lens == [seq_len for _, seq_len, _ in segments]
+
+    # One cache, disjoint page ranges per row: block 0 stays unused so a padded
+    # table entry cannot alias a real page.
+    mx.random.seed(7)
+    row_tables: list[list[int]] = []
+    next_block = 1
+    for _, seq_len, _ in segments:
+        count = (seq_len + BLOCK - 1) // BLOCK
+        row_tables.append(list(range(next_block, next_block + count)))
+        next_block += count
+    width = max(len(row) for row in row_tables)
+    table = mx.array(
+        [row + [0] * (width - len(row)) for row in row_tables], dtype=mx.int32
+    )
+    key_cache = mx.random.normal((next_block, BLOCK, KV_HEADS, HD)).astype(DTYPE)
+    value_cache = mx.random.normal((next_block, BLOCK, KV_HEADS, HD)).astype(DTYPE)
+    query = mx.random.normal((cu_seqlens[-1], HEADS, HD)).astype(DTYPE)
+    mx.eval(key_cache, value_cache, query, table)
+
+    out = _kernel_multi(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_lens=context_lens,
+        cu_seqlens_q=cu_seqlens,
+        window=window,
+    )
+    ctx = PagedAttentionContext(
+        slot_mapping=[],
+        cu_seqlens=cu_seqlens,
+        context_lens=context_lens,
+        segment_bidi_ranges=[
+            None if block is None else [block] for _, _, block in segments
+        ],
+        bidi_layer_kinds=frozenset({"sliding", "full"}),
+    )
+    with _captured_bidi_logs() as records:
+        got = apply_bidirectional_segments(
+            out,
+            query,
+            key_cache,
+            value_cache,
+            block_tables=table,
+            block_size=BLOCK,
+            cu_seqlens=cu_seqlens,
+            context_lens=context_lens,
+            ctx=ctx,
+            window=window,
+            scale=HD**-0.5,
+            head_dim=HD,
+            softcap=0.0,
+            sinks=None,
+            turboquant=False,
+        )
+    mx.eval(got)
+    got_np = np.array(got)
+    out_np = np.array(out)
+    query_np = np.array(query.astype(mx.float32))
+
+    spliced: list[tuple[int, int]] = []
+    for i, (n, seq_len, block) in enumerate(segments):
+        if block is None:
+            continue
+        b0, b1 = block
+        q_lo = seq_len - n
+        a, b = max(q_lo, b0), min(seq_len, b1)
+        row_start = cu_seqlens[i] + (a - q_lo)
+        row_end = cu_seqlens[i] + (b - q_lo)
+        k_lo = max(0, a - window + 1)
+        ref = _ref_attention(
+            query_np[row_start:row_end],
+            _rows(key_cache, row_tables[i], k_lo, b),
+            _rows(value_cache, row_tables[i], k_lo, b),
+            build_bidi_mask(a, b - a, k_lo, b - k_lo, (b0, b1), window),
+        )
+        np.testing.assert_allclose(
+            got_np[row_start:row_end], ref, atol=1.5e-2, rtol=1e-2
+        )
+        spliced.append((row_start, row_end))
+
+    assert spliced == [(49, 109), (175, 225)]
+    # Every row outside a block — the decode row included — is untouched.
+    untouched = [(0, 49), (109, 175)]
+    for lo, hi in untouched:
+        np.testing.assert_array_equal(got_np[lo:hi], out_np[lo:hi])
+
+    assert ctx.bidi_logged is True
+    assert len(records) == 1
+    assert "2 segment(s), 2 block(s), 110 row(s)" in records[0].getMessage()
