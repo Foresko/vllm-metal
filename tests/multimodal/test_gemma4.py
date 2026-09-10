@@ -53,6 +53,10 @@ class _TextModel:
 class _Tower:
     def __init__(self) -> None:
         self.calls: list[tuple[mx.Dtype, tuple[int, ...], tuple[int, ...]]] = []
+        self.pooling_kernel_size = 3
+        self.patch_size = 16
+        self.default_output_length = 280
+        self.max_patches = 2520
 
     def __call__(
         self, pixel_values: mx.array, pixel_position_ids: mx.array
@@ -287,11 +291,14 @@ class TestProfileFeatures:
 
 
 class TestProfileFeaturesRealPooler:
-    def test_profile_grid_pools_to_280_rows_in_mlx_vlm_vision_tower(self) -> None:
+    @pytest.mark.parametrize("pooling_kernel_size", [2, 3])
+    def test_profile_grid_pools_to_280_rows_in_mlx_vlm_vision_tower(
+        self, pooling_kernel_size: int
+    ) -> None:
         from mlx_vlm.models.gemma4.config import VisionConfig
         from mlx_vlm.models.gemma4.vision import VisionModel
 
-        tower = VisionModel(
+        real_tower = VisionModel(
             VisionConfig(
                 hidden_size=16,
                 intermediate_size=32,
@@ -301,16 +308,21 @@ class TestProfileFeaturesRealPooler:
                 head_dim=8,
                 global_head_dim=8,
                 patch_size=16,
-                pooling_kernel_size=3,
+                pooling_kernel_size=pooling_kernel_size,
                 default_output_length=280,
                 position_embedding_size=10240,
             )
         )
-        adapter, _ = _adapter()
+        # default_output_length stays 280 regardless of k; max_patches scales
+        # with k**2, matching the real VisionModel's own derivation.
+        fake_tower = _Tower()
+        fake_tower.pooling_kernel_size = pooling_kernel_size
+        fake_tower.max_patches = 280 * pooling_kernel_size**2
+        adapter, _ = _adapter(fake_tower)
         [feature] = adapter.profile_features()
         pixel_values = mx.array(feature.data["pixel_values"].data.numpy())
         positions = mx.array(feature.data["pixel_position_ids"].data.numpy())
 
-        pooled = tower(pixel_values, positions)
+        pooled = real_tower(pixel_values, positions)
 
         assert pooled.shape[:2] == (1, 280)
