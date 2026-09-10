@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import mlx.core as mx
 from vllm.logger import init_logger
 
-from vllm_metal.multimodal.gemma4.sidecar import has_vision_weights
-
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
@@ -47,11 +45,46 @@ def _probe_processor(model_config: Any) -> None:
     cached_processor_from_config(model_config)
 
 
+def _resolve_cached_snapshot(model_config: Any) -> Path | None:
+    """Resolve a fully cached Hugging Face snapshot for a repo id, offline.
+
+    Returns ``None`` on a cache miss, while offline, or when ``model_config.model``
+    is not a Hugging Face repo id at all -- any exception from
+    ``huggingface_hub`` falls back rather than propagating, since this is only
+    a best-effort activation check for the sidecar.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        resolved = Path(
+            snapshot_download(
+                model_config.model,
+                revision=getattr(model_config, "revision", None),
+                local_files_only=True,
+            )
+        )
+    except Exception:  # cache miss, offline, or not a repo id: fall back
+        return None
+    return resolved if resolved.is_dir() else None
+
+
 def _local_checkpoint_dir(model_config: Any) -> Path | None:
     from vllm_metal.utils import get_model_download_path
 
-    path = Path(get_model_download_path(model_config.model))
-    return path if path.is_dir() else None
+    path = Path(
+        get_model_download_path(
+            model_config.model, revision=getattr(model_config, "revision", None)
+        )
+    )
+    if path.is_dir():
+        return path
+    return _resolve_cached_snapshot(model_config)
+
+
+def _has_vision_weights(model_path: Path) -> bool:
+    from vllm_metal.multimodal.gemma4.sidecar import has_vision_weights
+
+    return has_vision_weights(model_path)
 
 
 def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str | None:
@@ -71,8 +104,15 @@ def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str 
         return "vision needs a safetensors checkpoint (AWQ)"
     checkpoint = _local_checkpoint_dir(model_config)
     if checkpoint is None:
-        return f"vision needs a local checkpoint directory, got {model_config.model!r}"
-    if not has_vision_weights(checkpoint):
+        return (
+            "vision needs a local checkpoint directory or a fully cached "
+            f"Hugging Face repo, got {model_config.model!r}"
+        )
+    try:
+        has_vision = _has_vision_weights(checkpoint)
+    except Exception as exc:
+        return f"could not inspect the checkpoint for vision weights: {exc}"
+    if not has_vision:
         return "no vision weights in the checkpoint"
     text_config = getattr(hf_config, "text_config", hf_config)
     if int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0:

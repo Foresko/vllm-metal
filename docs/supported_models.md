@@ -52,13 +52,17 @@ Native multimodal support currently targets image-only vision-language requests 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
 are loaded from the checkpoint through mlx-vlm. The sidecar activates in
-`VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint is a local safetensors
-directory with `vision_tower.*` weights, the HF `Gemma4Processor` builds (the
-checkpoint's `processor_config.json` needs a `video_processor` block with
-transformers 5.14+), the text config has no per-layer inputs, and no
-speculative decoding is configured; otherwise the model stays text-only and the
-reason is logged. Image tokens attend causally in this version; bidirectional
-attention inside an image block is not implemented yet.
+`VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
+safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
+builds (the checkpoint's `processor_config.json` needs a `video_processor`
+block with transformers 5.14+), the text config has no per-layer inputs, and
+no speculative decoding is configured; otherwise the model stays text-only and
+the reason is logged. A repo id such as the example above only resolves when
+it is already fully cached locally (`hf download <repo>` first) — the sidecar
+never triggers a download itself, and an uncached repo id falls back to
+text-only with a logged reason exactly like a nonexistent local path. Image
+tokens attend causally in this version; bidirectional attention inside an
+image block is not implemented yet.
 
 ## Text-Only Language Models
 
