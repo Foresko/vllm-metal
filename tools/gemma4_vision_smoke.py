@@ -6,10 +6,9 @@ the Metal plugin, sends one chat request per image size in the matrix plus a
 two-image request, then starts a second engine on the text-only variant and
 checks it reports the text-only mode.  Prints ``SMOKE PASS`` on success.
 
-The text-only half runs in a child process (``--text-only-check``): a
-second ``vllm.LLM`` in the same process is not supported (duplicate plugin
-registration / "already initialized" errors), so the main path shells out
-to itself with that flag once the vision half is done.
+A second ``vllm.LLM`` in the same process was not attempted; the text-only
+variant runs in a child process (``--text-only-check``) instead, and the
+main path shells out to itself with that flag once the vision half is done.
 """
 
 from __future__ import annotations
@@ -85,6 +84,11 @@ def _run_vision_half(checkpoint: Path) -> bool:
     if not any("vision sidecar" in message for message in capture.messages):
         print("FAIL: engine did not report the vision sidecar mode", file=sys.stderr)
         return False
+    sidecar_loaded = [m for m in capture.messages if "vision sidecar loaded" in m]
+    if not sidecar_loaded:
+        print("FAIL: engine did not log the sidecar load", file=sys.stderr)
+        return False
+    print(f"sidecar load: {sidecar_loaded[0]}")
 
     for index, size in enumerate(SIZES):
         text = _chat(llm, [_image(size, index)], "Describe the image.")
@@ -141,8 +145,8 @@ def main() -> int:
     if not _run_vision_half(checkpoint):
         return 1
 
-    # A second `vllm.LLM` in this process hits duplicate plugin registration /
-    # "already initialized" errors, so the text-only half runs as a subprocess.
+    # The text-only half runs as a subprocess (see the module docstring): a
+    # second `vllm.LLM` in this process was not attempted.
     build_tiny_checkpoint(args.workdir / "tiny-text", with_vision=False)
     result = subprocess.run(
         [
