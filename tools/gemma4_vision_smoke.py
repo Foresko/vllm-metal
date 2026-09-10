@@ -4,10 +4,13 @@
 Builds the checkpoint (or uses ``--checkpoint``), starts ``vllm.LLM`` with
 the Metal plugin, sends one chat request per image size in the matrix plus a
 two-image request, asserts the engine logged the bidirectional image-attention
-path and compares its first-token log-probs against mlx-vlm under the ``hf``
-and ``causal`` mask modes (``tools/gemma4_mask_modes.py``), then starts a
-second engine on the text-only variant and checks it reports the text-only
-mode.  Prints ``SMOKE PASS`` on success.
+path (``Metal: mm_prefix ranges`` on the default kernel path, ``bidirectional
+image attention`` under ``VLLM_METAL_MM_PREFIX_PATH=recompute``) and compares
+its first-token log-probs against mlx-vlm under the ``hf`` and ``causal``
+mask modes (``tools/gemma4_mask_modes.py``), then starts a second engine on
+the recompute path in a child process and checks it picks the same first
+token, and a third on the text-only variant and checks it reports the
+text-only mode.  Prints ``SMOKE PASS`` on success.
 
 A second ``vllm.LLM`` in the same process was not attempted; the text-only
 variant runs in a child process (``--text-only-check``) instead, and the
@@ -17,6 +20,7 @@ main path shells out to itself with that flag once the vision half is done.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -130,12 +134,24 @@ def _reference_logprobs(
     return {int(i): float(logprobs[i]) for i in top.tolist()}
 
 
-def _parity_check(llm, checkpoint: Path) -> bool:
+def _expected_bidi_line() -> str:
+    """The log line proving image-block rows took the configured path."""
+    path = os.environ.get("VLLM_METAL_MM_PREFIX_PATH", "kernel")
+    if path == "recompute":
+        return "bidirectional image attention"
+    return "Metal: mm_prefix ranges"
+
+
+FIRST_TOKEN_IMAGE = ((256, 256), 7)
+FIRST_TOKEN_PROMPT = "Describe the image."
+
+
+def _parity_check(llm, checkpoint: Path) -> dict[int, float] | None:
     """Compare the engine's first token against the hf and causal references."""
     from gemma4_mask_modes import kl_over_support
 
-    image = _image((256, 256), 7)
-    text = "Describe the image."
+    image = _image(*FIRST_TOKEN_IMAGE)
+    text = FIRST_TOKEN_PROMPT
     engine = _first_token_logprobs(llm, [image], text)
     hf = _reference_logprobs(checkpoint, image, text, "hf")
     causal = _reference_logprobs(checkpoint, image, text, "causal")
@@ -154,19 +170,19 @@ def _parity_check(llm, checkpoint: Path) -> bool:
         print(
             "parity inconclusive: the tiny checkpoint does not separate the mask modes"
         )
-        return True
+        return engine
     if top["engine"] != top["hf"]:
         print("FAIL: engine top-1 differs from the hf reference", file=sys.stderr)
-        return False
+        return None
     if kl_hf is None or kl_causal is None or kl_hf > kl_causal:
         print(
             "FAIL: engine is closer to the causal reference than to hf", file=sys.stderr
         )
-        return False
-    return True
+        return None
+    return engine
 
 
-def _run_vision_half(checkpoint: Path) -> bool:
+def _run_vision_half(checkpoint: Path, first_token_out: Path) -> bool:
     """Start the vision-sidecar engine and run the size matrix. True on success."""
     capture = _ModeCapture()
     llm = _start(checkpoint, capture)
@@ -190,15 +206,58 @@ def _run_vision_half(checkpoint: Path) -> bool:
     print(f"two images: {len(text)} chars")
     text = _chat(llm, [], "Say hello.")
     print(f"text only: {len(text)} chars")
-    if not any("bidirectional image attention" in m for m in capture.messages):
+    expected = _expected_bidi_line()
+    if not any(expected in m for m in capture.messages):
         print(
-            "FAIL: engine never logged the bidirectional image attention path",
+            f"FAIL: engine never logged the image-block path ({expected!r})",
             file=sys.stderr,
         )
         return False
-    if not _parity_check(llm, checkpoint):
+    engine = _parity_check(llm, checkpoint)
+    if engine is None:
         return False
+    first_token_out.write_text(
+        json.dumps({"top_logprobs": {str(k): v for k, v in engine.items()}})
+    )
     del llm
+    return True
+
+
+def _run_recompute_check(checkpoint: Path, first_token_in: Path) -> bool:
+    """Start the engine on the recompute path and compare its first token.
+
+    Runs in a child process with ``VLLM_METAL_MM_PREFIX_PATH=recompute`` set by
+    the parent: the engine core is its own process, so the variable must be in
+    place before the engine starts.
+    """
+    from gemma4_mask_modes import kl_over_support
+
+    capture = _ModeCapture()
+    llm = _start(checkpoint, capture)
+    # The log line only appears inside a prefill forward that carries image
+    # rows, so it cannot be checked until after a request has run (mirrors
+    # `_run_vision_half`, which checks its expected line after its chats).
+    recompute = _first_token_logprobs(
+        llm, [_image(*FIRST_TOKEN_IMAGE)], FIRST_TOKEN_PROMPT
+    )
+    if not any("bidirectional image attention" in m for m in capture.messages):
+        print("FAIL: recompute engine never logged the phase-2 path", file=sys.stderr)
+        return False
+    saved = json.loads(first_token_in.read_text())["top_logprobs"]
+    kernel = {int(k): float(v) for k, v in saved.items()}
+    top_kernel = max(kernel, key=kernel.get)
+    top_recompute = max(recompute, key=recompute.get)
+    print(
+        f"recompute check: top1 kernel={top_kernel} recompute={top_recompute} "
+        f"kl={kl_over_support(kernel, recompute)}"
+    )
+    del llm
+    if top_kernel != top_recompute:
+        print(
+            "FAIL: kernel and recompute paths disagree on the first token",
+            file=sys.stderr,
+        )
+        return False
     return True
 
 
@@ -227,6 +286,14 @@ def main() -> int:
         action="store_true",
         help="Internal: run only the text-only engine check and exit 0/1.",
     )
+    parser.add_argument(
+        "--recompute-check",
+        action="store_true",
+        help=(
+            "Internal: compare the recompute path's first token with the "
+            "saved kernel one."
+        ),
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -238,8 +305,20 @@ def main() -> int:
         )
         return 0 if _run_text_only_check(checkpoint) else 1
 
+    first_token = args.workdir / "first-token-kernel.json"
+    if args.recompute_check:
+        checkpoint = args.checkpoint or build_tiny_checkpoint(args.workdir / "tiny")
+        return 0 if _run_recompute_check(checkpoint, first_token) else 1
+
     checkpoint = args.checkpoint or build_tiny_checkpoint(args.workdir / "tiny")
-    if not _run_vision_half(checkpoint):
+    if not _run_vision_half(checkpoint, first_token):
+        return 1
+
+    result = subprocess.run(
+        [sys.executable, __file__, "--recompute-check", "--workdir", str(args.workdir)],
+        env={**os.environ, "VLLM_METAL_MM_PREFIX_PATH": "recompute"},
+    )
+    if result.returncode != 0:
         return 1
 
     # The text-only half runs as a subprocess (see the module docstring): a

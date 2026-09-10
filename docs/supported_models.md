@@ -64,9 +64,14 @@ text-only with a logged reason exactly like a nonexistent local path.
 Image soft tokens attend bidirectionally to each other inside their own image
 block on sliding-window layers, matching HF's
 `create_masks_for_vision_model` semantics; full-attention layers and text
-tokens stay causal. The engine logs `Metal: bidirectional image attention: N
-segment(s), M block(s), R row(s)` the first time a prefill batch recomputes an
-image block this way. An image block that does not fit inside one prefill
+tokens stay causal. By default the tiled Metal prefill kernel applies this
+mask itself from a per-row range buffer (vLLM's `mm_prefix` contract) and the
+engine logs `Metal: mm_prefix ranges on R row(s)` the first time a prefill
+batch carries image-block rows; `VLLM_METAL_MM_PREFIX_PATH=recompute` selects
+the reference path instead, which recomputes the block rows with MLX SDPA
+after the kernel and logs `Metal: bidirectional image attention: N
+segment(s), M block(s), R row(s)`. Both paths give the same mask; the kernel
+path attends each row once. An image block that does not fit inside one prefill
 step falls back to causal attention for the rest of the request, with a
 warning containing `falling back to causal attention`; raise
 `--max-num-batched-tokens` or lower `--max-num-seqs` to keep the block inside
