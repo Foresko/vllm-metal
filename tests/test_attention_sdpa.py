@@ -14,7 +14,7 @@ not here.
 
 from collections.abc import Iterator
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1178,6 +1178,77 @@ class TestSDPAForward:
         assert cache.value_caches[0] is original_v_cache
         assert captured["key_cache"] is original_k_cache
         assert captured["value_cache"] is original_v_cache
+
+
+class TestBidirectionalDispatch:
+    """The bidirectional path is entered only for the configured layer kinds."""
+
+    def _run(self, kinds: frozenset[str], ranges, layer_idx: int):
+        layout = MHAKVCacheLayout(
+            num_blocks=11,
+            tensor_sizes=(1, 1),
+            layers=(
+                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
+                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
+            ),
+            group_block_sizes=(32, 16),
+            slot_layers=((0,), (1,)),
+        )
+        cache = MetalPagedKVCache.from_layout(layout, mx.float16)
+        prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
+        ctx = get_context()
+        assert ctx is not None
+        ctx.segment_bidi_ranges = ranges
+        ctx.bidi_layer_kinds = kinds
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        x = mx.ones((_BATCH, 3, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, 3, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
+        bidi = MagicMock(side_effect=lambda out, *a, **k: out)
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, 3, _N_HEADS * _HEAD_DIM)),
+            ),
+            patch.object(sdpa_mod, "apply_bidirectional_segments", bidi),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=layer_idx)
+        return bidi
+
+    def test_sliding_kind_enters_only_on_sliding_layers(self) -> None:
+        ranges = [None, [(0, 2)]]
+        assert self._run(frozenset({"sliding"}), ranges, 0).call_count == 0
+        bidi = self._run(frozenset({"sliding"}), ranges, 1)
+        assert bidi.call_count == 1
+        kwargs = bidi.call_args.kwargs
+        assert kwargs["window"] == 1024
+        assert kwargs["head_dim"] == _HEAD_DIM
+        assert kwargs["block_size"] == 16
+        assert kwargs["cu_seqlens"] == [0, 1, 3]
+        assert kwargs["turboquant"] is False
+
+    def test_full_kind_enters_only_on_full_layers(self) -> None:
+        ranges = [None, [(0, 2)]]
+        bidi = self._run(frozenset({"full"}), ranges, 0)
+        assert bidi.call_count == 1
+        assert bidi.call_args.kwargs["window"] is None
+        assert self._run(frozenset({"full"}), ranges, 1).call_count == 0
+
+    def test_no_ranges_never_enters(self) -> None:
+        assert self._run(frozenset({"sliding"}), None, 1).call_count == 0
 
 
 # === Laguna g_proj per-head gating ===

@@ -251,3 +251,104 @@ def test_softcap_and_turboquant_are_refused() -> None:
         apply_bidirectional_segments(
             out, query, key_cache, value_cache, softcap=0.0, turboquant=True, **common
         )
+
+
+def test_two_blocks_in_one_segment_are_spliced_in_order() -> None:
+    """Two disjoint image blocks in one segment are each recomputed in place."""
+    n, seq_len, window = 256, 600, 128
+    ranges = [(360, 420), (500, 560)]
+    key_cache, value_cache, query, table = _setup(5, n=n, seq_len=seq_len)
+    out = _kernel(
+        query, key_cache, value_cache, table, n=n, seq_len=seq_len, window=window
+    )
+    ctx = _ctx(n, seq_len, ranges)
+    got = apply_bidirectional_segments(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        block_tables=table,
+        block_size=BLOCK,
+        cu_seqlens=[0, n],
+        context_lens=[seq_len],
+        ctx=ctx,
+        window=window,
+        scale=HD**-0.5,
+        head_dim=HD,
+        softcap=0.0,
+        sinks=None,
+        turboquant=False,
+    )
+    mx.eval(got)
+    got_np = np.array(got)
+    out_np = np.array(out)
+    q_lo = seq_len - n
+    row_table = table[0].tolist()
+    query_np = np.array(query.astype(mx.float32))
+
+    for b0, b1 in ranges:
+        row_start, row_end = b0 - q_lo, b1 - q_lo
+        k_lo = max(0, b0 - window + 1)
+        ref = _ref_attention(
+            query_np[row_start:row_end],
+            _rows(key_cache, row_table, k_lo, b1),
+            _rows(value_cache, row_table, k_lo, b1),
+            build_bidi_mask(b0, b1 - b0, k_lo, b1 - k_lo, (b0, b1), window),
+        )
+        np.testing.assert_allclose(
+            got_np[row_start:row_end], ref, atol=1.5e-2, rtol=1e-2
+        )
+
+    # Rows outside both blocks keep the kernel result bit-for-bit.
+    outside = [(0, 16), (76, 156), (216, n)]
+    for lo, hi in outside:
+        np.testing.assert_array_equal(got_np[lo:hi], out_np[lo:hi])
+
+    assert ctx.bidi_logged is True
+
+
+def test_narrow_head_dim_rows_are_repadded() -> None:
+    """A caller-supplied ``head_dim`` narrower than the cache pads the tail."""
+    n, seq_len, window = 256, 600, 128
+    b0, b1 = 400, 600
+    narrow = 32
+    key_cache, value_cache, query, table = _setup(6, n=n, seq_len=seq_len)
+    out = _kernel(
+        query, key_cache, value_cache, table, n=n, seq_len=seq_len, window=window
+    )
+    got = apply_bidirectional_segments(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        block_tables=table,
+        block_size=BLOCK,
+        cu_seqlens=[0, n],
+        context_lens=[seq_len],
+        ctx=_ctx(n, seq_len, [(b0, b1)]),
+        window=window,
+        scale=HD**-0.5,
+        head_dim=narrow,
+        softcap=0.0,
+        sinks=None,
+        turboquant=False,
+    )
+    mx.eval(got)
+    assert got.shape == out.shape
+    assert got.dtype == out.dtype
+
+    got_np = np.array(got)
+    q_lo = seq_len - n
+    row_start, row_end = b0 - q_lo, b1 - q_lo
+    k_lo = max(0, b0 - window + 1)
+    row_table = table[0].tolist()
+    ref = _ref_attention(
+        np.array(query.astype(mx.float32))[row_start:row_end, :, :narrow],
+        _rows(key_cache, row_table, k_lo, b1)[..., :narrow],
+        _rows(value_cache, row_table, k_lo, b1)[..., :narrow],
+        build_bidi_mask(b0, b1 - b0, k_lo, b1 - k_lo, (b0, b1), window),
+    )
+    np.testing.assert_array_equal(got_np[row_start:row_end, :, narrow:], 0)
+    np.testing.assert_allclose(
+        got_np[row_start:row_end, :, :narrow], ref, atol=1.5e-2, rtol=1e-2
+    )
