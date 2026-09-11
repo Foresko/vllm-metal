@@ -175,7 +175,6 @@ class TestRangesReachTheContext:
         decode_state = RequestState(
             token_ids=[1, 2, 3, 4, 5],
             prompt_len=4,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=None,
         )
