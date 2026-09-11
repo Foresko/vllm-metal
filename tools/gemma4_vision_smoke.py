@@ -30,7 +30,6 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-os.environ.setdefault("VLLM_METAL_USE_PAGED_ATTENTION", "1")
 os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.3")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
 # Production runs the engine in-process this way; it also keeps EngineCore
