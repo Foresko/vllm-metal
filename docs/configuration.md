@@ -4,9 +4,8 @@
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_METAL_MEMORY_FRACTION` | `auto` | Metal memory budget mode; see [Paged KV vs MLX KV Memory Settings](#paged-kv-vs-mlx-kv-memory-settings) |
+| `VLLM_METAL_MEMORY_FRACTION` | `auto` | Metal memory budget mode; see [KV Cache Memory Settings](#kv-cache-memory-settings) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
-| `VLLM_METAL_USE_PAGED_ATTENTION` | `1` | Enable experimental paged KV cache |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
 | `VLLM_METAL_MM_PREFIX_PATH` | `kernel` | Gemma 4 image-block attention path: `kernel` hands each query row's image-block range to the tiled Metal prefill kernel; `recompute` keeps the MLX SDPA recompute of the block rows after the kernel (the reference path). Any other value is rejected at first use |
@@ -53,15 +52,7 @@ Use `--no-async-scheduling` (required for all spec-decode methods on Metal).
 See [Speculative Decoding](speculative_decoding.md) for supported methods,
 model pairing, and memory considerations.
 
-## Paged KV vs MLX KV Memory Settings
+## KV Cache Memory Settings
 
-- MLX path (`VLLM_METAL_USE_PAGED_ATTENTION=0`): `VLLM_METAL_MEMORY_FRACTION` must be `auto`.
-- Paged KV path (`VLLM_METAL_USE_PAGED_ATTENTION=1`): `VLLM_METAL_MEMORY_FRACTION` can be `auto` or a numeric fraction in `(0, 1]`.
-- For paged KV with `VLLM_METAL_MEMORY_FRACTION=auto`, vllm-metal uses vLLM's `--gpu-memory-utilization` value.
-
-| `VLLM_METAL_MEMORY_FRACTION` | `VLLM_METAL_USE_PAGED_ATTENTION` | Valid? | Notes |
-|--|--|--|--|
-| `auto` | `0` | Yes | MLX path |
-| `auto` | `1` | Yes | Paged KV path (default); uses `--gpu-memory-utilization` |
-| `0.7` | `1` | Yes | Paged KV path with explicit memory budget |
-| `0.7` | `0` | No | Explicit fraction without paged KV is invalid |
+`VLLM_METAL_MEMORY_FRACTION` accepts `auto` or a numeric fraction in `(0, 1]`.
+With `auto`, vllm-metal uses vLLM's `--gpu-memory-utilization` value.

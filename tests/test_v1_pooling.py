@@ -556,7 +556,7 @@ class TestMetalPoolingCapabilities:
 
         assert runner.supported_worker_tasks() == ()
 
-    def test_supported_worker_tasks_rejects_non_paged_pooling(self) -> None:
+    def test_supported_worker_tasks_requires_initialized_pooling_runtime(self) -> None:
         runner = _make_runner(paged=False)
 
         assert runner.supported_worker_tasks() == ()
@@ -601,9 +601,7 @@ class TestMetalPoolingCapabilities:
             _EncoderModel(),
         )
 
-        assert runner.scheduler_memory_reporting_mode(
-            paged_attention_enabled=False
-        ) == ("pooling_no_kv")
+        assert runner.scheduler_memory_reporting_mode() == ("pooling_no_kv")
         assert runner.get_kv_cache_spec() == {}
         runner.initialize_kv_cache(
             KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
@@ -615,7 +613,7 @@ class TestMetalPoolingCapabilities:
         runner._pooling_backend = None
         lifecycle = ModelLifecycle(runner, runner._model_adapter)
         runner._model_lifecycle = lifecycle
-        runner.metal_config = SimpleNamespace(use_paged_attention=True)
+        runner.metal_config = SimpleNamespace()
         runner.scheduler_config = SimpleNamespace(
             max_num_seqs=1,
             max_num_batched_tokens=1,
@@ -700,11 +698,13 @@ class TestMetalPoolingCapabilities:
                 (_SupportedEmbedPooler(), _SupportedEmbedPooler()),
             )
 
+    @pytest.mark.parametrize("pooling_type", ["CLS", "MEAN"])
     @pytest.mark.parametrize("dimensions", [None, 4])
     def test_xlm_roberta_checkpoint_matches_transformers(
         self,
         tmp_path,
         dimensions,
+        pooling_type,
     ) -> None:
         torch.manual_seed(0)
         torch_config, transformers_model = _save_tiny_xlm_roberta_checkpoint(tmp_path)
@@ -715,7 +715,9 @@ class TestMetalPoolingCapabilities:
             tokenizer_revision="tokenizer-revision",
             hf_config=torch_config,
             dtype=torch.float32,
-            pooler_config=_pooler_config(seq_pooling_type="CLS", dimensions=dimensions),
+            pooler_config=_pooler_config(
+                seq_pooling_type=pooling_type, dimensions=dimensions
+            ),
             is_matryoshka=True,
             matryoshka_dimensions=None,
             embedding_size=torch_config.hidden_size,
@@ -766,12 +768,18 @@ class TestMetalPoolingCapabilities:
             _scheduler_output(new_reqs=[request]),
             model_config,
         )
-        expected_cls = normalize(expected_hidden[0, 0, :dimensions].float(), dim=0)
+        expected_tokens = expected_hidden[0, :4, :dimensions].float()
+        expected_pooled = (
+            expected_tokens.mean(dim=0)
+            if pooling_type == "MEAN"
+            else expected_tokens[0]
+        )
+        expected_embedding = normalize(expected_pooled, dim=0)
 
         assert len(outputs) == 1
         assert torch.allclose(
             outputs[0].pooler_output,
-            expected_cls,
+            expected_embedding,
             atol=1e-5,
             rtol=1e-5,
         )
@@ -920,21 +928,29 @@ class TestMetalPoolingRunnerOutput:
         _assert_embedding(out.pooler_output[0], 5, dimensions)
         _assert_embedding(out.pooler_output[1], 9)
 
+    @pytest.mark.parametrize(
+        ("pooling_type", "expected_tokens"),
+        [("CLS", (4, 7)), ("MEAN", (5, 8))],
+    )
     @pytest.mark.parametrize("dimensions", [None, 2])
     def test_encoder_embed_preserves_request_order_without_paged_attention(
         self,
         dimensions,
+        pooling_type,
+        expected_tokens,
     ) -> None:
         runner = _make_runner(
             paged=False,
-            model_config=_encoder_model_config(),
+            model_config=_encoder_model_config(
+                pooler_config=_pooler_config(seq_pooling_type=pooling_type)
+            ),
         )
         runner._pooling_backend = MetalEncoderPoolingBackend(
             PoolingConfigView(runner.model_config),
             _EncoderModel(),
         )
         req_b = _new_req(
-            "req-b", [4, 5], pooling_params=_pooling_params(dimensions=dimensions)
+            "req-b", [4, 6], pooling_params=_pooling_params(dimensions=dimensions)
         )
         req_a = _new_req("req-a", [7, 8, 9])
 
@@ -945,8 +961,31 @@ class TestMetalPoolingRunnerOutput:
         assert out.req_ids == ["req-b", "req-a"]
         assert out.sampled_token_ids == [[], []]
         assert out.pooler_output is not None
-        _assert_embedding(out.pooler_output[0], 4, dimensions)
-        _assert_embedding(out.pooler_output[1], 7)
+        _assert_embedding(out.pooler_output[0], expected_tokens[0], dimensions)
+        _assert_embedding(out.pooler_output[1], expected_tokens[1])
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_encoder_mean_accumulates_in_float32(self, dtype) -> None:
+        model_config = _encoder_model_config(
+            pooler_config=_pooler_config(seq_pooling_type="MEAN")
+        )
+        hidden_states = mx.array(
+            [[[1.0, 1.0, 1.0], [0.0, 0.125, 1.0], [0.0, 0.0, 0.0]]],
+            dtype=dtype,
+        )
+        backend = MetalEncoderPoolingBackend(
+            PoolingConfigView(model_config),
+            lambda input_ids, attention_mask: hidden_states,
+        )
+        outputs = backend.pool_scheduler_output(
+            _scheduler_output(new_reqs=[_new_req("req-0", [0, 5, 2])]),
+            model_config,
+        )
+        expected = normalize(torch.tensor([1.0, 1.125, 2.0]), dim=0)
+
+        torch.testing.assert_close(
+            outputs[0].pooler_output, expected, atol=1e-6, rtol=1e-6
+        )
 
     @pytest.mark.parametrize("dimensions", [None, 2])
     def test_chunked_prefill_returns_pooler_output_only_on_final_chunk(
@@ -1090,13 +1129,6 @@ class TestMetalPoolingFailFast:
         req = _new_req("req-0", [1, 2], task="embed")
 
         with pytest.raises(NotImplementedError, match="task='embed'"):
-            runner.execute_model(_scheduler_output(new_reqs=[req]))
-
-    def test_pooling_requires_paged_attention(self) -> None:
-        runner = _make_runner(paged=False)
-        req = _new_req("req-0", [1, 2], task="embed")
-
-        with pytest.raises(NotImplementedError, match="paged attention"):
             runner.execute_model(_scheduler_output(new_reqs=[req]))
 
     def test_encoder_pooling_rejects_chunked_requests(self) -> None:

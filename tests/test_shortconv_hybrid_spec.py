@@ -18,7 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from tests.stub_runner import make_stub_runner
+from tests.stub_runner import make_cache_config, make_stub_runner
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.v1.model_lifecycle import ModelLifecycle
@@ -81,7 +81,6 @@ def _ordinary_paged_cache(monkeypatch):
         lambda: MetalConfig(
             memory_fraction=-1.0,
             mlx_device="gpu",
-            use_paged_attention=True,
             turboquant=False,
         ),
     )
@@ -104,13 +103,11 @@ def _runner(model, *, mode="align", cache_dtype="auto"):
             ),
             dtype=torch.bfloat16,
         ),
-        cache_config=SimpleNamespace(
+        cache_config=make_cache_config(
             block_size=BLOCK_SIZE,
             mamba_block_size=BLOCK_SIZE if mode == "align" else 128,
-            mamba_page_size_padded=None,
             mamba_cache_mode=mode,
             mamba_cache_dtype=cache_dtype,
-            num_gpu_blocks_override=None,
         ),
         scheduler_config=SimpleNamespace(
             max_num_seqs=3,
@@ -156,13 +153,14 @@ def test_scheduler_spec_bills_only_the_convolution_tail(lfm_model, mode):
 
 
 def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_model):
-    """Round-trip real vLLM grouping, including its shared_by physical layout."""
+    """Round-trip real vLLM grouping, including its aliased physical layout."""
     runner = _runner(lfm_model, cache_dtype="float32")
     runtime = _runtime(runner)
     engine_config = SimpleNamespace(
         cache_config=runner.cache_config,
         scheduler_config=runner.scheduler_config,
         kv_transfer_config=None,
+        speculative_config=None,
     )
     groups = get_kv_cache_groups(engine_config, runner.get_kv_cache_spec())
     scheduler_cache = get_kv_cache_config_from_groups(
@@ -194,12 +192,18 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
     cache.ensure_capacity(NUM_BLOCKS)
     assert cache.conv_states[0].dtype == mx.float32
     assert cache.num_state_pools == 2
+    # Groups overlay one allocation: conv layers whose regions start at the same
+    # byte address share a physical pool but belong to different groups.
+    indices_by_address: dict[int, list[int]] = {}
     for tensor in scheduler_cache.kv_cache_tensors:
-        indices = [
-            STATE_INDICES.index(int(name.split(".")[1]))
-            for name in tensor.shared_by
-            if name.endswith(".conv")
-        ]
+        for position, name in enumerate(tensor.layers):
+            if name.endswith(".conv"):
+                address = tensor.offset + position * tensor.layer_stride
+                indices_by_address.setdefault(address, []).append(
+                    STATE_INDICES.index(int(name.split(".")[1]))
+                )
+    assert len(indices_by_address) == 2
+    for indices in indices_by_address.values():
         assert len(indices) == 2
         assert cache.conv_states[indices[0]] is cache.conv_states[indices[1]]
         assert cache.layer_group_ordinal(indices[0]) != cache.layer_group_ordinal(

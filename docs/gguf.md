@@ -42,6 +42,7 @@ before model load.
 ## Current scope
 
 - Supported model families: Qwen2, Qwen3, Llama, and Mistral.
-- Supported qtypes: Q8_0, Q4_0, and Q4_1.
+- Supported qtypes: Q8_0, Q4_0, and Q4_1, plus plain F32/F16/BF16 tensors.
+  The same set applies to local files and remote reference tags.
 - Unsupported: K-quants, MoE, SSM or hybrid models, vision models, fused-QKV
   GGUFs, and sharded GGUF files.

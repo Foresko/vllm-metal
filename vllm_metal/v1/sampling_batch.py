@@ -19,6 +19,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 
 GREEDY_TEMPERATURE_EPS = 1e-5
 _EMPTY_LOGITSPROCS = LogitsProcessors()
@@ -201,21 +202,18 @@ class SamplingBatch:
     ) -> bool:
         """Whether MLX categorical sampling matches *sampling_params_list*.
 
-        Mirror of :meth:`params_allow_native_greedy` for the non-greedy case:
-        every request must use plain temperature/top-k/top-p sampling, with
-        one shared ``(top_k, top_p)`` across the batch so a single mask graph
-        covers every row. Seeded requests keep the torch path, whose
-        per-request ``torch.Generator`` contract MLX keys do not reproduce.
-        Options the platform rejects outright (``min_p``, ``logit_bias``)
-        are not re-checked here.
+        Requests must use plain temperature/top-k/top-p/min-p sampling with
+        one shared mask. Seeded requests stay on the torch path.
         """
         if not sampling_params_list:
             return False
         shared_top_k = len({sp.top_k for sp in sampling_params_list}) == 1
         shared_top_p = len({sp.top_p for sp in sampling_params_list}) == 1
+        shared_min_p = len({sp.min_p for sp in sampling_params_list}) == 1
         return (
             shared_top_k
             and shared_top_p
+            and shared_min_p
             and all(
                 sp.temperature >= GREEDY_TEMPERATURE_EPS
                 and sp.seed is None
@@ -269,35 +267,34 @@ class SamplingBatch:
         scaled_logits: mx.array,
         top_k: int,
         top_p: float,
+        min_p: float = 0.0,
     ) -> mx.array:
-        """Mask temperature-scaled logits to the top-k/top-p candidate set.
-
-        Mask semantics match vLLM's ``apply_top_k_top_p``: ties at the top-k
-        threshold survive, while top-p masks sorted positions individually
-        (boundary ties do NOT all survive; which tied token survives follows
-        sort order). The leading sorted position carries zero leading mass,
-        so every valid ``top_p > 0`` keeps at least one candidate.
-        Non-candidates become ``-inf``.
-        """
+        """Mask temperature-scaled logits to the native candidate set."""
         vocab_size = int(scaled_logits.shape[-1])
         if 0 < top_k < vocab_size:
+            # Top-k can run before min-p: it preserves probability ratios
+            # among survivors and removes only tokens top-k would drop anyway.
             kth_largest = mx.min(
                 mx.topk(scaled_logits, k=top_k, axis=-1), axis=-1, keepdims=True
             )
             scaled_logits = mx.where(
                 scaled_logits < kth_largest, -mx.inf, scaled_logits
             )
-        if top_p < 1.0:
+        if top_p < 1.0 or min_p > 0.0:
             order_desc = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
             sorted_desc = mx.take_along_axis(scaled_logits, order_desc, axis=-1)
-            sorted_probs = mx.softmax(sorted_desc, axis=-1)
-            leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
-            keep = leading_mass < top_p
-            masked_sorted = mx.where(keep, sorted_desc, -mx.inf)
+            if min_p > 0.0:
+                sorted_probs = mx.softmax(sorted_desc, axis=-1)
+                keep = sorted_probs >= min_p * sorted_probs[..., :1]
+                sorted_desc = mx.where(keep, sorted_desc, -mx.inf)
+            if top_p < 1.0:
+                sorted_probs = mx.softmax(sorted_desc, axis=-1)
+                leading_mass = mx.cumsum(sorted_probs, axis=-1) - sorted_probs
+                sorted_desc = mx.where(leading_mass < top_p, sorted_desc, -mx.inf)
             scaled_logits = mx.put_along_axis(
                 mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
                 order_desc,
-                masked_sorted,
+                sorted_desc,
                 axis=-1,
             )
         return scaled_logits
@@ -309,11 +306,7 @@ class SamplingBatch:
         sampling_params_list: Sequence[SamplingParams],
         key: mx.array,
     ) -> mx.array:
-        """Lazy temperature/top-k/top-p token ids, one per row.
-
-        Only valid for batches that pass :meth:`params_allow_native_random`:
-        per-row temperature with one shared ``(top_k, top_p)``.
-        """
+        """Lazy temperature/top-k/top-p/min-p token ids, one per row."""
         temperatures = mx.array(
             [sp.temperature for sp in sampling_params_list], dtype=mx.float32
         )
@@ -322,6 +315,7 @@ class SamplingBatch:
             scaled,
             sampling_params_list[0].top_k,
             sampling_params_list[0].top_p,
+            min_p=sampling_params_list[0].min_p,
         )
         return mx.random.categorical(masked, axis=-1, key=key)
 
@@ -487,6 +481,22 @@ class SamplingBatch:
                 token_ids_by_row[i] = []
         return None, token_ids_by_row
 
+    def _make_logitsprocs(self) -> LogitsProcessors:
+        min_p_vals = [sp.min_p for sp in self.sampling_params_list]
+        if not any(min_p > 0.0 for min_p in min_p_vals):
+            return _EMPTY_LOGITSPROCS
+        return LogitsProcessors(
+            [
+                BatchMinPLogitsProcessor(
+                    torch.tensor(
+                        min_p_vals,
+                        dtype=torch.float32,
+                        device=self.SAMPLER_DEVICE,
+                    )
+                )
+            ]
+        )
+
     def make_sampling_metadata(
         self, logits: torch.Tensor | None = None
     ) -> SamplingMetadata:
@@ -514,7 +524,7 @@ class SamplingBatch:
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=self._make_allowed_token_ids_mask(),
             bad_words_token_ids=self._make_bad_words_token_ids(),
-            logitsprocs=_EMPTY_LOGITSPROCS,
+            logitsprocs=self._make_logitsprocs(),
             logprob_token_ids=logprob_token_ids,
         )
 

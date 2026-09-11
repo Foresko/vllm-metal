@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -26,6 +27,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
+from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT
 from vllm_metal.config import get_config
 from vllm_metal.distributed import PipelineGroup
 from vllm_metal.platform import MetalPlatform
@@ -200,26 +202,10 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-    def _one_sequence_kv_bytes(self) -> int:
-        """Bytes for one max-length sequence of cache state.
-
-        Uses block-aligned token count so the estimate matches the upstream
-        ``_check_enough_kv_cache_memory`` calculation, which rounds
-        ``max_model_len`` up to the nearest ``block_size`` boundary via
-        ``cdiv(max_model_len, block_size) * page_size_bytes``.
-        """
-        block_size = self.vllm_config.cache_config.block_size
-        return self.model_runner.estimate_one_sequence_kv_bytes(
-            max_model_len=self.model_config.max_model_len,
-            block_size=block_size,
-        )
-
     def determine_available_memory(self) -> int:
         """Determine available memory for KV cache.
 
         Paged attention: reports the actual MPS paged cache capacity.
-        MLX path: reports one max-length sequence of KV cache
-        so the scheduler budgets for one concurrent sequence.
 
         Returns:
             Available memory in bytes
@@ -244,12 +230,24 @@ class MetalWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """Report Metal's own page order instead of the CPU backend's LBHNC."""
+        return [KV_CACHE_LAYOUT]
+
+    def synchronize_device(self) -> None:
+        """Wait for in-flight MLX work; Metal is outside ``torch.accelerator``."""
+        mx.synchronize()
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Initialize from KV cache configuration.
 
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        # Mirrors GPUWorker: workers spawned after resolution only see the
+        # layout through the config.
+        if kv_cache_config.kv_cache_layout is not None:
+            record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
         self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def compile_or_warm_up_model(self) -> CompilationTimes:

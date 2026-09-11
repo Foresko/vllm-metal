@@ -118,7 +118,6 @@ class TestStartPagedForwardMmFailFast:
         state = RequestState(
             token_ids=[1, 2, 3],
             prompt_len=2,
-            cache=[],
             sampling_params=SamplingParams(),
             mrope_position_delta=-1,
         )

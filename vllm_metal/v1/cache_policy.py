@@ -20,7 +20,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.caches.mha_layout import (
+    MHAKVCacheLayout,
+    layer_addresses,
+)
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
@@ -51,10 +54,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# vLLM widens the KV group size to the larger layer count when the types are
-# this close, to avoid padding; see kv_cache_utils._get_kv_cache_groups_uniform_page_size.
-UNIFORM_GROUP_PADDING_RATIO = 1.5
-
 
 def _align_state_pool_count(num_linear_layers: int, num_sdpa_layers: int) -> int:
     """Physical GDN state pools under align mode, as the memory plan sees it.
@@ -79,10 +78,9 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
     Publishes the packed per-(head, token) byte count through the base
     spec's ``state_content_bytes`` field so vLLM's scheduler budgets
     blocks from the true compressed page size — without lying about
-    ``head_size``. vLLM 0.28.0 computes ``page_size_bytes`` as
-    ``num_heads * storage_block_size * state_content_size_bytes`` and
-    demoted ``real_page_size_bytes`` to an alias, so overriding the
-    latter no longer reaches the scheduler; publishing the field is the
+    ``head_size``. Since vLLM 0.28.0 the scheduler derives ``page_size_bytes``
+    from that field and ``real_page_size_bytes`` is only an alias, so
+    overriding the latter would not reach it; publishing the field is the
     same mechanism upstream's ``TurboQuantAttentionBackend.customize_spec``
     uses for its packed layout.
     """
@@ -298,12 +296,11 @@ class ModelCachePolicy:
             )
 
     def scheduler_memory_reporting_mode(
-        self, *, paged_attention_enabled: bool
+        self,
     ) -> Literal[
         "paged_attention_capacity",
         "paged_attention_mha_layout_budget",
         "pooling_no_kv",
-        "single_sequence_estimate",
     ]:
         """Return which scheduler memory-reporting mode worker should use."""
         pooling_backend = self._runner._pooling_backend
@@ -312,11 +309,9 @@ class ModelCachePolicy:
             and not pooling_backend.capabilities.uses_kv_cache
         ):
             return "pooling_no_kv"
-        if paged_attention_enabled:
-            if self._uses_deferred_mha_layout():
-                return "paged_attention_mha_layout_budget"
-            return "paged_attention_capacity"
-        return "single_sequence_estimate"
+        if self._uses_deferred_mha_layout():
+            return "paged_attention_mha_layout_budget"
+        return "paged_attention_capacity"
 
     def _hybrid_plan(self) -> HybridRuntimePlan:
         """Return the resolved hybrid plan, failing fast if lifecycle skipped it."""
@@ -694,28 +689,24 @@ class ModelCachePolicy:
                 raise RuntimeError(
                     "scheduler mamba cache groups do not cover every hybrid state layer"
                 )
-            # Physical pools follow the engine's tensor sharing: each
-            # kv_cache_tensor is shared by one layer from each cache group, so
-            # state layers sharing a tensor share one state pool (their
-            # groups own disjoint block ids and never collide).
+            # State layers whose regions share a KV address share one pool
+            # (see ``layer_addresses``).
             layer_pool_ordinals = [-1] * len(cache_idx_by_name)
-            pools_used = 0
+            pool_by_address: dict[int, int] = {}
             for tensor in kv_cache_config.kv_cache_tensors:
-                members = [
-                    cache_idx_by_name[name]
-                    for name in tensor.shared_by
-                    if name in cache_idx_by_name
-                ]
-                if not members:
-                    continue
-                for cache_idx in members:
+                for name, address in layer_addresses(tensor):
+                    cache_idx = cache_idx_by_name.get(name)
+                    if cache_idx is None:
+                        continue
                     if layer_pool_ordinals[cache_idx] != -1:
                         raise RuntimeError(
                             "a hybrid state layer appears in two "
                             "kv_cache_tensors; cannot derive state pools"
                         )
-                    layer_pool_ordinals[cache_idx] = pools_used
-                pools_used += 1
+                    layer_pool_ordinals[cache_idx] = pool_by_address.setdefault(
+                        address, len(pool_by_address)
+                    )
+            pools_used = len(pool_by_address)
             if -1 in layer_pool_ordinals:
                 raise RuntimeError(
                     "kv_cache_tensors do not cover every hybrid state "
@@ -942,74 +933,6 @@ class ModelCachePolicy:
             group_block_sizes=backend.kv_group_block_sizes(),
         )
 
-    def estimate_one_sequence_kv_bytes(
-        self, *, max_model_len: int, block_size: int
-    ) -> int:
-        """Estimate bytes for one max-length sequence of cache state."""
-        self._require_supported_per_layer_shapes()
-        dtype_size = self._require_kv_cache_dtype().size
-        aligned_tokens = -(-max_model_len // block_size) * block_size
-        num_kv_layers = self._num_kv_cache_layers()
-
-        # TurboQuant uses quantized KV cache with different byte layout
-        config = get_config()
-        if self._use_turboquant(config):
-            return num_kv_layers * turboquant_page_size_bytes(
-                block_size=aligned_tokens,
-                num_kv_heads=self._runner.num_kv_heads,
-                head_dim=self._runner.head_dim,
-                k_quant=config.k_quant,
-                v_quant=config.v_quant,
-            )
-
-        if self._runner.is_hybrid:
-            num_attention, num_state = self._padded_hybrid_layer_counts()
-            attention_bytes = (
-                self._kv_factor()
-                * aligned_tokens
-                * dtype_size
-                * self._runner.num_kv_heads
-                * self._runner.head_dim
-            )
-            return (
-                num_attention * attention_bytes
-                + num_state * self._state_layer_bytes_as_charged()
-            )
-        return (
-            self._kv_factor() * aligned_tokens * dtype_size * self._kv_layer_size_sum()
-        )
-
-    def _padded_hybrid_layer_counts(self) -> tuple[int, int]:
-        """Attention and state layer counts after vLLM pads its KV groups.
-
-        vLLM splits a hybrid model into equal-size groups and pads the last
-        group of each layer type (``_get_kv_cache_groups_uniform_page_size``),
-        so admission charges the padding layers and the estimate must too.
-        """
-        layers = self._hybrid_plan().layers
-        counts = (layers.num_attention, layers.num_state)
-        group_size = min(counts)
-        if max(counts) < group_size * UNIFORM_GROUP_PADDING_RATIO:
-            group_size = max(counts)
-        num_attention, num_state = (
-            cdiv(count, group_size) * group_size for count in counts
-        )
-        return num_attention, num_state
-
-    def _state_layer_bytes_as_charged(self) -> int:
-        """Per-layer state bytes as the reported MambaSpec charges them.
-
-        The MambaSpec carries ``mamba_page_size_padded`` when set; an
-        unpadded estimate falls short of admission by the padding margin.
-        """
-        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
-        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
-        # this mirror must follow.
-        padded = self._runner.cache_config.mamba_page_size_padded
-        if padded is not None:
-            return padded
-        return self._hybrid_plan().state_bytes_per_layer()
-
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
         return HybridPagedAttentionRuntime(
@@ -1212,9 +1135,7 @@ class WorkerCachePlanner:
 
     def determine_available_memory(self) -> int:
         """Return scheduler-visible available cache memory."""
-        mode = self._worker.model_runner.scheduler_memory_reporting_mode(
-            paged_attention_enabled=self._worker.metal_config.use_paged_attention
-        )
+        mode = self._worker.model_runner.scheduler_memory_reporting_mode()
 
         if mode == "stt_nominal":
             logger.info("STT model: reporting nominal memory for scheduler")
@@ -1257,19 +1178,7 @@ class WorkerCachePlanner:
             logger.info("Encoder pooling: reporting zero KV-cache bytes")
             return 0
 
-        request_bytes = self._worker._one_sequence_kv_bytes()
-        # vLLM's BlockPool permanently reserves one null block. Reporting
-        # exactly one request's bytes therefore leaves one fewer free block
-        # than admission requires and the waiting request is skipped forever.
-        reserved_block_bytes = self._worker.get_cache_block_size_bytes()
-        available = request_bytes + reserved_block_bytes
-        logger.info(
-            "MLX path: reporting %.2f GB for scheduler admission control "
-            "(one max-length sequence + reserved null block, max_model_len=%d)",
-            available / 1e9,
-            self._worker.model_config.max_model_len,
-        )
-        return available
+        raise AssertionError(f"Unknown scheduler memory reporting mode: {mode}")
 
     @staticmethod
     def base_kv_budget_bytes(

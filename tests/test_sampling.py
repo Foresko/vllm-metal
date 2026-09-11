@@ -15,17 +15,19 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from tests.stub_runner import make_stub_runner
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
 from vllm_metal.v1 import sampling_batch
 from vllm_metal.v1.model_runner import (
-    MetalModelRunner,
     PrefillRequest,
     RequestState,
     _create_request_generator,
     _ExecutionBatch,
 )
-from vllm_metal.v1.sampling_batch import SamplingBatch, sample_from_logits
+from vllm_metal.v1.sampling_batch import (
+    SamplingBatch,
+    sample_decode_tokens,
+    sample_from_logits,
+)
 
 VOCAB_SIZE = 1024
 MAX_NUM_PROMPT_TOKENS = 64
@@ -268,19 +270,8 @@ class TestV1SeededSamplingGenerator:
     def test_seeded_sampling_generator_advances_across_decode_steps(self) -> None:
         """Seeded sampling should reuse (and advance) a per-request generator."""
 
-        def uniform_logits_model(vocab_size: int):
-            def _model(input_ids: mx.array, cache=None) -> mx.array:  # noqa: ANN001
-                batch_size = int(input_ids.shape[0])
-                return mx.zeros((batch_size, 1, vocab_size), dtype=mx.float32)
-
-            return _model
-
         vocab_size = 32
-        runner = make_stub_runner(
-            model_args={"vocab_size": vocab_size},
-            _sampler=Sampler(),
-            model=uniform_logits_model(vocab_size),
-        )
+        sampler = Sampler()
 
         sp = SamplingParams(temperature=1.0, seed=123)
         generator = _create_request_generator(sp)
@@ -289,15 +280,26 @@ class TestV1SeededSamplingGenerator:
         state = RequestState(
             token_ids=[1],
             prompt_len=1,
-            cache=[],
             sampling_params=sp,
             generator=generator,
         )
 
         before = generator.get_state()
-        runner._batched_decode([("r1", state)])
+        sample_decode_tokens(
+            mx.zeros((1, 1, vocab_size), dtype=mx.float32),
+            [("r1", state)],
+            num_decode=1,
+            vocab_size=vocab_size,
+            sampler=sampler,
+        )
         after_first = generator.get_state()
-        runner._batched_decode([("r1", state)])
+        sample_decode_tokens(
+            mx.zeros((1, 1, vocab_size), dtype=mx.float32),
+            [("r1", state)],
+            num_decode=1,
+            vocab_size=vocab_size,
+            sampler=sampler,
+        )
         after_second = generator.get_state()
 
         assert not torch.equal(after_first, before)
@@ -532,6 +534,48 @@ class TestV1SamplingBatch:
         assert result.token_ids[0] == VOCAB_SIZE - 1
         # Top-k row stays inside the top-64 candidates (values 960..1023).
         assert VOCAB_SIZE - top_k <= result.token_ids[1] < VOCAB_SIZE
+
+    def test_min_p_narrows_candidates_before_top_p(self) -> None:
+        """Native sampling applies min_p before top_p."""
+        probs = [0.5, 0.4, 0.1]
+        logits = mx.array([[float(np.log(p)) for p in probs]], dtype=mx.float32)
+        params = [SamplingParams(temperature=1.0, top_p=0.55, min_p=0.25)]
+        assert SamplingBatch.params_allow_native_random(params)
+
+        keys = iter([mx.random.key(seed) for seed in range(64)])
+        sampled = {
+            int(
+                SamplingBatch.native_decode_tokens(
+                    logits,
+                    params,
+                    vocab_size=len(probs),
+                    next_key=lambda: next(keys),
+                ).item()
+            )
+            for _ in range(64)
+        }
+        assert sampled == {0}
+
+    def test_min_p_masks_after_temperature_on_torch_path(self) -> None:
+        """Torch sampling applies min_p after temperature."""
+        sampler = Sampler()
+        sampled = set()
+        for seed in range(40):
+            logits = mx.array([[4.0, 2.0, 0.0, -2.0]], dtype=mx.float32)
+            sp = SamplingParams(temperature=2.0, min_p=0.3, seed=seed)
+            assert not SamplingBatch.params_allow_native_random([sp])
+            batch = SamplingBatch(
+                [sp],
+                [[1]],
+                [[]],
+                vocab_size=4,
+                generators={0: torch.Generator().manual_seed(seed)},
+            )
+            metadata = batch.make_sampling_metadata(torch.zeros(1, 4))
+            assert len(list(metadata.logitsprocs.argmax_invariant)) == 1
+
+            sampled.add(sample_from_logits(logits, batch, sampler).token_ids[0])
+        assert sampled == {0, 1}
 
     def test_bad_words_blocks_greedy_token(self) -> None:
         """Greedy + bad_words_token_ids must fall back and block the banned token."""
@@ -909,24 +953,10 @@ class TestV1PenaltyTokenAccounting:
     """Regression tests for prompt vs output token accounting in penalties."""
 
     @staticmethod
-    def _fixed_logits_model(vocab_size: int, token_a: int, token_b: int):
-        """Return a dummy MLX model that always prefers token_a over token_b."""
-
-        def _model(input_ids: mx.array, cache=None) -> mx.array:  # noqa: ANN001
-            batch_size = int(input_ids.shape[0])
-            logits = mx.zeros((batch_size, 1, vocab_size), dtype=mx.float32)
-            logits = logits.at[:, :, token_a].add(10.0)
-            logits = logits.at[:, :, token_b].add(9.5)
-            return logits
-
-        return _model
-
-    @staticmethod
-    def _make_runner(vocab_size: int) -> MetalModelRunner:
-        return make_stub_runner(
-            model_args={"vocab_size": vocab_size},
-            _sampler=Sampler(),
-        )
+    def _fixed_logits(vocab_size: int, token_a: int, token_b: int) -> mx.array:
+        logits = mx.zeros((1, 1, vocab_size), dtype=mx.float32)
+        logits = logits.at[:, :, token_a].add(10.0)
+        return logits.at[:, :, token_b].add(9.5)
 
     def test_presence_penalty_does_not_apply_to_prompt_tokens(self) -> None:
         """Presence/frequency penalties should apply only to generated tokens."""
@@ -935,10 +965,7 @@ class TestV1PenaltyTokenAccounting:
         alternative_token = 7
         already_generated_token = 11
 
-        runner = self._make_runner(vocab_size)
-        runner.model = self._fixed_logits_model(
-            vocab_size, prompt_token, alternative_token
-        )
+        logits = self._fixed_logits(vocab_size, prompt_token, alternative_token)
 
         # If prompt tokens were incorrectly treated as output tokens, a presence penalty
         # would demote `prompt_token` and flip greedy selection to `alternative_token`.
@@ -953,12 +980,17 @@ class TestV1PenaltyTokenAccounting:
             # `prompt_len` splits them so presence_penalty is applied to output-only.
             token_ids=[prompt_token, already_generated_token],
             prompt_len=1,
-            cache=[],
             sampling_params=sp,
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)]).token_ids
+        next_tokens = sample_decode_tokens(
+            logits,
+            [("r1", state)],
+            num_decode=1,
+            vocab_size=vocab_size,
+            sampler=Sampler(),
+        ).token_ids
 
         assert next_tokens == [prompt_token]
 
@@ -969,10 +1001,7 @@ class TestV1PenaltyTokenAccounting:
         alternative_token = 7
         already_generated_token = 11
 
-        runner = self._make_runner(vocab_size)
-        runner.model = self._fixed_logits_model(
-            vocab_size, prompt_token, alternative_token
-        )
+        logits = self._fixed_logits(vocab_size, prompt_token, alternative_token)
 
         sp = SamplingParams(
             temperature=0.0,
@@ -983,12 +1012,17 @@ class TestV1PenaltyTokenAccounting:
         state = RequestState(
             token_ids=[prompt_token, already_generated_token],
             prompt_len=1,
-            cache=[],
             sampling_params=sp,
             generated_tokens=0,
         )
 
-        next_tokens = runner._sequential_decode([("r1", state)]).token_ids
+        next_tokens = sample_decode_tokens(
+            logits,
+            [("r1", state)],
+            num_decode=1,
+            vocab_size=vocab_size,
+            sampler=Sampler(),
+        ).token_ids
 
         assert next_tokens == [prompt_token]
 
@@ -997,8 +1031,6 @@ class TestV1PenaltyTokenAccounting:
         vocab_size = 64
         repeated_token = 5
         alternative_token = 7
-
-        runner = self._make_runner(vocab_size)
 
         logits = torch.zeros((1, vocab_size), dtype=torch.float32)
         logits[0, repeated_token] = 10.0
@@ -1010,15 +1042,16 @@ class TestV1PenaltyTokenAccounting:
             repetition_penalty=1.0,
             frequency_penalty=0.0,
         )
-        metadata = runner._make_sampling_metadata(
+        metadata = SamplingBatch(
             sampling_params_list=[sp],
             prompt_token_id_lists=[[]],
             # Mock: the model has already generated `repeated_token`, so presence_penalty
             # should demote it and flip greedy selection to `alternative_token`.
             output_token_id_lists=[[repeated_token]],
-        )
+            vocab_size=vocab_size,
+        ).make_sampling_metadata()
 
-        output = runner._sampler.forward(logits, metadata)
+        output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token
 
@@ -1027,8 +1060,6 @@ class TestV1PenaltyTokenAccounting:
         vocab_size = 64
         repeated_token = 5
         alternative_token = 7
-
-        runner = self._make_runner(vocab_size)
 
         logits = torch.zeros((1, vocab_size), dtype=torch.float32)
         logits[0, repeated_token] = 10.0
@@ -1040,15 +1071,16 @@ class TestV1PenaltyTokenAccounting:
             repetition_penalty=1.0,
             frequency_penalty=1.0,
         )
-        metadata = runner._make_sampling_metadata(
+        metadata = SamplingBatch(
             sampling_params_list=[sp],
             prompt_token_id_lists=[[]],
             # Mock: the model has already generated `repeated_token` once, so a positive
             # frequency_penalty should reduce its probability and pick `alternative_token`.
             output_token_id_lists=[[repeated_token]],
-        )
+            vocab_size=vocab_size,
+        ).make_sampling_metadata()
 
-        output = runner._sampler.forward(logits, metadata)
+        output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token
 
@@ -1057,8 +1089,6 @@ class TestV1PenaltyTokenAccounting:
         vocab_size = 64
         prompt_token = 5
         alternative_token = 7
-
-        runner = self._make_runner(vocab_size)
 
         # Model "prefers" prompt_token, but repetition penalty should demote it because
         # it already appears in the prompt.
@@ -1072,15 +1102,16 @@ class TestV1PenaltyTokenAccounting:
             repetition_penalty=1.2,
             frequency_penalty=0.0,
         )
-        metadata = runner._make_sampling_metadata(
+        metadata = SamplingBatch(
             sampling_params_list=[sp],
             # Mock: the prompt already contains `prompt_token`, so repetition_penalty
             # should demote it and prefer `alternative_token`.
             prompt_token_id_lists=[[prompt_token]],
             output_token_id_lists=[[]],
-        )
+            vocab_size=vocab_size,
+        ).make_sampling_metadata()
 
-        output = runner._sampler.forward(logits, metadata)
+        output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token
 
@@ -1089,8 +1120,6 @@ class TestV1PenaltyTokenAccounting:
         vocab_size = 64
         repeated_token = 5
         alternative_token = 7
-
-        runner = self._make_runner(vocab_size)
 
         logits = torch.zeros((1, vocab_size), dtype=torch.float32)
         logits[0, repeated_token] = 10.0
@@ -1102,14 +1131,15 @@ class TestV1PenaltyTokenAccounting:
             repetition_penalty=1.2,
             frequency_penalty=0.0,
         )
-        metadata = runner._make_sampling_metadata(
+        metadata = SamplingBatch(
             sampling_params_list=[sp],
             prompt_token_id_lists=[[]],
             # Mock: `repeated_token` is already in the generated output, so repetition_penalty
             # should demote it and select `alternative_token`.
             output_token_id_lists=[[repeated_token]],
-        )
+            vocab_size=vocab_size,
+        ).make_sampling_metadata()
 
-        output = runner._sampler.forward(logits, metadata)
+        output = Sampler().forward(logits, metadata)
 
         assert int(output.sampled_token_ids[0, 0].item()) == alternative_token

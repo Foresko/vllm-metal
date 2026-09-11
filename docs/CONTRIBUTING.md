@@ -58,7 +58,7 @@ scripts/lint.sh
 
 ## Run CI locally
 
-Mirrors the `test` job in CI — serving smoke tests plus the non-slow pytest suite:
+Mirrors the `test` job in CI: wheel validation, Metal platform checks, and the non-slow pytest suite. Model parity runs separately in the [daily and requested workflow](tools.md#scheduled-and-requested-ci):
 
 ```bash
 scripts/test.sh
@@ -86,7 +86,7 @@ Two conditional checks apply depending on what your PR touches:
 curl -O https://raw.githubusercontent.com/vllm-project/vllm/main/benchmarks/sonnet.txt
 
 # 1. Start the server
-VLLM_METAL_USE_PAGED_ATTENTION=1 VLLM_METAL_MEMORY_FRACTION=0.8 \
+VLLM_METAL_MEMORY_FRACTION=0.8 \
   vllm serve Qwen/Qwen3-0.6B --port 8000 --max-model-len 2048
 
 # 2. Run the benchmark
