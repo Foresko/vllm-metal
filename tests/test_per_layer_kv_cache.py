@@ -33,7 +33,6 @@ from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
 )
 from vllm_metal.config import (
-    AUTO_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
 )
@@ -323,7 +322,6 @@ class TestCachePolicyPerLayerBytes:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=True,
             ),
@@ -453,7 +451,6 @@ class TestAttentionKVCacheLayout:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=False,
             ),
@@ -497,7 +494,6 @@ class TestAttentionKVCacheLayout:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=False,
             ),
@@ -534,7 +530,6 @@ class TestAttentionKVCacheLayout:
             full_kv_heads=full_kv_heads,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )
@@ -600,7 +595,6 @@ class TestAttentionKVCacheLayout:
             disable_hybrid_manager=True,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )
@@ -642,7 +636,6 @@ class TestAttentionKVCacheLayout:
             num_gpu_blocks_override=100,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )

@@ -62,7 +62,7 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: '15.0'
       # Use 0.65 on small GHA runners; 0.8 makes parity tests extremely slow.
-      VLLM_METAL_MEMORY_FRACTION: '0.65'
+      PARITY_GPU_MEMORY_UTILIZATION: '0.65'
       GLOO_SOCKET_IFNAME: lo0
       MODEL_ID: ${{ matrix.model.id }}
       MODEL_REVISION: ${{ matrix.model.revision }}
@@ -117,7 +117,8 @@ jobs:
         run: |
           source .venv-vllm-metal/bin/activate
           python tools/check_parity.py --model "$MODEL_PATH" --top-k 5 --max-tokens 20 \
-            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity"
+            --batch-size 1 2 --output-dir "$RUNNER_TEMP/parity" \
+            --gpu-memory-utilization "$PARITY_GPU_MEMORY_UTILIZATION"
       - name: Summarize parity
         if: always()
         run: |

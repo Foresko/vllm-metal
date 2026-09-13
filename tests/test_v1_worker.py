@@ -26,7 +26,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
-from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
+from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -110,10 +110,7 @@ def _refuse_backend_probe(vllm_config: object) -> None:
 def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
-    worker.metal_config = MetalConfig(
-        memory_fraction=AUTO_MEMORY_FRACTION,
-        mlx_device="gpu",
-    )
+    worker.metal_config = MetalConfig(mlx_device="gpu")
     worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
@@ -203,13 +200,13 @@ class TestPagedAttentionPlanDiagnostics:
         self,
         model_runner: object,
         *,
-        memory_fraction: float,
+        gpu_memory_utilization: float,
         block_size: int = 16,
         per_block_bytes: int = 1,
     ) -> WorkerCachePlanner:
         worker = _make_worker(model_runner)
         worker.cache_config.block_size = block_size
-        worker.metal_config.memory_fraction = memory_fraction
+        worker.cache_config.gpu_memory_utilization = gpu_memory_utilization
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
@@ -227,7 +224,7 @@ class TestPagedAttentionPlanDiagnostics:
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner)
-        worker.metal_config.memory_fraction = 0.5
+        worker.cache_config.gpu_memory_utilization = 0.5
         worker.get_cache_block_size_bytes = MagicMock(return_value=1)
         monkeypatch.setattr(
             WorkerCachePlanner,
@@ -251,10 +248,34 @@ class TestPagedAttentionPlanDiagnostics:
         ) in message
         assert "kv_budget=-0.09GB" in message
         assert "lower --max-num-seqs" in message
-        assert "increase VLLM_METAL_MEMORY_FRACTION" in message
+        assert "increase --gpu-memory-utilization (currently 0.5)" in message
         runner.scheduler_memory_reporting_mode.assert_called_once_with()
         runner.profile_run.assert_called_once_with()
         runner.validate_paged_attention_support.assert_called_once_with()
+
+    def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(runner, gpu_memory_utilization=0.15)
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "_metal_limit_bytes",
+            lambda self: 10_000_000_000,
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner,
+            "get_model_memory_usage",
+            lambda self: 2_000_000_000,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            planner._paged_attention_plan(overhead=100_000_000)
+
+        message = str(exc_info.value)
+        assert "increase --gpu-memory-utilization (currently 0.15)" in message
+        assert "VLLM_METAL_MEMORY_FRACTION" not in message
 
     def test_hybrid_plan_reserves_bounded_gdn_growth_cushion(self, monkeypatch) -> None:
         runner = SimpleNamespace(
@@ -266,7 +287,7 @@ class TestPagedAttentionPlanDiagnostics:
         )
         planner = self._make_planner(
             runner,
-            memory_fraction=0.5,
+            gpu_memory_utilization=0.5,
             per_block_bytes=100_000_000,
         )
         monkeypatch.setattr(
@@ -308,7 +329,7 @@ class TestPagedAttentionPlanDiagnostics:
         )
         planner = self._make_planner(
             runner,
-            memory_fraction=0.5,
+            gpu_memory_utilization=0.5,
             per_block_bytes=100_000_000,
         )
         monkeypatch.setattr(
@@ -342,7 +363,7 @@ class TestPagedAttentionPlanDiagnostics:
         )
         planner = self._make_planner(
             runner,
-            memory_fraction=1.0,
+            gpu_memory_utilization=1.0,
             per_block_bytes=100,
         )
         monkeypatch.setattr(
@@ -371,7 +392,7 @@ class TestPagedAttentionPlanDiagnostics:
             is_hybrid=False,
             draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
-        planner = self._make_planner(runner, memory_fraction=0.1)
+        planner = self._make_planner(runner, gpu_memory_utilization=0.1)
         monkeypatch.setattr(
             WorkerCachePlanner,
             "_metal_limit_bytes",
@@ -393,29 +414,21 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget=-1.10GB" in message
 
     @pytest.mark.parametrize(
-        "is_auto, memory_fraction, gpu_mem_util, expected_fraction",
+        "gpu_mem_util",
         [
-            pytest.param(True, -1.0, 0.92, 0.92, id="auto_uses_vllm_default"),
-            pytest.param(True, -1.0, 0.5, 0.5, id="auto_uses_vllm_flag"),
-            pytest.param(False, 0.5, 0.7, 0.5, id="metal_env_wins"),
+            pytest.param(0.92, id="vllm_default"),
+            pytest.param(0.5, id="vllm_flag"),
         ],
     )
-    def test_memory_fraction_precedence(
-        self,
-        is_auto: bool,
-        memory_fraction: float,
-        gpu_mem_util: float,
-        expected_fraction: float,
+    def test_memory_fraction_follows_gpu_memory_utilization(
+        self, gpu_mem_util: float
     ) -> None:
         worker = _make_worker(SimpleNamespace(is_hybrid=False))
-        worker.metal_config.memory_fraction = (
-            AUTO_MEMORY_FRACTION if is_auto else memory_fraction
-        )
         worker.cache_config.gpu_memory_utilization = gpu_mem_util
 
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
-        assert fraction == expected_fraction
+        assert fraction == gpu_mem_util
 
 
 class TestAlignStateSizing:

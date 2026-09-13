@@ -119,8 +119,8 @@ class MetalPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get total memory available for the device.
 
-        On Apple Silicon, this returns the fraction of unified memory
-        configured for use by the plugin.
+        On Apple Silicon this is the unified memory size; the paged KV
+        budget carved out of it follows ``--gpu-memory-utilization``.
 
         Args:
             device_id: Device index (ignored for Metal)
@@ -128,12 +128,7 @@ class MetalPlatform(Platform):
         Returns:
             Total memory in bytes
         """
-        config = get_config()
-        total_memory = psutil.virtual_memory().total
-        # In auto mode, report full memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return total_memory
-        return int(total_memory * config.memory_fraction)
+        return int(psutil.virtual_memory().total)
 
     @classmethod
     def get_device_available_memory(cls, device_id: int = 0) -> int:
@@ -145,12 +140,7 @@ class MetalPlatform(Platform):
         Returns:
             Available memory in bytes
         """
-        config = get_config()
-        available = psutil.virtual_memory().available
-        # In auto mode, report full available memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return available
-        return int(available * config.memory_fraction)
+        return int(psutil.virtual_memory().available)
 
     @classmethod
     def is_available(cls) -> bool:
@@ -936,9 +926,7 @@ class MetalPlatform(Platform):
             return
         desired = _pick_mb_buffer_default(
             total_memory_bytes=psutil.virtual_memory().total,
-            memory_fraction=get_config().effective_memory_fraction(
-                vllm_config.cache_config.gpu_memory_utilization
-            ),
+            memory_fraction=vllm_config.cache_config.gpu_memory_utilization,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),

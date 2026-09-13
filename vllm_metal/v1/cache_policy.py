@@ -242,7 +242,7 @@ class _PagedAttentionPlan:
 
     def format_mitigations(self) -> str:
         mitigations = [
-            "increase VLLM_METAL_MEMORY_FRACTION",
+            f"increase --gpu-memory-utilization (currently {self.fraction})",
             "use a smaller or more quantized model",
         ]
         reservation = self.hybrid_gdn_reservation
@@ -1294,26 +1294,12 @@ class WorkerCachePlanner:
         )
 
     def _memory_fraction(self) -> float:
-        """Resolve the paged KV memory fraction.
-
-        Precedence lives in ``MetalConfig.effective_memory_fraction``; this
-        wrapper only adds the operator-facing log line.
-        """
-        metal_config = self._worker.metal_config
-        fraction = metal_config.effective_memory_fraction(
-            self._worker.vllm_config.cache_config.gpu_memory_utilization
+        """Resolve the paged KV memory fraction from ``--gpu-memory-utilization``."""
+        fraction = self._worker.vllm_config.cache_config.gpu_memory_utilization
+        logger.info(
+            "Paged attention: using --gpu-memory-utilization=%.2f",
+            fraction,
         )
-        if metal_config.is_auto_memory:
-            logger.info(
-                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-                "using --gpu-memory-utilization=%.2f",
-                fraction,
-            )
-        else:
-            logger.info(
-                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
-                fraction,
-            )
         return fraction
 
     def _metal_limit_bytes(self) -> int:

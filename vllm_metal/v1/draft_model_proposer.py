@@ -542,7 +542,7 @@ class DraftModelProposer:
                     f"Draft KV scratch pool exhausted: request {req_id!r} "
                     f"needs {scratch_needed} lookahead block(s) but none are "
                     "free. Lower --max-num-seqs or raise "
-                    "VLLM_METAL_MEMORY_FRACTION."
+                    "--gpu-memory-utilization."
                 )
             scratch_blocks.append(self._scratch_free_blocks.pop())
         if not scratch_blocks:

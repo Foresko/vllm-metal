@@ -4,7 +4,6 @@
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_METAL_MEMORY_FRACTION` | `auto` | Metal memory budget mode; see [KV Cache Memory Settings](#kv-cache-memory-settings) |
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist; `multimodal-native` disables overrides |
@@ -50,5 +49,6 @@ model pairing, and memory considerations.
 
 ## KV Cache Memory Settings
 
-`VLLM_METAL_MEMORY_FRACTION` accepts `auto` or a numeric fraction in `(0, 1]`.
-With `auto`, vllm-metal uses vLLM's `--gpu-memory-utilization` value.
+The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
+flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
+former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
