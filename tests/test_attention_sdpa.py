@@ -1202,12 +1202,12 @@ class TestBidirectionalDispatch:
         repeat: int = 1,
         dtype: mx.Dtype = mx.float16,
     ):
-        layout = MHAKVCacheLayout(
+        layout = AttentionKVCacheLayout(
             num_blocks=11,
             allocation_bytes=2,
             layers=(
-                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
-                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
+                AttentionLayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
+                AttentionLayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
             ),
             group_block_sizes=(32, 16),
             slot_layers=((0,), (1,)),
