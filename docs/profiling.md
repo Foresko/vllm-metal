@@ -78,7 +78,7 @@ This launches Xcode and loads the **GPU Frame Debugger**. Useful views (in the l
 
 ### Don't click Profile on default-config traces
 
-The **Profile…** button replays the captured commands with counters enabled — fine for traces produced by the [recommended recipe](#recommended-starting-recipe) (~2 GB, replay takes a few minutes). It will lock up your machine on a default-config trace, where the engine has 20+ GiB of paged-attention KV state captured: replay tries to re-allocate all of that on the GPU at once. If Xcode beachballs after Profile, force-quit and re-run with `VLLM_METAL_MEMORY_FRACTION=0.1`.
+The **Profile…** button replays the captured commands with counters enabled — fine for traces produced by the [recommended recipe](#recommended-starting-recipe) (~2 GB, replay takes a few minutes). It will lock up your machine on a default-config trace, where the engine has 20+ GiB of paged-attention KV state captured: replay tries to re-allocate all of that on the GPU at once. If Xcode beachballs after Profile, force-quit and re-run with `--gpu-memory-utilization 0.1`.
 
 The non-replay panes (Summary, Dependencies, Memory, Frame Navigator) work on any trace size without clicking Profile.
 
@@ -105,12 +105,12 @@ The `delay_iterations` and `max_iterations` scheduling fields are **rejected** a
 This is the empirically-validated starting point. Smoke-tested on Qwen3-0.6B; produces a trace that finishes in ~1 minute and is small enough to inspect via Xcode's static panes (Summary, Dependencies, Memory):
 
 ```bash
-# Required env — Apple's gate + our 10× KV-cache shrink.
+# Required env — Apple's capture gate.
 export MTL_CAPTURE_ENABLED=1
-export VLLM_METAL_MEMORY_FRACTION=0.1
 
-# Launch the server.
+# Launch the server with a 10× KV-cache shrink.
 vllm serve Qwen/Qwen3-0.6B \
+  --gpu-memory-utilization 0.1 \
   --profiler-config.profiler=torch \
   --profiler-config.torch_profiler_dir=/tmp/metal-trace
 ```
@@ -132,12 +132,12 @@ What this recipe gets you (measured numbers, Qwen3-0.6B, M-series, 10 tokens gen
 
 | Knob | Effect |
 |---|---|
-| `VLLM_METAL_MEMORY_FRACTION=0.1` | KV cache: 22.1 GB → **0.58 GB** (38× reduction) |
+| `--gpu-memory-utilization 0.1` | KV cache: 22.1 GB → **0.58 GB** (38× reduction) |
 | `max_tokens=10` | Bounded decode work; ~10 forward passes captured |
 | **Resulting trace size** | **~2.2 GB on disk** |
 | **Capture wall-clock** | **~49 s** |
 
-This trace is small enough for **all** of Xcode's panes — including Profile/replay for per-kernel timing. The KV-cache shrink (22 GB → 0.58 GB) is what makes replay feasible: the captured GPU heap state has to fit when replay re-allocates it. Without `VLLM_METAL_MEMORY_FRACTION=0.1`, Profile will lock up your machine.
+This trace is small enough for **all** of Xcode's panes — including Profile/replay for per-kernel timing. The KV-cache shrink (22 GB → 0.58 GB) is what makes replay feasible: the captured GPU heap state has to fit when replay re-allocates it. Without `--gpu-memory-utilization 0.1`, Profile will lock up your machine.
 
 ## Caveats
 
@@ -145,7 +145,7 @@ This trace is small enough for **all** of Xcode's panes — including Profile/re
 
 **Traces are large.** A single forward pass through Qwen3-0.6B (28 layers) produces a ~2.6 GB `.gputrace` bundle on disk (the logical size, summed across the 30k+ captured buffers, is much higher — Metal uses sparse files). Larger models and longer captures grow accordingly. Make sure your trace dir has space.
 
-**Xcode replay needs the KV cache shrunk.** The Profile/replay pass re-allocates all captured GPU heap state. Without `VLLM_METAL_MEMORY_FRACTION=0.1` (or smaller), the replay will try to re-allocate the engine's full ~22 GiB paged-attention cache and lock up your machine. The recommended recipe avoids this. Static panes (Summary, Dependencies, Memory) work regardless.
+**Xcode replay needs the KV cache shrunk.** The Profile/replay pass re-allocates all captured GPU heap state. Without `--gpu-memory-utilization 0.1` (or smaller), the replay will try to re-allocate the engine's full ~22 GiB paged-attention cache and lock up your machine. The recommended recipe avoids this. Static panes (Summary, Dependencies, Memory) work regardless.
 
 **`MTL_CAPTURE_ENABLED` cannot be set lazily.** Apple's framework reads it once at process startup. Our wrapper checks for it in the worker subprocess and raises a clear error if missing. If you forget to set it, you'll see:
 

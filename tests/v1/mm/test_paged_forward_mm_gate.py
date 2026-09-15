@@ -17,7 +17,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
-from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_runner import RequestState, text_path_selective_logits_allowed
@@ -37,7 +37,7 @@ class TestStartPagedForwardMmFailFast:
         runner = make_stub_runner(
             encoder_cache=EncoderCache(),
             _is_vlm=True,
-            _paged_attention_runtime=MHAPagedAttentionRuntime(
+            _paged_attention_runtime=SDPAPagedAttentionRuntime(
                 num_layers=1,
                 num_kv_heads=1,
                 head_dim=4,

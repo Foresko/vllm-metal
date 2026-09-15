@@ -81,7 +81,12 @@ def mlx_generate(
 
 @contextmanager
 def serving(
-    model: str, max_model_len: int, max_num_seqs: int, log_path: Path, env: dict
+    model: str,
+    max_model_len: int,
+    max_num_seqs: int,
+    gpu_memory_utilization: float,
+    log_path: Path,
+    env: dict,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -104,6 +109,8 @@ def serving(
                 str(max_model_len),
                 "--max-num-seqs",
                 str(max_num_seqs),
+                "--gpu-memory-utilization",
+                str(gpu_memory_utilization),
                 "--no-enable-prefix-caching",
                 "--generation-config",
                 "vllm",
@@ -147,6 +154,7 @@ def check_parity(
     top_k: int | None = None,
     batch_sizes: tuple[int, ...] = (1, 2),
     output_dir: Path | None = None,
+    gpu_memory_utilization: float = 0.65,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -167,7 +175,6 @@ def check_parity(
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
-    env.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.3")
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
@@ -195,7 +202,12 @@ def check_parity(
     passed = True
     print("Starting vLLM server...", flush=True)
     with serving(
-        model, max_model_len, max(batch_sizes), output_dir / "serve.log", env
+        model,
+        max_model_len,
+        max(batch_sizes),
+        gpu_memory_utilization,
+        output_dir / "serve.log",
+        env,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -389,6 +401,12 @@ def main() -> None:
         type=Path,
         help="Artifact directory (default: a new temporary directory)",
     )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.65,
+        help="KV budget fraction passed to the vLLM server (default: 0.65)",
+    )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.max_tokens < 1:
@@ -410,6 +428,7 @@ def main() -> None:
         args.top_k,
         tuple(args.batch_size),
         args.output_dir,
+        args.gpu_memory_utilization,
     )
     raise SystemExit(0 if passed else 1)
 

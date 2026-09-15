@@ -23,7 +23,7 @@ import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
-from vllm_metal.attention.runtime.mha import MHAPagedAttentionRuntime
+from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.attention.state import RequestStateManager
 from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
@@ -1397,7 +1397,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
-        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+        runner._paged_attention_runtime = SDPAPagedAttentionRuntime(
             num_layers=1,
             num_kv_heads=1,
             head_dim=4,
@@ -1476,7 +1476,7 @@ class TestV1MetalModelRunnerExecuteModel:
 
     def test_paged_spec_decode_failure_does_not_mutate_request_setup(self) -> None:
         runner = self._make_runner()
-        runner._paged_attention_runtime = MHAPagedAttentionRuntime(
+        runner._paged_attention_runtime = SDPAPagedAttentionRuntime(
             num_layers=1,
             num_kv_heads=1,
             head_dim=4,
@@ -1679,7 +1679,7 @@ class TestV1MetalModelRunnerGDNSubmit:
     def test_prefill_non_hybrid_submits_logits_only(self, monkeypatch) -> None:
         submitted: list[tuple[object, ...]] = []
         runner = make_stub_runner(
-            _paged_attention_runtime=MHAPagedAttentionRuntime(
+            _paged_attention_runtime=SDPAPagedAttentionRuntime(
                 num_layers=1,
                 num_kv_heads=1,
                 head_dim=4,
@@ -1992,7 +1992,7 @@ class TestRunnerMlaProperties:
         runner = self._make_runner({"kv_lora_rank": 512})
         assert runner.is_mla is True
 
-    def test_is_mla_false_for_standard_mha(self) -> None:
+    def test_is_mla_false_for_standard_attention(self) -> None:
         runner = self._make_runner(
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
@@ -2240,7 +2240,7 @@ class TestMergeVerifyWindows:
     def test_false_by_default_without_opt_in(self) -> None:
         assert make_stub_runner().merge_verify_windows is False
 
-    def test_true_for_plain_mha_when_opted_in(self, monkeypatch) -> None:
+    def test_true_for_plain_attention_when_opted_in(self, monkeypatch) -> None:
         monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
         assert make_stub_runner().merge_verify_windows is True
 

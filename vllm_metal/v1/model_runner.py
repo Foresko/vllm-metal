@@ -130,7 +130,7 @@ logger = init_logger(__name__)
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
     "paged_attention_capacity",
-    "paged_attention_mha_layout_budget",
+    "paged_attention_layout_budget",
     "pooling_no_kv",
 ]
 
@@ -709,7 +709,7 @@ class MetalModelRunner:
         (``_start_paged_forward``) and the KV-cache spec size only this stage's
         layers — not the full model.
 
-        Only the validated path (uniform MHA, e.g. Qwen3) is supported under
+        Only the validated path (uniform SDPA attention, e.g. Qwen3) is supported under
         pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
         KV-cache layer accounting does not map cleanly onto a contiguous layer
         slice yet.
@@ -1020,6 +1020,10 @@ class MetalModelRunner:
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif spec.uses_draft_model():
+            allow_deferred_zero_k_ingest = (
+                not self.vllm_config.cache_config.enable_prefix_caching
+            )
+
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
             # `num_blocks` is the scheduler-visible committed-KV capacity for
@@ -1039,6 +1043,7 @@ class MetalModelRunner:
                 scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
+                allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
             )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer

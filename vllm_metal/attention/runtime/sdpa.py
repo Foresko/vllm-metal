@@ -5,16 +5,16 @@ from typing import Any
 
 import mlx.core as mx
 
+from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.impls.sdpa_wrapper import (
     patch_sdpa_attention,
 )
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 
 
-class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
-    """Paged attention runtime for standard MHA models.
+class SDPAPagedAttentionRuntime(PagedAttentionRuntimeBase):
+    """Paged attention runtime for SDPA attention models (MHA, GQA, MQA).
 
     Orchestrates native Metal SDPA attention: allocates MetalPagedKVCache, patches
     model attention layers with the vendored C++/Metal kernel, and warms up
@@ -50,7 +50,7 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
-        self._layout: MHAKVCacheLayout | None = None
+        self._layout: AttentionKVCacheLayout | None = None
 
     def initialize(self, num_blocks: int) -> None:
         self._cache = MetalPagedKVCache(
@@ -68,11 +68,11 @@ class MHAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             sliding_window_per_layer=self._sliding_window_per_layer,
         )
 
-    def adopt_layout(self, layout: MHAKVCacheLayout) -> None:
-        """Use vLLM's grouped MHA layout as the runtime KV cache."""
+    def adopt_layout(self, layout: AttentionKVCacheLayout) -> None:
+        """Use vLLM's grouped attention layout as the runtime KV cache."""
         if self._turboquant:
             raise NotImplementedError(
-                "layout-backed MHA runtime does not support TurboQuant"
+                "layout-backed SDPA runtime does not support TurboQuant"
             )
 
         self._layout = layout

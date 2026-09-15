@@ -79,7 +79,6 @@ def _ordinary_paged_cache(monkeypatch):
     monkeypatch.setattr(
         "vllm_metal.v1.cache_policy.get_config",
         lambda: MetalConfig(
-            memory_fraction=-1.0,
             mlx_device="gpu",
             turboquant=False,
         ),

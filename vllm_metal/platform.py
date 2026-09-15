@@ -33,6 +33,13 @@ _MB_BUFFER_MAX_BATCHED_TOKENS = 4096
 # Only the local executors share this process's memory and inherit its
 # environment; Ray workers must not receive a driver-derived value.
 _MB_BUFFER_LOCAL_BACKENDS = ("uni", "mp")
+_METAL_DENSE_KV_CACHE_DTYPES: dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+_METAL_DENSE_KV_CACHE_DTYPE_NAMES: dict[torch.dtype, str] = {
+    dtype: name for name, dtype in _METAL_DENSE_KV_CACHE_DTYPES.items()
+}
 
 
 def _pick_mb_buffer_default(
@@ -139,8 +146,8 @@ class MetalPlatform(Platform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get total memory available for the device.
 
-        On Apple Silicon, this returns the fraction of unified memory
-        configured for use by the plugin.
+        On Apple Silicon this is the unified memory size; the paged KV
+        budget carved out of it follows ``--gpu-memory-utilization``.
 
         Args:
             device_id: Device index (ignored for Metal)
@@ -148,12 +155,7 @@ class MetalPlatform(Platform):
         Returns:
             Total memory in bytes
         """
-        config = get_config()
-        total_memory = psutil.virtual_memory().total
-        # In auto mode, report full memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return total_memory
-        return int(total_memory * config.memory_fraction)
+        return int(psutil.virtual_memory().total)
 
     @classmethod
     def get_device_available_memory(cls, device_id: int = 0) -> int:
@@ -165,12 +167,7 @@ class MetalPlatform(Platform):
         Returns:
             Available memory in bytes
         """
-        config = get_config()
-        available = psutil.virtual_memory().available
-        # In auto mode, report full available memory - actual allocation is dynamic
-        if config.is_auto_memory:
-            return available
-        return int(available * config.memory_fraction)
+        return int(psutil.virtual_memory().available)
 
     @classmethod
     def is_available(cls) -> bool:
@@ -500,6 +497,35 @@ class MetalPlatform(Platform):
                 "which populates skip layers upstream). Enable TurboQuant with "
                 "--additional-config '{\"turboquant\": true}' instead."
             )
+
+        # vLLM accepts quantized KV cache dtypes and logs them as in use, but the
+        # Metal paged KV cache is always stored in the model dtype, so the
+        # requested memory saving would silently never happen. TurboQuant is
+        # Metal's quantized KV cache.
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype != "auto":
+            model_dtype = vllm_config.model_config.dtype
+            model_cache_dtype = _METAL_DENSE_KV_CACHE_DTYPE_NAMES.get(model_dtype)
+            if cache_dtype in _METAL_DENSE_KV_CACHE_DTYPES:
+                if _METAL_DENSE_KV_CACHE_DTYPES[cache_dtype] != model_dtype:
+                    dtype_detail = model_cache_dtype or str(model_dtype)
+                    raise NotImplementedError(
+                        f"vllm-metal does not support --kv-cache-dtype {cache_dtype} "
+                        f"with model dtype {dtype_detail}: the paged KV cache is "
+                        "stored in the model dtype."
+                    )
+            else:
+                dense_dtype_hint = (
+                    f"--kv-cache-dtype {model_cache_dtype}"
+                    if model_cache_dtype is not None
+                    else "--kv-cache-dtype auto"
+                )
+                raise NotImplementedError(
+                    f"vllm-metal does not support --kv-cache-dtype {cache_dtype}: "
+                    "the paged KV cache is stored in the model dtype. Use "
+                    f"{dense_dtype_hint}, or enable TurboQuant with "
+                    "--additional-config '{\"turboquant\": true}'."
+                )
 
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
@@ -940,9 +966,7 @@ class MetalPlatform(Platform):
             return
         desired = _pick_mb_buffer_default(
             total_memory_bytes=psutil.virtual_memory().total,
-            memory_fraction=get_config().effective_memory_fraction(
-                vllm_config.cache_config.gpu_memory_utilization
-            ),
+            memory_fraction=vllm_config.cache_config.gpu_memory_utilization,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),

@@ -24,15 +24,15 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
-from tests.stub_runner import make_gemma4_mixed_mha_runner, make_stub_runner
+from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runner
+from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.caches.mha_layout import KV_CACHE_LAYOUT, MHAKVCacheLayout
+from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
-from vllm_metal.attention.runtime.mha import (
-    MHAPagedAttentionRuntime,
+from vllm_metal.attention.runtime.sdpa import (
+    SDPAPagedAttentionRuntime,
 )
 from vllm_metal.config import (
-    AUTO_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
 )
@@ -61,7 +61,7 @@ def config_from_vllm_groups(
     )
 
 
-def merged_full_mha_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
+def merged_full_attention_config() -> tuple[KVCacheConfig, tuple[str, ...]]:
     names = tuple(f"layers.{index}.self_attn" for index in range(4))
     specs = {
         names[0]: FullAttentionSpec(
@@ -188,14 +188,14 @@ class TestMetalPagedKVCachePerLayer:
         assert "4.7 MB" not in messages[0]
 
 
-class TestMHABackendPerLayer:
-    """MHAPagedAttentionRuntime passes per-layer shapes to cache."""
+class TestSDPARuntimePerLayer:
+    """SDPAPagedAttentionRuntime passes per-layer shapes to cache."""
 
     def test_backend_propagates_per_layer_shapes(self) -> None:
         kv_heads = [16, 4]
         head_dims = [256, 512]
 
-        backend = MHAPagedAttentionRuntime(
+        backend = SDPAPagedAttentionRuntime(
             num_layers=2,
             num_kv_heads=kv_heads[0],
             head_dim=head_dims[0],
@@ -322,7 +322,6 @@ class TestCachePolicyPerLayerBytes:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=True,
             ),
@@ -341,8 +340,8 @@ class TestCachePolicyPerLayerBytes:
             runner.get_kv_cache_spec()
 
 
-class TestMHAKVCacheLayout:
-    """vLLM-managed standard-MHA cache layout contracts."""
+class TestAttentionKVCacheLayout:
+    """vLLM-managed standard attention cache layout contracts."""
 
     def gemma4_mixed_runner(
         self,
@@ -353,7 +352,7 @@ class TestMHAKVCacheLayout:
         disable_hybrid_manager: bool = False,
         num_gpu_blocks_override: int | None = None,
     ):
-        return make_gemma4_mixed_mha_runner(
+        return make_gemma4_mixed_attention_runner(
             num_layers=num_layers,
             sliding_kv_heads=sliding_kv_heads,
             full_kv_heads=full_kv_heads,
@@ -361,7 +360,7 @@ class TestMHAKVCacheLayout:
             num_gpu_blocks_override=num_gpu_blocks_override,
         )
 
-    def _mixed_mha_config(
+    def _mixed_attention_config(
         self, vllm_config: VllmConfig | None = None
     ) -> tuple[KVCacheConfig, tuple[str, ...]]:
         names = tuple(f"layers.{index}.self_attn" for index in range(4))
@@ -399,21 +398,21 @@ class TestMHAKVCacheLayout:
         return config_from_vllm_groups(groups, 3, vllm_config), names
 
     def test_translates_upstream_slots_and_groups(self) -> None:
-        config, names = self._mixed_mha_config()
+        config, names = self._mixed_attention_config()
 
-        layout = MHAKVCacheLayout.from_config(config, names)
+        layout = AttentionKVCacheLayout.from_config(config, names)
 
         assert layout.group_block_sizes == (32, 16)
         assert layout.slot_layers == ((0, 1), (2, 3))
-        assert [layer.tensor_index for layer in layout.layers] == [0, 0, 1, 1]
+        assert [layer.slot_index for layer in layout.layers] == [0, 0, 1, 1]
         assert [layer.group_index for layer in layout.layers] == [0, 1, 0, 1]
         assert [layer.sliding_window for layer in layout.layers] == [-1, 1024, -1, 1024]
         # Every tensor describes the same backing allocation the slots partition.
         assert layout.total_bytes == config.kv_cache_tensors[0].size
 
     def test_allocates_shared_slots_from_layout(self) -> None:
-        config, names = self._mixed_mha_config()
-        layout = MHAKVCacheLayout.from_config(config, names)
+        config, names = self._mixed_attention_config()
+        layout = AttentionKVCacheLayout.from_config(config, names)
 
         cache = MetalPagedKVCache.from_layout(layout, mx.bfloat16)
 
@@ -423,7 +422,7 @@ class TestMHAKVCacheLayout:
         assert cache.block_size_for_layer(1) == 16
 
     def test_cache_policy_adopts_engine_layout(self, monkeypatch) -> None:
-        config, _ = self._mixed_mha_config()
+        config, _ = self._mixed_attention_config()
         runner = make_stub_runner(
             num_layers=4,
             num_kv_cache_layers=4,
@@ -432,7 +431,7 @@ class TestMHAKVCacheLayout:
             kv_cache_dtype=mx.bfloat16,
             cache_config=SimpleNamespace(block_size=32),
         )
-        backend = MHAPagedAttentionRuntime(
+        backend = SDPAPagedAttentionRuntime(
             num_layers=4,
             num_kv_heads=4,
             head_dim=512,
@@ -452,7 +451,6 @@ class TestMHAKVCacheLayout:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=False,
             ),
@@ -469,7 +467,7 @@ class TestMHAKVCacheLayout:
     def test_cache_policy_keeps_merged_single_group_on_existing_runtime(
         self, monkeypatch
     ) -> None:
-        config, _ = merged_full_mha_config()
+        config, _ = merged_full_attention_config()
         runner = make_stub_runner(
             num_layers=4,
             num_kv_cache_layers=4,
@@ -480,7 +478,7 @@ class TestMHAKVCacheLayout:
             kv_heads_per_layer=[16, 16, 4, 4],
             head_dim_per_layer=[256, 256, 512, 512],
         )
-        backend = MHAPagedAttentionRuntime(
+        backend = SDPAPagedAttentionRuntime(
             num_layers=4,
             num_kv_heads=16,
             head_dim=256,
@@ -496,7 +494,6 @@ class TestMHAKVCacheLayout:
         monkeypatch.setattr(
             "vllm_metal.v1.cache_policy.get_config",
             lambda: MetalConfig(
-                memory_fraction=AUTO_MEMORY_FRACTION,
                 mlx_device="gpu",
                 turboquant=False,
             ),
@@ -533,7 +530,6 @@ class TestMHAKVCacheLayout:
             full_kv_heads=full_kv_heads,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )
@@ -577,7 +573,7 @@ class TestMHAKVCacheLayout:
         runner.initialize_kv_cache(config)
 
         backend = runner.paged_attention_runtime
-        assert isinstance(backend, MHAPagedAttentionRuntime)
+        assert isinstance(backend, SDPAPagedAttentionRuntime)
         assert backend.num_blocks() == config.num_blocks
         assert runner._paged_scheduler_group_indices == (0, 1, 2, 3, 4, 5)
         assert runner._paged_group_block_sizes == (16, 16, 16, 16, 16, 32)
@@ -599,7 +595,6 @@ class TestMHAKVCacheLayout:
             disable_hybrid_manager=True,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )
@@ -641,7 +636,6 @@ class TestMHAKVCacheLayout:
             num_gpu_blocks_override=100,
         )
         metal_config = MetalConfig(
-            memory_fraction=1.0,
             mlx_device="gpu",
             turboquant=False,
         )
@@ -674,9 +668,9 @@ class TestMHAKVCacheLayout:
             runner.initialize_kv_cache(config)
 
     def test_rebind_updates_every_layer_sharing_the_slot(self) -> None:
-        config, names = self._mixed_mha_config()
+        config, names = self._mixed_attention_config()
         cache = MetalPagedKVCache.from_layout(
-            MHAKVCacheLayout.from_config(config, names), mx.bfloat16
+            AttentionKVCacheLayout.from_config(config, names), mx.bfloat16
         )
 
         new_key = cache.key_caches[1] + mx.array(1, dtype=mx.bfloat16)
@@ -693,7 +687,7 @@ class TestMHAKVCacheLayout:
         """vLLM's block-outermost layout interleaves layers inside each block."""
         vllm_config = VllmConfig()
         record_kv_cache_layout(vllm_config.cache_config, KVCacheLayout.BLHNC.name)
-        config, names = self._mixed_mha_config(vllm_config)
+        config, names = self._mixed_attention_config(vllm_config)
 
         with pytest.raises(NotImplementedError, match="layer-outermost"):
-            MHAKVCacheLayout.from_config(config, names)
+            AttentionKVCacheLayout.from_config(config, names)

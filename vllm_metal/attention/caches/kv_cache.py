@@ -22,7 +22,7 @@ from collections.abc import Sequence
 import mlx.core as mx
 from vllm.logger import init_logger
 
-from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
+from vllm_metal.attention.caches.attention_layout import AttentionKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
@@ -41,7 +41,7 @@ class MetalPagedKVCache:
     and ``head_dim_per_layer`` are provided, each cache layer is allocated
     with its own ``(num_kv_heads, head_dim)`` pair.  When omitted, all
     layers share the scalar ``num_kv_heads`` / ``head_dim`` (backward
-    compat for MLA, Hybrid, and uniform MHA models).
+    compat for MLA, Hybrid, and uniform attention models).
     """
 
     def __init__(
@@ -59,7 +59,7 @@ class MetalPagedKVCache:
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
-        layout: MHAKVCacheLayout | None = None,
+        layout: AttentionKVCacheLayout | None = None,
     ) -> None:
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -234,7 +234,7 @@ class MetalPagedKVCache:
         mx.eval(*self.key_caches, *self.value_caches)
 
     def _allocate_layout_caches(
-        self, layout: MHAKVCacheLayout, dtype: mx.Dtype
+        self, layout: AttentionKVCacheLayout, dtype: mx.Dtype
     ) -> None:
         """Allocate shared physical K/V slots and per-layer logical views."""
         for slot_layers in layout.slot_layers:
@@ -245,12 +245,12 @@ class MetalPagedKVCache:
 
         for layer in layout.layers:
             self.key_caches.append(
-                self._key_slots[layer.tensor_index].reshape(
+                self._key_slots[layer.slot_index].reshape(
                     layer.cache_shape(self.num_blocks)
                 )
             )
             self.value_caches.append(
-                self._value_slots[layer.tensor_index].reshape(
+                self._value_slots[layer.slot_index].reshape(
                     layer.cache_shape(self.num_blocks)
                 )
             )
@@ -269,7 +269,7 @@ class MetalPagedKVCache:
             f"{self.block_size} tokens/block)"
         )
 
-    def _log_layout_cache(self, layout: MHAKVCacheLayout) -> None:
+    def _log_layout_cache(self, layout: AttentionKVCacheLayout) -> None:
         logger.info(
             f"KV cache: {layout.total_bytes / 1e6:.1f} MB "
             f"({len(layout.slot_layers)} physical slots across "
@@ -278,9 +278,9 @@ class MetalPagedKVCache:
 
     @classmethod
     def from_layout(
-        cls, layout: MHAKVCacheLayout, dtype: mx.Dtype
+        cls, layout: AttentionKVCacheLayout, dtype: mx.Dtype
     ) -> MetalPagedKVCache:
-        """Allocate one physical K/V pair for every upstream tensor slot."""
+        """Allocate one physical K/V pair for every upstream slot."""
         first_layer = layout.layers[0]
         return cls(
             num_layers=len(layout.layers),
@@ -316,7 +316,7 @@ class MetalPagedKVCache:
             self.value_caches[layer_idx] = value_cache
             return
 
-        slot = self._layout.layers[layer_idx].tensor_index
+        slot = self._layout.layers[layer_idx].slot_index
         self._key_slots[slot] = key_cache
         self._value_slots[slot] = value_cache
         for shared_layer in self._layout.slot_layers[slot]:
@@ -345,7 +345,7 @@ class MetalPagedKVCache:
                 arrays.extend(self.value_scale_caches)
                 arrays.extend(self.key_zero_caches)
         else:
-            # Logical layer views can share one upstream tensor slot. Copy the
+            # Logical layer views can share one upstream slot. Copy the
             # physical arrays once instead of repeating the same write through
             # every alias.
             arrays = [*self._key_slots, *self._value_slots]
