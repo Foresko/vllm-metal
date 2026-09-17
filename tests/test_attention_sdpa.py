@@ -1480,3 +1480,127 @@ class TestPhiAttention:
         assert captured["scale"] == pytest.approx(head_dim**-0.5)
         # The output ran through PhiAttention.dense, not a missing o_proj.
         assert out is not None
+
+
+class TestNarrowHeadKernelRead:
+    """A layer narrower than its cache reads the cache through the narrow kernel.
+
+    Gemma 4 sliding layers (head_dim 256) share a cache allocated for the
+    full-attention layers (512).  The scatter must keep writing cache-wide
+    rows, but the kernel addresses K/V through the cache's runtime strides and
+    only touches the first ``HEAD_SIZE`` elements of a row, so the query can go
+    in at the layer's own width and the output comes back at that width.  The
+    HEAD_SIZE=512 tile config (8 rows, one simdgroup) is ~6x slower than the
+    256 one, and 25 of Gemma 4's 30 layers were paying for it.
+    """
+
+    def _run(self, *, turboquant: bool) -> dict[str, object]:
+        cache = MetalPagedKVCache(
+            num_layers=2,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+            kv_heads_per_layer=[_N_KV_HEADS, _N_KV_HEADS],
+            head_dim_per_layer=[_HEAD_DIM, _CACHE_HEAD_DIM],
+        )
+        cache.turboquant = turboquant
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, object] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(self, key, _value, key_cache, value_cache, _slots):
+                captured["scatter_width"] = int(key.shape[-1])
+                return key_cache, value_cache
+
+            def turbo_quant_encode_and_cache(self, key, *_args, **_kwargs):
+                captured["scatter_width"] = int(key.shape[-1])
+                raise RuntimeError("stop before the TurboQuant kernel")
+
+            def paged_attention_primitive(
+                self, query, key_cache, _value_cache, *_args, **_kwargs
+            ) -> None:
+                captured["query_width"] = int(query.shape[-1])
+                captured["cache_width"] = int(key_cache.shape[-1])
+
+        def fake_truncate(out, b, l, n, cache_head_dim, actual_head_dim):
+            captured["truncate"] = (cache_head_dim, actual_head_dim)
+            return mx.zeros((b, l, n * actual_head_dim))
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(sdpa_mod, "truncate_padded_output", side_effect=fake_truncate),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=1)
+        return captured
+
+    def test_narrow_layer_query_reaches_the_kernel_unpadded(self) -> None:
+        captured = self._run(turboquant=False)
+        # The cache rows stay cache-wide: the scatter still pads K/V.
+        assert captured["scatter_width"] == _CACHE_HEAD_DIM
+        assert captured["cache_width"] == _CACHE_HEAD_DIM
+        # The kernel gets the layer's own width, and nothing is stripped after.
+        assert captured["query_width"] == _HEAD_DIM
+        assert captured["truncate"] == (_HEAD_DIM, _HEAD_DIM)
+
+    def test_full_width_layer_is_unchanged(self) -> None:
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        inner = SimpleNamespace(
+            n_heads=_N_HEADS,
+            n_kv_heads=_N_KV_HEADS,
+            scale=_HEAD_DIM**-0.5,
+            o_proj=lambda out: out,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+        queries = mx.ones((_BATCH, _N_HEADS, _SEQ_LEN, _HEAD_DIM))
+        keys = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
+        captured: dict[str, int] = {}
+
+        class _FakeOps:
+            def reshape_and_cache(self, key, _value, key_cache, value_cache, _slots):
+                captured["scatter_width"] = int(key.shape[-1])
+                return key_cache, value_cache
+
+            def paged_attention_primitive(self, query, *_args, **_kwargs) -> None:
+                captured["query_width"] = int(query.shape[-1])
+
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        assert captured == {"scatter_width": _HEAD_DIM, "query_width": _HEAD_DIM}
