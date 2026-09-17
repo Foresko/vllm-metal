@@ -288,6 +288,9 @@ struct TileConfig {
   int BQ;
   int TILE_KV;
   int NUM_THREADS;
+  // Simdgroups per 8-row group; > 1 splits the O columns between them
+  // (see D_SPLIT in pagedattention_tiled.metal).
+  int D_SPLIT = 1;
 };
 
 // ─ How to add a new HEAD_SIZE ────────────────────────────────────────────
@@ -308,7 +311,11 @@ struct TileConfig {
 // HEAD_SIZE -> (BQ, TILE_KV, NUM_THREADS, NUM_SG, smem):
 //   64, 96, 128 -> (32, 32, 128, 4, 24-26 KB)
 //   256         -> (16, 16,  64, 2,   25.3 KB)
-//   512         -> ( 8,  8,  32, 1,   24.9 KB)  // no in-threadgroup SG parallelism
+//   512         -> ( 8,  8, 128, 4,   25.9 KB)  // D_SPLIT=4: four simdgroups share
+//                                              // the 8 rows; each computes S over
+//                                              // its 128 columns of Q/K (partials
+//                                              // summed through a 1 KB exchange)
+//                                              // and owns 128 O columns
 // 80, 112 excluded by HD_TILES % NUM_SG(4) == 0.
 // ─────────────────────────────────────────────────────────────────────────
 static std::optional<TileConfig> select_tile_config(int head_size) {
@@ -318,7 +325,7 @@ static std::optional<TileConfig> select_tile_config(int head_size) {
     case 256:
       return TileConfig{16, 16, 64};
     case 512:
-      return TileConfig{8, 8, 32};
+      return TileConfig{8, 8, 128, 4};
     default:
       return std::nullopt;
   }
@@ -398,7 +405,8 @@ static void dispatch_paged_attention_tiled(
       "_bs" + std::to_string(block_size) +
       "_bq" + std::to_string(cfg.BQ) +
       "_tk" + std::to_string(cfg.TILE_KV) +
-      "_nt" + std::to_string(cfg.NUM_THREADS);
+      "_nt" + std::to_string(cfg.NUM_THREADS) +
+      "_ds" + std::to_string(cfg.D_SPLIT);
   std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0")
                           + "_mp" + (use_mm_prefix ? "1" : "0");
 
@@ -421,6 +429,12 @@ static void dispatch_paged_attention_tiled(
   const int ld       = head_size + smem_pad;
   size_t shmem = static_cast<size_t>(
       (cfg.BQ + 2 * cfg.TILE_KV) * ld * t_size);  // Q + K + V, padded
+  if (cfg.D_SPLIT > 1) {
+    // Partial-S exchange: [BQ/8 row groups][D_SPLIT][TILE_KV/8] fp32 8×8
+    // fragments (mirrors S_xchg in pagedattention_tiled.metal).
+    shmem += static_cast<size_t>(
+        (cfg.BQ / 8) * cfg.D_SPLIT * (cfg.TILE_KV / 8) * 64 * sizeof(float));
+  }
 
   int num_heads = static_cast<int>(query.shape(1));
   auto& enc = metal::get_command_encoder(s);
