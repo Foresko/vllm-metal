@@ -282,8 +282,22 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     }
   }
 
+  // Sliding window: every key left of the earliest row's window is masked
+  // for every row of this threadgroup, so those tiles contribute nothing
+  // and the loop starts at the first tile that can hold an attended key
+  // (the NAX kernel bounds its loop the same way).  Without this the 25
+  // sliding layers of Gemma 4 visited every tile of a 32K prompt and cost as
+  // much as full attention.  context_len and q_pos_start are uniform, so
+  // the bound needs no barrier; rows >= valid_q stay masked regardless.
+  const int tg_min_q_abs_pos = context_len + q_pos_start;
+  const int tg_max_q_abs_pos = tg_min_q_abs_pos + valid_q - 1;
+  int tile_idx_start = 0;
+  if (sliding_window >= 0) {
+    tile_idx_start = max(0, (tg_min_q_abs_pos + 1 - sliding_window) / TILE_KV);
+  }
+
   // ─ MAIN KV TILE LOOP ──────────────────────────────────────────────────
-  for (int tile_idx = 0; tile_idx < num_kv_tiles; tile_idx++) {
+  for (int tile_idx = tile_idx_start; tile_idx < num_kv_tiles; tile_idx++) {
     const int tile_start = tile_idx * TILE_KV;
 
     // Causal skip: stop once the whole tile lies beyond every key this
@@ -389,12 +403,16 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
     // This applies to most tiles in long-prefill (tile_start + TILE_KV - 1
     // < min_q_abs_pos in this threadgroup; min_q_abs_pos = context_len +
     // q_pos_start).  Saves ~16 ALU ops per element on tiles 0..N_safe-1.
-    const int q_abs_pos = context_len + q_pos_start + sg_idx * 8 + fm;
-    const int min_q_abs_pos = context_len + q_pos_start;
+    // With a sliding window the tile is also unmasked when it lies inside
+    // the window of the *last* row of the threadgroup (the tightest one):
+    // then every row's window covers the whole tile.
+    const int q_abs_pos = tg_min_q_abs_pos + sg_idx * 8 + fm;
+    const int min_q_abs_pos = tg_min_q_abs_pos;
     const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_pos
                               && (tile_start + TILE_KV) <= seq_len
                               && softcapping <= 0.0f
-                              && sliding_window < 0;
+                              && (sliding_window < 0
+                                  || tile_start >= tg_max_q_abs_pos + 1 - sliding_window);
 
     if (tile_no_mask && !row_masked) {
       #pragma unroll
