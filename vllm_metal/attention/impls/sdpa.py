@@ -710,9 +710,22 @@ def sdpa_forward(
         raw_block_tables = group.block_tables
         cache_block_size = group.block_size
     actual_head_dim = head_dim
-    queries, keys, values = pad_qkv_to_cache_head_dim(
+    # K/V are padded to the cache's width: the scatter writes whole rows.
+    # The query is not: the kernels address K/V rows through the cache's
+    # runtime strides and read only the first HEAD_SIZE elements of a row,
+    # which is exactly the layer's real data, so the layer can run on the
+    # kernel instantiated for its own head_dim.  For Gemma 4 that moves the
+    # 25 sliding layers (256) off the HEAD_SIZE=512 tile config (8 rows, one
+    # simdgroup, ~6x slower).  TurboQuant packs K per row, so there the
+    # first elements of a packed row are not the first dims: keep padding.
+    padded_q, keys, values = pad_qkv_to_cache_head_dim(
         queries, keys, values, head_dim, cache_head_dim
     )
+    if kv_cache.turboquant:
+        queries = padded_q
+        kernel_head_dim = cache_head_dim
+    else:
+        kernel_head_dim = actual_head_dim
     head_dim = cache_head_dim
 
     # The attention output keeps the query dtype, not the cache dtype.
@@ -1153,8 +1166,9 @@ def sdpa_forward(
             turboquant=kv_cache.turboquant,
         )
 
-    # Reshape + strip padding back to actual head_dim before o_proj.
-    out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
+    # Reshape + strip padding back to actual head_dim before o_proj (a no-op
+    # reshape when the kernel already ran at the layer's width).
+    out = truncate_padded_output(out, B, L, n_heads, kernel_head_dim, actual_head_dim)
     # The kernel returns the cache dtype. MLX promotes bfloat16 with float16
     # to float32, so a float16 checkpoint with a bfloat16 cache would
     # otherwise carry a float32 residual stream.
