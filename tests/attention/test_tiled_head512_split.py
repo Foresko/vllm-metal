@@ -42,7 +42,9 @@ def _setup(seed: int, *, n: int, seq_len: int, hd: int):
     return key_cache, value_cache, query, table
 
 
-def _kernel(query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window, **kwargs):
+def _kernel(
+    query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window, **kwargs
+):
     hd = int(query.shape[-1])
     out = mx.array(0)
     get_ops().paged_attention_primitive(
@@ -81,7 +83,18 @@ def _mask(q_lo, n, seq_len, blocks, window):
     return allowed
 
 
-def _reference(query, key_cache, value_cache, table_row, *, q_lo, seq_len, window, blocks=(), sinks=None):
+def _reference(
+    query,
+    key_cache,
+    value_cache,
+    table_row,
+    *,
+    q_lo,
+    seq_len,
+    window,
+    blocks=(),
+    sinks=None,
+):
     q = np.array(query.astype(mx.float32))
     k = _rows(key_cache, table_row, 0, seq_len)
     v = _rows(value_cache, table_row, 0, seq_len)
@@ -90,7 +103,9 @@ def _reference(query, key_cache, value_cache, table_row, *, q_lo, seq_len, windo
     k = np.repeat(k, n_rep, axis=1)
     v = np.repeat(v, n_rep, axis=1)
     scores = np.einsum("qhd,khd->hqk", q, k) * hd**-0.5
-    scores = np.where(_mask(q_lo, q.shape[0], seq_len, blocks, window)[None], scores, -1e30)
+    scores = np.where(
+        _mask(q_lo, q.shape[0], seq_len, blocks, window)[None], scores, -1e30
+    )
     if sinks is None:
         m = scores.max(axis=-1, keepdims=True)
         probs = np.exp(scores - m)
@@ -120,14 +135,32 @@ def _range_rows(cu_seqlens, context_lens, blocks_per_segment) -> mx.array:
     ("seq_len", "chunks"),
     [(300, [300]), (300, [150, 150]), (420, [200, 100, 120])],
 )
-def test_head512_matches_reference_for_every_chunking(window, seq_len, chunks, force_tiled_prefill) -> None:
+def test_head512_matches_reference_for_every_chunking(
+    window, seq_len, chunks, force_tiled_prefill
+) -> None:
     key_cache, value_cache, query, table = _setup(1, n=seq_len, seq_len=seq_len, hd=512)
     table_row = table[0].tolist()
     done = 0
     for n in chunks:
         q_lo, kv_len = done, done + n
-        got = _kernel(query[q_lo:kv_len], key_cache, value_cache, table, kv_lens=[kv_len], cu_seqlens_q=[0, n], window=window)
-        ref = _reference(query[q_lo:kv_len], key_cache, value_cache, table_row, q_lo=q_lo, seq_len=kv_len, window=window)
+        got = _kernel(
+            query[q_lo:kv_len],
+            key_cache,
+            value_cache,
+            table,
+            kv_lens=[kv_len],
+            cu_seqlens_q=[0, n],
+            window=window,
+        )
+        ref = _reference(
+            query[q_lo:kv_len],
+            key_cache,
+            value_cache,
+            table_row,
+            q_lo=q_lo,
+            seq_len=kv_len,
+            window=window,
+        )
         np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
         done = kv_len
 
@@ -147,10 +180,28 @@ def test_head512_varlen_batch_matches_reference(force_tiled_prefill) -> None:
     table = mx.array(rows, dtype=mx.int32)
     query = mx.concatenate([parts[0][2], parts[1][2]], axis=0)
     mx.eval(key_cache, value_cache, table, query)
-    got = np.array(_kernel(query, key_cache, value_cache, table, kv_lens=[kv for kv, _ in lens], cu_seqlens_q=[0, lens[0][1], lens[0][1] + lens[1][1]], window=64))
+    got = np.array(
+        _kernel(
+            query,
+            key_cache,
+            value_cache,
+            table,
+            kv_lens=[kv for kv, _ in lens],
+            cu_seqlens_q=[0, lens[0][1], lens[0][1] + lens[1][1]],
+            window=64,
+        )
+    )
     start = 0
     for i, (kv, q) in enumerate(lens):
-        ref = _reference(query[start : start + q], key_cache, value_cache, rows[i], q_lo=kv - q, seq_len=kv, window=64)
+        ref = _reference(
+            query[start : start + q],
+            key_cache,
+            value_cache,
+            rows[i],
+            q_lo=kv - q,
+            seq_len=kv,
+            window=64,
+        )
         np.testing.assert_allclose(got[start : start + q], ref, atol=ATOL, rtol=RTOL)
         start += q
 
@@ -159,8 +210,26 @@ def test_head512_sinks_match_reference(force_tiled_prefill) -> None:
     n = 200
     key_cache, value_cache, query, table = _setup(7, n=n, seq_len=n, hd=512)
     sinks = mx.array([0.5, -1.0, 2.0, 0.0], dtype=mx.float32)
-    got = _kernel(query, key_cache, value_cache, table, kv_lens=[n], cu_seqlens_q=[0, n], window=None, sinks=sinks)
-    ref = _reference(query, key_cache, value_cache, table[0].tolist(), q_lo=0, seq_len=n, window=None, sinks=np.array(sinks))
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_lens=[n],
+        cu_seqlens_q=[0, n],
+        window=None,
+        sinks=sinks,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=0,
+        seq_len=n,
+        window=None,
+        sinks=np.array(sinks),
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
@@ -171,8 +240,26 @@ def test_head512_mm_prefix_rows_match_reference(window, force_tiled_prefill) -> 
     block = (300, 400)
     key_cache, value_cache, query, table = _setup(9, n=n, seq_len=seq_len, hd=512)
     ranges = _range_rows([0, n], [seq_len], [[block]])
-    got = _kernel(query, key_cache, value_cache, table, kv_lens=[seq_len], cu_seqlens_q=[0, n], window=window, mm_prefix_ranges=ranges)
-    ref = _reference(query, key_cache, value_cache, table[0].tolist(), q_lo=seq_len - n, seq_len=seq_len, window=window, blocks=[block])
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, n],
+        window=window,
+        mm_prefix_ranges=ranges,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=seq_len - n,
+        seq_len=seq_len,
+        window=window,
+        blocks=[block],
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
@@ -194,9 +281,21 @@ def test_head512_costs_at_most_about_twice_head256(force_tiled_prefill) -> None:
     seq_len = 4096
     times = {}
     for hd in (256, 512):
-        key_cache, value_cache, query, table = _setup(11, n=seq_len, seq_len=seq_len, hd=hd)
+        key_cache, value_cache, query, table = _setup(
+            11, n=seq_len, seq_len=seq_len, hd=hd
+        )
         times[hd] = _median_seconds(
-            lambda: _kernel(query, key_cache, value_cache, table, kv_lens=[seq_len], cu_seqlens_q=[0, seq_len], window=None)
+            lambda q=query, k=key_cache, v=value_cache, t=table: _kernel(
+                q,
+                k,
+                v,
+                t,
+                kv_lens=[seq_len],
+                cu_seqlens_q=[0, seq_len],
+                window=None,
+            )
         )
     ratio = times[512] / times[256]
-    assert ratio <= 3.0, f"512: {times[512] * 1e3:.0f} ms vs 256: {times[256] * 1e3:.0f} ms, ratio {ratio:.1f}"
+    assert ratio <= 3.0, (
+        f"512: {times[512] * 1e3:.0f} ms vs 256: {times[256] * 1e3:.0f} ms, ratio {ratio:.1f}"
+    )

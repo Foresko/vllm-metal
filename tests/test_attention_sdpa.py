@@ -1534,9 +1534,9 @@ class TestNarrowHeadKernelRead:
                 captured["query_width"] = int(query.shape[-1])
                 captured["cache_width"] = int(key_cache.shape[-1])
 
-        def fake_truncate(out, b, l, n, cache_head_dim, actual_head_dim):
+        def fake_truncate(out, b, length, n, cache_head_dim, actual_head_dim):
             captured["truncate"] = (cache_head_dim, actual_head_dim)
-            return mx.zeros((b, l, n * actual_head_dim))
+            return mx.zeros((b, length, n * actual_head_dim))
 
         with (
             patch.object(

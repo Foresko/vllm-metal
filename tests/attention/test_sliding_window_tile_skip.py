@@ -198,7 +198,9 @@ def _median_seconds(fn, *, repeats: int = 5) -> float:
 
 
 @pytest.mark.slow
-def test_windowed_prefill_does_less_work_than_full_attention(force_tiled_prefill) -> None:
+def test_windowed_prefill_does_less_work_than_full_attention(
+    force_tiled_prefill,
+) -> None:
     """On an 8K sequence a 1024 window touches at most ~1/4 of the KV tiles a
     full-attention pass touches (causal triangle vs. band), so the windowed
     kernel must be clearly faster.  A kernel that only masks runs the same

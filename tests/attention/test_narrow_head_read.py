@@ -98,21 +98,49 @@ def test_prefill_on_a_wider_cache_matches_the_narrow_reference(
         1, n=seq_len, seq_len=seq_len, hd=hd, cache_hd=cache_hd
     )
     assert int(key_cache.shape[-1]) == cache_hd
-    got = _kernel(query, key_cache, value_cache, table, kv_len=seq_len, q_len=seq_len, window=window)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_len=seq_len,
+        q_len=seq_len,
+        window=window,
+    )
     assert int(got.shape[-1]) == hd
-    ref = _reference(query, key_cache, value_cache, table[0].tolist(), q_lo=0, seq_len=seq_len, window=window)
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=0,
+        seq_len=seq_len,
+        window=window,
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("window", [None, 96])
 @pytest.mark.parametrize(("hd", "cache_hd"), [(64, 128), (128, 256)])
-def test_decode_on_a_wider_cache_matches_the_narrow_reference(hd, cache_hd, window) -> None:
+def test_decode_on_a_wider_cache_matches_the_narrow_reference(
+    hd, cache_hd, window
+) -> None:
     """One query token over a 400-token context: the decode kernel path."""
     seq_len = 400
     key_cache, value_cache, query, table = _setup(
         2, n=1, seq_len=seq_len, hd=hd, cache_hd=cache_hd
     )
-    got = _kernel(query, key_cache, value_cache, table, kv_len=seq_len, q_len=1, window=window)
+    got = _kernel(
+        query, key_cache, value_cache, table, kv_len=seq_len, q_len=1, window=window
+    )
     assert int(got.shape[-1]) == hd
-    ref = _reference(query, key_cache, value_cache, table[0].tolist(), q_lo=seq_len - 1, seq_len=seq_len, window=window)
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        table[0].tolist(),
+        q_lo=seq_len - 1,
+        seq_len=seq_len,
+        window=window,
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)

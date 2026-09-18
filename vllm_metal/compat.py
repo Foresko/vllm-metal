@@ -35,6 +35,7 @@ def apply_compat_patches() -> None:
         return
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
+    _patch_vllm_sliding_window_replay_tail()
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
@@ -980,3 +981,127 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
     if patched:
         logger.debug("Patched mlx_lm Qwen3 flat weight prefix compatibility")
     return patched
+
+
+_REPLAY_TAIL_PATCHED_ATTR = "_vllm_metal_replay_tail_patched"
+
+
+def _patch_vllm_sliding_window_replay_tail() -> None:
+    """Retain one extra alignment block below every reachable boundary.
+
+    With ``prefix_cache_retention_interval`` 0 or positive (vLLM 0.29 defaults
+    to 0), a sliding-window group keeps only the window-sized run of blocks
+    that ends at a prompt's replay boundary, aligned down to the hybrid
+    alignment (32 tokens for Gemma 4: full-attention blocks of 32, sliding
+    blocks of 16).  A later request that diverges inside that last aligned
+    block -- the same user turn with a few words appended -- gets a
+    full-attention hit one aligned block shorter, and the sliding lookup then
+    finds 62-63 contiguous cached blocks where it needs 64: no match, the
+    whole prompt is recomputed.  Measured on Gemma 4 26B: a 4 100-token
+    prompt extended by three tokens hit 0 blocks (2.2 s), a 4 110-token one
+    hit 4 096 (0.13 s).  Keeping ``alignment_tokens / block_size`` more blocks
+    below each boundary makes the shorter hit's run long enough; the cost is
+    two 16-token blocks per cached prompt.  Dense retention (``None``) caches
+    every block and is left alone.
+    """
+    # Registration runs inside vLLM's own import, when this module cannot be
+    # imported yet (circular import), so the patch is applied the moment the
+    # module finishes importing -- or right away if it already has.
+    _after_import("vllm.v1.core.single_type_kv_cache_manager", _apply_replay_tail_patch)
+
+
+def _after_import(module_name: str, callback: Callable[[Any], None]) -> None:
+    """Run ``callback(module)`` once ``module_name`` is imported."""
+    import sys
+
+    module = sys.modules.get(module_name)
+    if module is not None:
+        callback(module)
+        return
+    sys.meta_path.insert(0, _PostImportHook(module_name, callback))
+
+
+class _PostImportHook:
+    """A meta-path finder that patches one module right after it executes."""
+
+    def __init__(self, module_name: str, callback: Callable[[Any], None]) -> None:
+        self._name = module_name
+        self._callback = callback
+        self._active = False
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname != self._name or self._active:
+            return None
+        import importlib.util
+        import sys
+
+        self._active = True
+        try:
+            spec = importlib.util.find_spec(fullname)
+        finally:
+            self._active = False
+        if (
+            spec is None
+            or spec.loader is None
+            or not hasattr(spec.loader, "exec_module")
+        ):
+            return None
+        loader = spec.loader
+        original_exec = loader.exec_module
+        hook = self
+
+        def exec_module(module: Any) -> None:
+            original_exec(module)
+            if hook in sys.meta_path:
+                sys.meta_path.remove(hook)
+            hook._callback(module)
+
+        loader.exec_module = exec_module  # type: ignore[method-assign]
+        return spec
+
+
+def _apply_replay_tail_patch(module: Any) -> None:
+    cls = module.SlidingWindowManager
+    if getattr(cls, _REPLAY_TAIL_PATCHED_ATTR, False):
+        return
+    original = cls.reachable_block_mask.__func__
+
+    def reachable_block_mask(
+        klass,
+        start_block,
+        end_block,
+        alignment_tokens,
+        kv_cache_spec,
+        use_eagle,
+        retention_interval=None,
+        reachable_boundaries=(),
+    ):
+        mask = original(
+            klass,
+            start_block,
+            end_block,
+            alignment_tokens,
+            kv_cache_spec,
+            use_eagle,
+            retention_interval,
+            reachable_boundaries,
+        )
+        if mask is None or retention_interval is None or not reachable_boundaries:
+            return mask
+        block_size = kv_cache_spec.block_size
+        need = klass._contiguous_blocks_for_hit(
+            window_size=kv_cache_spec.sliding_window,
+            block_size=block_size,
+            use_eagle=use_eagle,
+        )
+        extra = alignment_tokens // block_size
+        shift = 1 if use_eagle else 0
+        for boundary_tokens in reachable_boundaries:
+            aligned = boundary_tokens // alignment_tokens * alignment_tokens
+            end = aligned // block_size + shift
+            for j in range(max(start_block, end - need - extra), min(end_block, end)):
+                mask[j - start_block] = True
+        return mask
+
+    cls.reachable_block_mask = classmethod(reachable_block_mask)
+    setattr(cls, _REPLAY_TAIL_PATCHED_ATTR, True)
