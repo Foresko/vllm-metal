@@ -256,29 +256,6 @@ class SamplingBatch:
         )
 
     @staticmethod
-    def _top_k_top_p_masked_logits(
-        scaled_logits: mx.array,
-        top_k: int,
-        top_p: float,
-        min_p: float = 0.0,
-    ) -> mx.array:
-        """Mask temperature-scaled logits to the native candidate set.
-
-        Batch-wide scalar form of :meth:`_sorted_candidate_logits`, scattered
-        back into vocab order (used by the mask-parity tests).
-        """
-        rows = int(scaled_logits.shape[0])
-        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
-            scaled_logits, [top_k] * rows, [top_p] * rows, [min_p] * rows
-        )
-        return mx.put_along_axis(
-            mx.full(scaled_logits.shape, -mx.inf, dtype=scaled_logits.dtype),
-            sorted_idx,
-            sorted_desc,
-            axis=-1,
-        )
-
-    @staticmethod
     def _sorted_candidate_logits(
         scaled_logits: mx.array,
         top_k: Sequence[int],
@@ -291,25 +268,17 @@ class SamplingBatch:
         (``top_k <= 0`` means no top-k), so the graph stays lazy: nothing
         here evaluates an array. Returns ``(sorted_logits, sorted_token_ids)``:
         every row's candidate logits in descending order with masked positions
-        at ``-inf``, and the vocab ids at those positions. When every row has a
-        top-k, only the ``max(top_k)`` largest logits per row are partitioned
-        out and sorted; the rest of the vocab is never a candidate, so this is
-        exact except for ties straddling that boundary.
+        at ``-inf``, and the vocab ids at those positions.
+
+        The whole vocabulary is sorted, not just the ``max(top_k)`` largest
+        logits: top-k masks by value, so a row whose k-th largest logit is
+        tied keeps every token sharing that value, and a candidate set cut to
+        ``max(top_k)`` would drop the ones past it.
         """
         vocab_size = int(scaled_logits.shape[-1])
         effective_k = [k if 0 < k < vocab_size else vocab_size for k in top_k]
-        k_max = max(effective_k)
-        if k_max < vocab_size:
-            cand_idx = mx.argpartition(-scaled_logits, kth=k_max - 1, axis=-1)[
-                ..., :k_max
-            ]
-            cand = mx.take_along_axis(scaled_logits, cand_idx, axis=-1)
-            order = mx.argsort(-cand, axis=-1)
-            sorted_desc = mx.take_along_axis(cand, order, axis=-1)
-            sorted_idx = mx.take_along_axis(cand_idx, order, axis=-1)
-        else:
-            sorted_idx = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
-            sorted_desc = mx.take_along_axis(scaled_logits, sorted_idx, axis=-1)
+        sorted_idx = mx.argsort(scaled_logits, axis=-1)[..., ::-1]
+        sorted_desc = mx.take_along_axis(scaled_logits, sorted_idx, axis=-1)
 
         if any(k < vocab_size for k in effective_k):
             # Value threshold (not rank) so boundary ties survive like vLLM's
@@ -338,15 +307,20 @@ class SamplingBatch:
     ) -> mx.array:
         """Lazy per-row temperature/top-k/top-p/min-p token ids.
 
-        Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) become a
-        top-1 candidate set at unit temperature, so they resolve to the argmax
-        inside the same categorical draw as the random rows.
+        Greedy rows (temperature below ``GREEDY_TEMPERATURE_EPS``) ride along
+        as a top-1 candidate set at unit temperature so that every row of the
+        batch has a drawable distribution, and their drawn token is then
+        replaced by the argmax: top-k masks by value, so an exact tie at a
+        greedy row's maximum would otherwise leave the draw to pick between
+        the tied tokens where vLLM's greedy path is deterministic.
         """
+        greedy_rows: list[bool] = []
         temperatures: list[float] = []
         top_k: list[int] = []
         top_p: list[float] = []
         min_p: list[float] = []
         for sp in sampling_params_list:
+            greedy_rows.append(sp.temperature < GREEDY_TEMPERATURE_EPS)
             if sp.temperature < GREEDY_TEMPERATURE_EPS:
                 temperatures.append(1.0)
                 top_k.append(1)
@@ -365,7 +339,12 @@ class SamplingBatch:
             scaled, top_k, top_p, min_p
         )
         position = mx.random.categorical(sorted_desc, axis=-1, key=key)
-        return mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
+        tokens = mx.take_along_axis(sorted_idx, position[:, None], axis=-1)[:, 0]
+        if any(greedy_rows):
+            tokens = mx.where(
+                mx.array(greedy_rows), mlx_greedy_tokens(logits_2d), tokens
+            )
+        return tokens
 
     def _make_temperature(self) -> torch.Tensor | None:
         if self.all_greedy:
