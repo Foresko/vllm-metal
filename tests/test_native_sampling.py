@@ -13,6 +13,28 @@ VOCAB_SIZE = 512
 BATCH_SIZE = 4
 
 
+def _masked_in_vocab_order(
+    logits: mx.array,
+    top_k: list[int],
+    top_p: list[float],
+    min_p: list[float] | None = None,
+) -> mx.array:
+    """The native path's candidate mask, scattered back into vocab order.
+
+    Calls the production masking directly so these tests exercise what
+    sampling runs, and only rearranges its output for comparison with vLLM.
+    """
+    sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+        logits, top_k, top_p, min_p if min_p is not None else [0.0] * len(top_k)
+    )
+    return mx.put_along_axis(
+        mx.full(logits.shape, -mx.inf, dtype=logits.dtype),
+        sorted_idx,
+        sorted_desc,
+        axis=-1,
+    )
+
+
 def _random_params(**overrides) -> SamplingParams:
     defaults = {"temperature": 0.7, "top_k": 20, "top_p": 0.95}
     defaults.update(overrides)
@@ -117,7 +139,9 @@ class TestTopKTopPMaskParity:
         )
         p_arg = None if top_p == 1.0 else torch.full((BATCH_SIZE,), top_p)
 
-        masked_mlx = SamplingBatch._top_k_top_p_masked_logits(logits, top_k, top_p)
+        masked_mlx = _masked_in_vocab_order(
+            logits, [top_k] * BATCH_SIZE, [top_p] * BATCH_SIZE
+        )
         mx.eval(masked_mlx)
         masked_ref = apply_top_k_top_p(logits_torch.clone(), k_arg, p_arg)
 
@@ -134,7 +158,7 @@ class TestTopKTopPMaskParity:
         logits = mx.array([[2.0, 2.0, 2.0, 2.0]])
         logits_torch = torch.full((1, 4), 2.0)
 
-        masked = SamplingBatch._top_k_top_p_masked_logits(logits, 0, 0.25)
+        masked = _masked_in_vocab_order(logits, [0], [0.25])
         mx.eval(masked)
         masked_ref = apply_top_k_top_p(logits_torch, None, torch.full((1,), 0.25))
 
@@ -148,12 +172,7 @@ class TestTopKTopPMaskParity:
         mx.eval(logits)
         top_k = [20, 0, 7, VOCAB_SIZE]
         top_p = [1.0, 0.9, 0.5, 0.75]
-        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
-            logits, top_k, top_p, [0.0] * 4
-        )
-        masked_mlx = mx.put_along_axis(
-            mx.full(logits.shape, -mx.inf), sorted_idx, sorted_desc, axis=-1
-        )
+        masked_mlx = _masked_in_vocab_order(logits, top_k, top_p)
         mx.eval(masked_mlx)
         logits_torch = torch.tensor(logits.tolist())
         k_arg = torch.tensor([k if 0 < k < VOCAB_SIZE else VOCAB_SIZE for k in top_k])
@@ -163,9 +182,9 @@ class TestTopKTopPMaskParity:
         kept_ref = (masked_ref != float("-inf")).tolist()
         assert kept_mlx == kept_ref
 
-    def test_partitioned_top_k_keeps_ties_at_the_kth_value(self) -> None:
-        """Top-k masks by value, so ties at the k-th largest survive when the
-        partition (sized by the batch's widest top-k) contains them."""
+    def test_mixed_top_k_rows_keep_ties_at_their_own_kth_value(self) -> None:
+        """Each row's ties at its own k-th largest survive, whatever the
+        other rows in the batch ask for."""
         logits = mx.array(
             [[3.0, 2.0, 2.0, 2.0, 1.0, 0.0], [5.0, 4.0, 3.0, 2.0, 1.0, 0.0]]
         )
@@ -185,8 +204,60 @@ class TestTopKTopPMaskParity:
         ]
         assert kept_rows == [{0, 1, 2, 3}, {0, 1, 2, 3}]
 
+    def test_single_row_top_k_keeps_ties_at_the_kth_value(self) -> None:
+        """One row on its own must keep the same boundary ties vLLM keeps.
+
+        Top-k masks by value, so every logit equal to the k-th largest
+        survives: ``top_k=2`` over ``[3, 2, 2, 2, 1, 0]`` keeps four tokens.
+        A candidate set capped at the row's own ``top_k`` would keep two.
+        """
+        logits = mx.array([[3.0, 2.0, 2.0, 2.0, 1.0, 0.0]])
+        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+            logits, [2], [1.0], [0.0]
+        )
+        mx.eval(sorted_desc, sorted_idx)
+        kept = {
+            int(t)
+            for t, v in zip(
+                sorted_idx.tolist()[0], sorted_desc.tolist()[0], strict=True
+            )
+            if v != float("-inf")
+        }
+
+        masked_ref = apply_top_k_top_p(
+            torch.tensor([[3.0, 2.0, 2.0, 2.0, 1.0, 0.0]]),
+            torch.tensor([2]),
+            None,
+        )
+        kept_ref = {
+            i for i, v in enumerate(masked_ref.tolist()[0]) if v != float("-inf")
+        }
+        assert kept == kept_ref == {0, 1, 2, 3}
+
 
 class TestMlxRandomTokens:
+    def test_greedy_row_with_tied_maximum_stays_on_the_argmax(self) -> None:
+        """A greedy row must resolve to the argmax even when the top logits
+        tie. Masking it by value keeps every tied token, and the categorical
+        draw then picks between them; vLLM's greedy path takes the argmax.
+        """
+        logits = mx.array([[1.0, 5.0, 5.0, 0.0], [1.0, 2.0, 3.0, 4.0]])
+        params = [
+            _random_params(temperature=0.0),
+            _random_params(temperature=1.0, top_k=0, top_p=0.9),
+        ]
+        expected = int(mx.argmax(logits[0]).item())
+
+        drawn = set()
+        for seed in range(50):
+            tokens = SamplingBatch._native_random_tokens(
+                logits, params, mx.random.key(seed)
+            )
+            mx.eval(tokens)
+            drawn.add(int(tokens.tolist()[0]))
+
+        assert drawn == {expected}
+
     def test_mixed_batch_rows_follow_their_own_params(self) -> None:
         """A greedy row sticks to its argmax and a narrow top-k row stays inside
         its candidates while a wide row keeps exploring — all in one draw."""
