@@ -11,7 +11,7 @@ the paged backend.
 | ✅ | Supported model/feature |
 | 🔵 | Experimental supported model/feature |
 | ❌ | Not supported model/feature |
-| 🟡 | Not tested or verified |
+| 🟡 | Verified only with a tiny model; real checkpoint unverified |
 
 Each row tracks a model family. The **Example checkpoint** is one configuration
 we have actually run on Metal — a starting point, not the only checkpoint that
@@ -96,7 +96,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
 | Phi 1.5 / Phi 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
 | GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
-| GLM-4.5 | 🟡 | MLA (paged latent cache, MLX SDPA — no Metal kernel) | 🟡 | — |
+| GLM-4.5 | Not verified | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
 | GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
 | DeepSeek-R1-Distill-Qwen | ✅ | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
@@ -110,6 +110,7 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
 | EXAONE 4.0 | 🔵 | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
 | Laguna | ✅  | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
 | Hunyuan (dense) | ✅ | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |
+| MiniMax M2 | 🟡 | GQA + full-projection QK norm (paged) | Not verified | — |
 | OLMo 2 | ✅ | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
 | OLMoE | ✅ | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
 | OLMo 3 | 🔵 | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
