@@ -835,9 +835,10 @@ class MetalPlatform(Platform):
             if model_config is not None
             else None
         )
-        if resolved_model is not None and is_stt_model(
+        serves_stt_model = resolved_model is not None and is_stt_model(
             resolved_model, revision=model_config.revision
-        ):
+        )
+        if serves_stt_model:
             # STT checkpoints use a dedicated STTModelRunner with no pipeline-
             # split path. Reject PP here, with the other config-time PP guards,
             # before any worker spawns.

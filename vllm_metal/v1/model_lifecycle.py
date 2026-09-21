@@ -21,7 +21,7 @@ from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
@@ -148,7 +148,7 @@ class GenerationLoadRequest:
             model_config=model_config,
             hf_config=hf_config,
             is_vlm=is_vlm,
-            target_dtype=torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype,
+            target_dtype=TORCH_TO_MLX_DTYPE[model_config.dtype],
             tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
             gguf_source=gguf_source,
             lazy_weights=lazy_weights,
@@ -364,7 +364,7 @@ class ModelLifecycle:
             else dict(tokenizer_config)
         )
         if not is_vlm and target_dtype is None:
-            target_dtype = torch_to_mlx(torch.empty(0, dtype=model_config.dtype)).dtype
+            target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
 
         start_time = time.time()
         if gguf_source is None and not is_vlm:

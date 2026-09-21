@@ -121,6 +121,40 @@ class TestMetalPlatform:
         )
         monkeypatch.setattr("vllm_metal.stt.detection.is_stt_model", detect)
 
+    def _detection_platform_config(
+        self,
+        *,
+        model: str = "openai/whisper-tiny",
+        tokenizer: str | None = None,
+        model_type: str = "whisper",
+    ) -> VllmConfig:
+        return self._platform_config(
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=SimpleNamespace(
+                kv_cache_dtype_skip_layers=[],
+                block_size=None,
+            ),
+            model_config=SimpleNamespace(
+                model=model,
+                disable_cascade_attn=False,
+                tokenizer=tokenizer,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type=model_type),
+                is_hybrid=False,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=False,
+            ),
+        )
+
     def test_device_name(self) -> None:
         """Test device name retrieval."""
         name = MetalPlatform.get_device_name()
@@ -1379,32 +1413,7 @@ class TestMetalPlatform:
     ) -> None:
         """STT models should get tokenizer fallback and async scheduling disabled."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(
-                kv_cache_dtype_skip_layers=[],
-                block_size=None,
-            ),
-            model_config=SimpleNamespace(
-                model="openai/whisper-tiny",
-                disable_cascade_attn=False,
-                tokenizer=None,
-                multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="whisper"),
-                is_hybrid=False,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=False,
-            ),
-        )
+        vllm_config = self._detection_platform_config()
 
         MetalPlatform.check_and_update_config(vllm_config)
 
@@ -1416,32 +1425,7 @@ class TestMetalPlatform:
     ) -> None:
         """STT policy should not overwrite an explicitly configured tokenizer."""
         self._patch_stt_resolution(monkeypatch, is_stt=True)
-        vllm_config = self._platform_config(
-            speculative_config=None,
-            parallel_config=SimpleNamespace(
-                worker_cls="auto",
-                distributed_executor_backend="auto",
-                pipeline_parallel_size=1,
-                tensor_parallel_size=1,
-                disable_custom_all_reduce=False,
-            ),
-            cache_config=SimpleNamespace(
-                kv_cache_dtype_skip_layers=[],
-                block_size=None,
-            ),
-            model_config=SimpleNamespace(
-                model="openai/whisper-tiny",
-                disable_cascade_attn=False,
-                tokenizer="custom-tokenizer",
-                multimodal_config=None,
-                hf_config=SimpleNamespace(model_type="whisper"),
-                is_hybrid=False,
-            ),
-            scheduler_config=SimpleNamespace(
-                async_scheduling=True,
-                enable_chunked_prefill=False,
-            ),
-        )
+        vllm_config = self._detection_platform_config(tokenizer="custom-tokenizer")
 
         MetalPlatform.check_and_update_config(vllm_config)
 
@@ -1540,7 +1524,6 @@ class TestMetalPlatform:
         enters with the unset default and resolves to "uni" in the same
         call)."""
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1563,7 +1546,6 @@ class TestMetalPlatform:
         self, monkeypatch
     ) -> None:
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1586,7 +1568,6 @@ class TestMetalPlatform:
 
     def test_check_and_update_config_keeps_manual_mb_export(self, monkeypatch) -> None:
         monkeypatch.setenv("MLX_MAX_MB_PER_BUFFER", "64")
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,
@@ -1610,7 +1591,6 @@ class TestMetalPlatform:
         """#585 shape: a later engine above the batched-token bound removes
         the plugin's own earlier default instead of inheriting it."""
         monkeypatch.delenv("MLX_MAX_MB_PER_BUFFER", raising=False)
-        monkeypatch.delenv("VLLM_METAL_MEMORY_FRACTION", raising=False)
         vm_config.reset_config()
         monkeypatch.setattr(
             platform_module.psutil,

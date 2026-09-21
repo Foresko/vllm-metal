@@ -10,7 +10,7 @@ class QKNormPlacement(Enum):
 
     BEFORE_ROPE = auto()  # Default: per-head normalization
     AFTER_ROPE = auto()  # Hunyuan: per-head normalization after RoPE
-    BEFORE_HEAD_SPLIT = auto()  # OLMo 2/3: full-projection normalization
+    BEFORE_HEAD_SPLIT = auto()  # MiniMax, OLMo 2/3/E: full-projection normalization
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,10 +27,16 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.hunyuan_v1_dense": AttentionContract(
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
+    "mlx_lm.models.minimax": AttentionContract(
+        qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
+    ),
     "mlx_lm.models.olmo2": AttentionContract(
         qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
     ),
     "mlx_lm.models.olmo3": AttentionContract(
+        qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
+    ),
+    "mlx_lm.models.olmoe": AttentionContract(
         qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
     ),
     "mlx_lm.models.stablelm": AttentionContract(derive_scale_from_query=True),

@@ -3,10 +3,10 @@
 
 STT checkpoints (Whisper, Qwen3-ASR) run a black-box transcribe in a single
 ``execute_model`` call: the runtime adapter owns audio-feature extraction and
-the full greedy decode, returning the transcript tokens in one shot. That
-execution model shares nothing with token generation — no paged-attention KV
-cache, no sampler, no iterative decode loop — so it lives in a dedicated runner
-instead of branching inside :class:`MetalModelRunner`.
+the whole decode, returning the transcript tokens in one shot. That execution
+model shares nothing with token generation — no paged-attention KV cache, no
+scheduled decode loop — so it lives in a dedicated runner instead of branching
+inside :class:`MetalModelRunner`.
 
 The worker selects this runner for STT models (see ``MetalWorker.init_device``).
 Everything here implements the worker-facing runner contract for that one-shot
@@ -20,7 +20,6 @@ from typing import Any, Literal
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -29,10 +28,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.stt.loader import resolve_model_path
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
 from vllm_metal.stt.runtime import STTRuntimeAdapter
+from vllm_metal.stt.sampling import STTSampling
 from vllm_metal.stt.serve import VLLMSTTRequestAdapter
 from vllm_metal.v1.model_lifecycle import load_stt_model
 
@@ -52,6 +53,7 @@ class STTModelRunner:
         self.model: Any = None
         self.tokenizer: Any = None
         self._stt_runtime_adapter: STTRuntimeAdapter | None = None
+        self._sampler = Sampler()
 
         # execute_model stashes the output here; sample_tokens returns it,
         # matching the engine's execute -> sample handoff.
@@ -169,11 +171,7 @@ class STTModelRunner:
     def _execute_stt(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
-        """Execute STT inference for all new requests in the batch.
-
-        Raises:
-            ValueError: If a request uses non-greedy sampling params.
-        """
+        """Execute STT inference for all new requests in the batch."""
         assert self._stt_runtime_adapter is not None
 
         req_ids: list[str] = []
@@ -184,20 +182,14 @@ class STTModelRunner:
 
         for new_req in scheduler_output.scheduled_new_reqs:
             stt_request = VLLMSTTRequestAdapter.from_vllm_request(new_req)
-            sampling_params = new_req.sampling_params or SamplingParams()
-
-            # Only greedy decoding is supported for STT
-            if sampling_params.temperature > 0:
-                raise ValueError(
-                    "STT models only support greedy decoding (temperature=0). "
-                    f"Got temperature={sampling_params.temperature}"
-                )
 
             audio_features = self._stt_runtime_adapter.extract_audio_features(
                 stt_request.input_features
             )
             tokens = self._stt_runtime_adapter.decode_tokens(
-                audio_features, list(stt_request.prompt_token_ids)
+                audio_features,
+                list(stt_request.prompt_token_ids),
+                STTSampling.from_request(stt_request.sampling_params, self._sampler),
             )
 
             req_ids.append(stt_request.req_id)

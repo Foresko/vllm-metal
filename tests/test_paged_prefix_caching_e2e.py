@@ -23,9 +23,8 @@ the ``spawn`` start method) so Metal device init happens in a fresh
 interpreter.  Required on Metal because:
   - ``fork`` inherits the parent's Metal context and segfaults
     (Metal is not fork-safe).
-  - Running in the parent pytest process alongside the cache-off
-    baseline fixture in ``test_paged_deterministic`` causes
-    ``kv_budget=0`` — MLX wired buffers aren't released by Python gc.
+  - Other engines in the parent pytest process can retain MLX wired
+    buffers and leave no room for this test's KV cache.
 """
 
 from __future__ import annotations
@@ -35,10 +34,8 @@ import os
 
 import pytest
 
-from tests.test_paged_deterministic import (
-    DEFAULT_PAGED_MEMORY_FRACTION,
-    MODEL_NAME,
-)
+MODEL_NAME = "Qwen/Qwen3-0.6B"
+GPU_MEMORY_UTILIZATION = 0.2
 
 # Long shared prefix (~30 tokens — comfortably more than the 16-token
 # Metal block size, so the upstream scheduler hashes at least one block
@@ -56,15 +53,9 @@ PROMPTS = [
 MAX_TOKENS = 10
 
 
-def _setenv_default(key: str, default: str) -> None:
-    if os.environ.get(key) is None:
-        os.environ[key] = default
-
-
 def _run_prefix_cache_correctness() -> None:
     """Body of the e2e test — runs in a spawned child process."""
-    _setenv_default("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    _setenv_default("VLLM_METAL_MEMORY_FRACTION", DEFAULT_PAGED_MEMORY_FRACTION)
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     from vllm import LLM, SamplingParams
 
@@ -90,6 +81,7 @@ def _run_prefix_cache_correctness() -> None:
             max_model_len=512,
             max_num_seqs=1,
             enable_prefix_caching=True,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         )
         sp = SamplingParams(temperature=0, max_tokens=MAX_TOKENS)
         out_first = llm.generate(PROMPTS, sp)

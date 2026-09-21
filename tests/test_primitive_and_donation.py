@@ -12,6 +12,8 @@ Run with:
 
 from __future__ import annotations
 
+import time
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -161,7 +163,7 @@ def test_primitive_vs_reference_decode(
     "num_heads",
     [(4, 4), (8, 2)],
 )
-@pytest.mark.parametrize("sliding_window", [-1, 128])
+@pytest.mark.parametrize("sliding_window", [-1, 100])
 @pytest.mark.parametrize("num_blocks", [256])
 def test_primitive_vs_reference_varlen(
     seq_lens: list[tuple[int, int]],
@@ -212,6 +214,58 @@ def test_primitive_vs_reference_varlen(
         atol=1.5e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.slow
+def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
+    """A 1024-token window avoids most KV tiles of an 8K prefill."""
+    seq_len = 8192
+    window = 1024
+    repeats = 5
+    minimum_speedup = 2.0
+    num_kv_heads = 2
+    num_query_heads = 4
+    d = _make_cache_and_inputs(
+        seq_len // BLOCK_SIZE,
+        num_kv_heads,
+        num_query_heads,
+        [(seq_len, seq_len)],
+        head_size=64,
+    )
+    ops = get_ops()
+
+    def run(sliding_window: int) -> None:
+        out = mx.array(0)
+        ops.paged_attention_primitive(
+            d["query"],
+            d["key_cache"],
+            d["value_cache"],
+            d["num_kv_heads"],
+            d["scale"],
+            0.0,
+            d["block_tables"],
+            d["kv_lens_arr"],
+            d["cu_seqlens_q"],
+            BLOCK_SIZE,
+            d["max_kv_len"],
+            sliding_window,
+            out,
+        )
+        mx.eval(out)
+
+    def median_runtime(sliding_window: int) -> float:
+        run(sliding_window)
+        samples = []
+        for _ in range(repeats):
+            start = time.perf_counter()
+            run(sliding_window)
+            samples.append(time.perf_counter() - start)
+        return sorted(samples)[len(samples) // 2]
+
+    full = median_runtime(-1)
+    windowed = median_runtime(window)
+    speedup = full / windowed
+    assert speedup >= minimum_speedup, f"sliding-window speedup was only {speedup:.2f}x"
 
 
 # ── 1b. Tiled-kernel head-size coverage ─────────────────────────────────────

@@ -56,3 +56,8 @@ model pairing, and memory considerations.
 The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
 flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
+
+Models with full and sliding-window attention use grouped KV cache, allowing
+sliding layers to release old blocks. This can improve long-context capacity,
+but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
+for dense allocation.
