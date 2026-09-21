@@ -13,6 +13,28 @@ VOCAB_SIZE = 512
 BATCH_SIZE = 4
 
 
+def _masked_in_vocab_order(
+    logits: mx.array,
+    top_k: list[int],
+    top_p: list[float],
+    min_p: list[float] | None = None,
+) -> mx.array:
+    """The native path's candidate mask, scattered back into vocab order.
+
+    Calls the production masking directly so these tests exercise what
+    sampling runs, and only rearranges its output for comparison with vLLM.
+    """
+    sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+        logits, top_k, top_p, min_p if min_p is not None else [0.0] * len(top_k)
+    )
+    return mx.put_along_axis(
+        mx.full(logits.shape, -mx.inf, dtype=logits.dtype),
+        sorted_idx,
+        sorted_desc,
+        axis=-1,
+    )
+
+
 def _random_params(**overrides) -> SamplingParams:
     defaults = {"temperature": 0.7, "top_k": 20, "top_p": 0.95}
     defaults.update(overrides)
@@ -36,8 +58,36 @@ class TestNativeRandomEligibility:
     @pytest.mark.parametrize(
         ("label", "params_list"),
         [
-            ("empty batch", []),
             ("greedy request", [_random_params(temperature=0.0)]),
+            (
+                "mixed greedy and random",
+                [_random_params(), _random_params(temperature=0.0)],
+            ),
+            (
+                "mixed top_k",
+                [_random_params(top_k=20), _random_params(top_k=40)],
+            ),
+            (
+                "mixed top_p",
+                [_random_params(top_p=0.95), _random_params(top_p=0.8)],
+            ),
+            (
+                "mixed min_p",
+                [_random_params(min_p=0.1), _random_params(min_p=0.0)],
+            ),
+        ],
+    )
+    def test_per_row_masks_keep_mixed_batches_eligible(
+        self, label, params_list
+    ) -> None:
+        """Masks are per row: one request must never push the whole batch
+        onto the torch sampler (that serialises every decode step)."""
+        assert SamplingBatch.params_allow_native_random(params_list)
+
+    @pytest.mark.parametrize(
+        ("label", "params_list"),
+        [
+            ("empty batch", []),
             ("seeded request", [_random_params(seed=7)]),
             ("frequency penalty", [_random_params(frequency_penalty=0.5)]),
             ("presence penalty", [_random_params(presence_penalty=0.5)]),
@@ -48,20 +98,8 @@ class TestNativeRandomEligibility:
                 [_random_params(logprob_token_ids=[1, 2])],
             ),
             (
-                "mixed greedy and random",
-                [_random_params(), _random_params(temperature=0.0)],
-            ),
-            (
                 "allowed token ids",
                 [_random_params(allowed_token_ids=[1, 2])],
-            ),
-            (
-                "mixed top_k",
-                [_random_params(top_k=20), _random_params(top_k=40)],
-            ),
-            (
-                "mixed top_p",
-                [_random_params(top_p=0.95), _random_params(top_p=0.8)],
             ),
         ],
     )
@@ -101,7 +139,9 @@ class TestTopKTopPMaskParity:
         )
         p_arg = None if top_p == 1.0 else torch.full((BATCH_SIZE,), top_p)
 
-        masked_mlx = SamplingBatch._top_k_top_p_masked_logits(logits, top_k, top_p)
+        masked_mlx = _masked_in_vocab_order(
+            logits, [top_k] * BATCH_SIZE, [top_p] * BATCH_SIZE
+        )
         mx.eval(masked_mlx)
         masked_ref = apply_top_k_top_p(logits_torch.clone(), k_arg, p_arg)
 
@@ -118,7 +158,7 @@ class TestTopKTopPMaskParity:
         logits = mx.array([[2.0, 2.0, 2.0, 2.0]])
         logits_torch = torch.full((1, 4), 2.0)
 
-        masked = SamplingBatch._top_k_top_p_masked_logits(logits, 0, 0.25)
+        masked = _masked_in_vocab_order(logits, [0], [0.25])
         mx.eval(masked)
         masked_ref = apply_top_k_top_p(logits_torch, None, torch.full((1,), 0.25))
 
@@ -126,8 +166,127 @@ class TestTopKTopPMaskParity:
         kept_count_ref = int((masked_ref != float("-inf")).sum().item())
         assert kept_count == kept_count_ref == 1
 
+    def test_per_row_masks_match_vllm_reference(self) -> None:
+        """Each row keeps exactly the candidates vLLM keeps for its own k/p."""
+        logits = mx.random.normal((4, VOCAB_SIZE), key=mx.random.key(9))
+        mx.eval(logits)
+        top_k = [20, 0, 7, VOCAB_SIZE]
+        top_p = [1.0, 0.9, 0.5, 0.75]
+        masked_mlx = _masked_in_vocab_order(logits, top_k, top_p)
+        mx.eval(masked_mlx)
+        logits_torch = torch.tensor(logits.tolist())
+        k_arg = torch.tensor([k if 0 < k < VOCAB_SIZE else VOCAB_SIZE for k in top_k])
+        masked_ref = apply_top_k_top_p(logits_torch.clone(), k_arg, torch.tensor(top_p))
+
+        kept_mlx = [[v != float("-inf") for v in row] for row in masked_mlx.tolist()]
+        kept_ref = (masked_ref != float("-inf")).tolist()
+        assert kept_mlx == kept_ref
+
+    def test_mixed_top_k_rows_keep_ties_at_their_own_kth_value(self) -> None:
+        """Each row's ties at its own k-th largest survive, whatever the
+        other rows in the batch ask for."""
+        logits = mx.array(
+            [[3.0, 2.0, 2.0, 2.0, 1.0, 0.0], [5.0, 4.0, 3.0, 2.0, 1.0, 0.0]]
+        )
+        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+            logits, [2, 4], [1.0, 1.0], [0.0, 0.0]
+        )
+        mx.eval(sorted_desc, sorted_idx)
+        kept_rows = [
+            {
+                int(t)
+                for t, v in zip(idx_row, val_row, strict=True)
+                if v != float("-inf")
+            }
+            for idx_row, val_row in zip(
+                sorted_idx.tolist(), sorted_desc.tolist(), strict=True
+            )
+        ]
+        assert kept_rows == [{0, 1, 2, 3}, {0, 1, 2, 3}]
+
+    def test_single_row_top_k_keeps_ties_at_the_kth_value(self) -> None:
+        """One row on its own must keep the same boundary ties vLLM keeps.
+
+        Top-k masks by value, so every logit equal to the k-th largest
+        survives: ``top_k=2`` over ``[3, 2, 2, 2, 1, 0]`` keeps four tokens.
+        A candidate set capped at the row's own ``top_k`` would keep two.
+        """
+        logits = mx.array([[3.0, 2.0, 2.0, 2.0, 1.0, 0.0]])
+        sorted_desc, sorted_idx = SamplingBatch._sorted_candidate_logits(
+            logits, [2], [1.0], [0.0]
+        )
+        mx.eval(sorted_desc, sorted_idx)
+        kept = {
+            int(t)
+            for t, v in zip(
+                sorted_idx.tolist()[0], sorted_desc.tolist()[0], strict=True
+            )
+            if v != float("-inf")
+        }
+
+        masked_ref = apply_top_k_top_p(
+            torch.tensor([[3.0, 2.0, 2.0, 2.0, 1.0, 0.0]]),
+            torch.tensor([2]),
+            None,
+        )
+        kept_ref = {
+            i for i, v in enumerate(masked_ref.tolist()[0]) if v != float("-inf")
+        }
+        assert kept == kept_ref == {0, 1, 2, 3}
+
 
 class TestMlxRandomTokens:
+    def test_greedy_row_with_tied_maximum_stays_on_the_argmax(self) -> None:
+        """A greedy row must resolve to the argmax even when the top logits
+        tie. Masking it by value keeps every tied token, and the categorical
+        draw then picks between them; vLLM's greedy path takes the argmax.
+        """
+        logits = mx.array([[1.0, 5.0, 5.0, 0.0], [1.0, 2.0, 3.0, 4.0]])
+        params = [
+            _random_params(temperature=0.0),
+            _random_params(temperature=1.0, top_k=0, top_p=0.9),
+        ]
+        expected = int(mx.argmax(logits[0]).item())
+
+        drawn = set()
+        for seed in range(50):
+            tokens = SamplingBatch._native_random_tokens(
+                logits, params, mx.random.key(seed)
+            )
+            mx.eval(tokens)
+            drawn.add(int(tokens.tolist()[0]))
+
+        assert drawn == {expected}
+
+    def test_mixed_batch_rows_follow_their_own_params(self) -> None:
+        """A greedy row sticks to its argmax and a narrow top-k row stays inside
+        its candidates while a wide row keeps exploring — all in one draw."""
+        logits = mx.random.normal((3, VOCAB_SIZE), key=mx.random.key(21))
+        mx.eval(logits)
+        argmax = int(mx.argmax(logits[0]).item())
+        narrow_candidates = {int(i) for i in mx.argsort(logits[1])[::-1][:4].tolist()}
+        params = [
+            _random_params(temperature=0.0),
+            _random_params(temperature=1.5, top_k=4, top_p=1.0),
+            _random_params(temperature=2.0, top_k=0, top_p=1.0),
+        ]
+        assert SamplingBatch.params_allow_native_random(params)
+
+        greedy_row, narrow_row, wide_row = set(), set(), set()
+        key = mx.random.key(1)
+        for _ in range(200):
+            key, subkey = mx.random.split(key)
+            tokens = SamplingBatch._native_random_tokens(logits, params, subkey)
+            mx.eval(tokens)
+            g, n, w = tokens.tolist()
+            greedy_row.add(g)
+            narrow_row.add(n)
+            wide_row.add(w)
+
+        assert greedy_row == {argmax}
+        assert narrow_row <= narrow_candidates and len(narrow_row) > 1
+        assert len(wide_row) > len(narrow_candidates)
+
     def test_samples_stay_inside_candidate_set(self) -> None:
         candidate_count = 8
         logits = mx.full((BATCH_SIZE, VOCAB_SIZE), -100.0)
