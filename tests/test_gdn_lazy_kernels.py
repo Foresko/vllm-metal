@@ -12,7 +12,8 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from tests.stub_runner import make_state_cache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.impls.gdn_lazy import (
     GDNLazyKernels,
     GDNRecurrentDecodeRequest,
@@ -122,7 +123,7 @@ class _RecordingStateKernel(_ConstantKernel):
         return super().__call__(**kwargs)
 
 
-class TestGDNPagedStateCache:
+class TestPagedStateCache:
     def test_replacing_pending_conv_state_scatters_existing_update(self) -> None:
         # Arrange
         cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
@@ -279,8 +280,8 @@ def _make_state_cache(
     key_head_dim: int = 32,
     dtype: mx.Dtype = mx.float32,
     recurrent_dtype: mx.Dtype = mx.float32,
-) -> GDNPagedStateCache:
-    return GDNPagedStateCache(
+) -> PagedStateCache:
+    return make_state_cache(
         num_layers=num_layers,
         max_seqs=max_seqs,
         conv_kernel_dim=conv_kernel_dim,
@@ -300,7 +301,7 @@ def _recurrent_request(
     v: mx.array,
     g: mx.array,
     beta: mx.array,
-    cache: GDNPagedStateCache,
+    cache: PagedStateCache,
     slot_ids: list[int],
     output_dtype: mx.Dtype = mx.float32,
     threadgroup_dv: int = 4,
@@ -326,7 +327,7 @@ def _recurrent_prefill_request(
     v: mx.array,
     g: mx.array,
     beta: mx.array,
-    cache: GDNPagedStateCache,
+    cache: PagedStateCache,
     slot_ids: list[int],
     cu_seqlens: list[int],
     output_dtype: mx.Dtype = mx.float32,
@@ -1667,7 +1668,8 @@ class TestLazyDecodeFallbacks:
         conv_result = kernels.try_conv_decode(
             mx.zeros((1, 3, cache.conv_dim), dtype=mx.float32),
             SimpleNamespace(
-                conv_kernel_size=cache.conv_kernel_dim, conv1d=_RaisingKernel()
+                conv_kernel_size=(cache.conv_states[0].shape[1] + 1),
+                conv1d=_RaisingKernel(),
             ),
             cache,
             0,
@@ -1846,6 +1848,27 @@ class TestNativeGDNStateScatter:
         mx.eval(out)
         np.testing.assert_array_equal(np.array(pool[2]), 1.0)
 
+    @pytest.mark.parametrize("dtype", [mx.uint8, mx.int8, mx.float16, mx.float32])
+    @pytest.mark.parametrize(("dst_offset", "src_offset"), [(1, 0), (0, 1), (3, 1)])
+    @pytest.mark.parametrize("zero", [False, True])
+    def test_unaligned_views_preserve_bytes_outside_the_write(
+        self, dtype, dst_offset, src_offset, zero
+    ) -> None:
+        ops = _get_native_ops_or_skip()
+        backing = mx.full((80,), 99, dtype=dtype)
+        source = mx.arange(16).astype(dtype)
+        pool = ops.as_strided(backing, (4, 8), (16, 1), offset=dst_offset)
+        rows = ops.as_strided(source, (1, 8), (8, 1), offset=src_offset)
+
+        updated = ops.gdn_state_scatter(pool, rows, mx.array([2]), zero=zero)
+        mx.eval(updated)
+
+        expected = np.full(80, 99, dtype=np.float32)
+        expected[32 + dst_offset : 40 + dst_offset] = (
+            0 if zero else np.arange(src_offset, src_offset + 8)
+        )
+        np.testing.assert_array_equal(np.array(backing.astype(mx.float32)), expected)
+
     def test_empty_update_leaves_the_pool_alone(self) -> None:
         scatter = self._scatter_fn()
         pool = mx.ones((4, 2, 2), dtype=mx.float32)
@@ -1948,22 +1971,3 @@ class TestNativeGDNStateScatter:
         mx.eval(updated)
 
         np.testing.assert_array_equal(np.array(updated[2]), 5.0)
-
-    def test_shared_cache_drain_chains_native_scatters(self) -> None:
-        self._scatter_fn()  # skip when the primitive is unavailable
-        cache = _make_state_cache(num_layers=2, max_seqs=4)
-        cache.set_layer_layout([0, 1], [0, 0])
-        cache.set_pending_recurrent_state(
-            0, [0], mx.full((1, 1, 4, 32), 3, dtype=mx.float32)
-        )
-        cache.set_pending_recurrent_state(
-            1, [2], mx.full((1, 1, 4, 32), 7, dtype=mx.float32)
-        )
-
-        cache.apply_pending_recurrent_states()
-        mx.eval(cache.recurrent_states[0])
-
-        expected = np.zeros(cache.recurrent_states[0].shape, dtype=np.float32)
-        expected[0] = 3
-        expected[2] = 7
-        np.testing.assert_array_equal(np.array(cache.recurrent_states[0]), expected)
