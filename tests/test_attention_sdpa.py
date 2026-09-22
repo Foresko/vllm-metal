@@ -1212,6 +1212,40 @@ class TestSDPAForward:
 class TestBidirectionalDispatch:
     """Image-block rows take the kernel path or the phase-2 recompute per env."""
 
+    @staticmethod
+    def _cache(dtype: mx.Dtype) -> MetalPagedKVCache:
+        """Gemma 4's layer mix over upstream storage: one full-attention layer
+        at block 32 beside one sliding layer (window 1024) at block 16."""
+        torch_dtype = torch.float32 if dtype == mx.float32 else torch.float16
+        full = FullAttentionSpec(
+            block_size=32,
+            num_kv_heads=_N_KV_HEADS,
+            head_size=_HEAD_DIM,
+            dtype=torch_dtype,
+        )
+        sliding = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=_N_KV_HEADS,
+            head_size=_HEAD_DIM,
+            dtype=torch_dtype,
+            sliding_window=1024,
+            page_size_padded=full.page_size_bytes,
+        )
+        vllm_config = VllmConfig()
+        vllm_config.cache_config.kv_cache_layout = "LBNHC"
+        config = get_kv_cache_config_from_groups(
+            vllm_config,
+            [
+                KVCacheGroupSpec(layer_names=["full"], kv_cache_spec=full),
+                KVCacheGroupSpec(layer_names=["sliding"], kv_cache_spec=sliding),
+            ],
+            11 * full.page_size_bytes,
+        )
+        config.kv_cache_layout = "LBNHC"
+        return MetalPagedKVCache.from_upstream(
+            KVCacheStorage(config), ["full", "sliding"]
+        )
+
     def _run(
         self,
         kinds: frozenset[str],
@@ -1223,17 +1257,7 @@ class TestBidirectionalDispatch:
         repeat: int = 1,
         dtype: mx.Dtype = mx.float16,
     ):
-        layout = AttentionKVCacheLayout(
-            num_blocks=11,
-            allocation_bytes=2,
-            layers=(
-                AttentionLayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
-                AttentionLayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
-            ),
-            group_block_sizes=(32, 16),
-            slot_layers=((0,), (1,)),
-        )
-        cache = MetalPagedKVCache.from_layout(layout, dtype)
+        cache = self._cache(dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
         prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
         ctx = get_context()
