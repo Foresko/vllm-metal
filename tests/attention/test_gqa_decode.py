@@ -292,6 +292,9 @@ def test_partition_rule_follows_the_measured_thresholds() -> None:
     # One partition covering the whole context: single pass.
     assert rule(1, 1, 256) == 0
     assert rule(1, edge, 512) == 0
+    # One token over: that partition no longer covers the context, so split.
+    assert rule(1, 1, 257) == 256
+    assert rule(1, edge, 513) == 512
     # Full grid: single pass; one threadgroup below it: split.
     grid = ops.gqa_decode_min_grid()
     assert rule(grid, 1, 65536) == 0
