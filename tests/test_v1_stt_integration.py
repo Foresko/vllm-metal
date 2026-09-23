@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.config import _CONFIG_REGISTRY
 from vllm.v1.sample.sampler import Sampler
@@ -27,7 +28,13 @@ from vllm_metal.stt.audio import (
 )
 from vllm_metal.stt.loader import load_model
 from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES
+from vllm_metal.stt.qwen3_asr import (
+    Qwen3ASRAudioConfig,
+    Qwen3ASRConfig,
+    Qwen3ASRTextConfig,
+)
 from vllm_metal.stt.qwen3_asr.adapter import Qwen3ASRRuntimeAdapter
+from vllm_metal.stt.qwen3_asr.model import Qwen3ASRModel
 from vllm_metal.stt.qwen3_asr.transcriber import Qwen3ASRTranscriber
 from vllm_metal.stt.runtime import STTRuntimeAdapter
 from vllm_metal.stt.sampling import STTSampling
@@ -376,6 +383,70 @@ class TestExtractAudioFeaturesFormats:
         result = adapter.extract_audio_features(mel)
 
         assert result is not None
+
+
+def _tiny_qwen3_asr_adapter() -> STTRuntimeAdapter:
+    config = Qwen3ASRConfig(
+        audio_config=Qwen3ASRAudioConfig(
+            num_mel_bins=16,
+            d_model=32,
+            encoder_layers=1,
+            encoder_attention_heads=2,
+            encoder_ffn_dim=64,
+            downsample_hidden_size=8,
+            output_dim=48,
+            max_source_positions=100,
+            n_window=50,
+            n_window_infer=800,
+        ),
+        text_config=Qwen3ASRTextConfig(
+            hidden_size=48,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=24,
+            intermediate_size=96,
+            vocab_size=100,
+        ),
+        audio_token_id=99,
+        eos_token_id=0,
+    )
+    model = Qwen3ASRModel(config)
+    model.set_dtype(mx.float16)  # load_model casts checkpoints to fp16
+    return Qwen3ASRRuntimeAdapter(model, "/fake/qwen3-asr")
+
+
+def _qwen3_asr_cached_features(dtype: torch.dtype) -> torch.Tensor:
+    # vLLM's Qwen3-ASR field config: audios concatenated along the frame axis.
+    batch = torch.randn((16, 100), generator=torch.Generator().manual_seed(0))
+    field = MultiModalFieldConfig.flat_from_sizes("audio", torch.tensor([100]), dim=1)
+    return field.build_elems("input_audio_features", batch.to(dtype))[0].data
+
+
+class TestExtractAudioFeaturesLeavesCachedInputsIntact:
+    @pytest.mark.parametrize(
+        "dtype",
+        # vLLM delivers features in the model dtype: bf16 under --dtype auto,
+        # fp16 under --dtype float16; the encoder runs in fp16 either way.
+        [torch.bfloat16, torch.float16],
+        ids=["dtype-auto", "dtype-float16"],
+    )
+    def test_reencoding_cached_features_gives_the_same_features(
+        self, dtype: torch.dtype
+    ) -> None:
+        # vLLM's multimodal cache hands the same features to every later
+        # Qwen3-ASR request with this audio that the prefix cache does not
+        # cover.  Casting bf16 features to fp16 keeps the item size, so MLX
+        # may write the cast into the donated input buffer.
+        adapter = _tiny_qwen3_asr_adapter()
+        features = _qwen3_asr_cached_features(dtype)
+        original = features.clone()
+
+        first = adapter.extract_audio_features(features)
+        second = adapter.extract_audio_features(features)
+
+        assert torch.equal(features, original)
+        assert mx.array_equal(first, second).item()
 
 
 class TestKVCacheSTT:
