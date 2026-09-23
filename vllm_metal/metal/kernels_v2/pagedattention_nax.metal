@@ -54,8 +54,11 @@ METAL_FUNC void nax_mma(thread nax_frag8<CT>& Cn0, thread nax_frag8<CT>& Cn1,
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
   auto ct_a = op.template get_left_input_cooperative_tensor<AT, BT, CT>();
   auto ct_b = op.template get_right_input_cooperative_tensor<AT, BT, CT>();
+  // Metal 4.1 makes decltype of a local explicitly `thread`, which MPP's
+  // operand traits reject; stripping it is a no-op under Metal 4.0.
   auto ct_c = op.template get_destination_cooperative_tensor<
-      decltype(ct_a), decltype(ct_b), CT>();
+      metal::remove_addrspace_t<decltype(ct_a)>,
+      metal::remove_addrspace_t<decltype(ct_b)>, CT>();
 #pragma clang loop unroll(full)
   for (short i = 0; i < 8; i++) {
     ct_a[i] = A[i];
