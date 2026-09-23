@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: str = "auto"
+    VLLM_METAL_DISABLE_GQA_DECODE: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -103,6 +104,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sets an explicit MiB limit; 0 disables. Set before worker startup.
     "VLLM_METAL_TQ_PREFILL_MAX_MIB": lambda: os.getenv(
         "VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto"
+    ),
+    # Emergency override for the GQA-packed decode attention kernel: "1"
+    # keeps every decode batch on the per-token paged-attention kernel.
+    "VLLM_METAL_DISABLE_GQA_DECODE": lambda: (
+        os.getenv("VLLM_METAL_DISABLE_GQA_DECODE", "0") == "1"
     ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
