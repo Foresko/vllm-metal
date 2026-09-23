@@ -216,6 +216,7 @@ def test_routing_follows_the_table_and_the_switches() -> None:
     four = _make_case(kv_lens=[1024] * 4, dtype=mx.bfloat16, seed=1, **GEMMA_FULL)
     short = _make_case(kv_lens=[2048], dtype=mx.bfloat16, seed=2, **GEMMA_FULL)
     three = _make_case(kv_lens=[1024] * 3, dtype=mx.bfloat16, seed=3, **GEMMA_FULL)
+    edge = _make_case(kv_lens=[4095], dtype=mx.bfloat16, seed=4, **GEMMA_FULL)
     sliding = _make_case(
         kv_lens=[4096], heads=16, kv_heads=8, hd=256, dtype=mx.bfloat16
     )
@@ -228,12 +229,16 @@ def test_routing_follows_the_table_and_the_switches() -> None:
         _run(four, scale=512**-0.5, expect="gqa")  # 4 x 1024
         _run(short, scale=512**-0.5, expect="per_token")  # 1 x 2048
         _run(three, scale=512**-0.5, expect="per_token")  # 3 x 1024
+        _run(edge, scale=512**-0.5, expect="per_token")  # 1 x 4095
         _run(sliding, scale=256**-0.5, expect="per_token")  # (256, 2): not measured
         ops.set_gqa_decode_enabled(False)
         _run(full, scale=512**-0.5, expect="per_token")  # kill switch
         ops.set_gqa_decode_enabled(True)
         ops.set_gqa_decode_force(True)
         _run(short, scale=512**-0.5, expect="gqa")  # force ignores the bucket
+        ops.set_gqa_decode_enabled(False)
+        _run(short, scale=512**-0.5, expect="per_token")  # kill switch beats force
+        ops.set_gqa_decode_enabled(True)
         _run(sliding, scale=256**-0.5, expect="gqa")  # force: any supported shape
         _run(mha, scale=512**-0.5, expect="per_token")  # G = 1: unsupported
         _run(hd64, scale=64**-0.5, expect="per_token")  # head_dim 64: unsupported
@@ -243,13 +248,16 @@ def test_routing_follows_the_table_and_the_switches() -> None:
 
 
 def test_single_pass_and_partitions_agree(force_gqa) -> None:
+    # 5000 tokens: a window of 1024 starts at 3976, off every tile (8/16/32)
+    # and partition (256/512) boundary.
     case = _make_case(kv_lens=[5000], dtype=mx.bfloat16, seed=23, **GEMMA_FULL)
-    outs = {}
-    for size in (0, 256, 512):
-        force_gqa.set_gqa_decode_partition_size(size)
-        outs[size] = _run(case, scale=512**-0.5, expect="gqa")
-    _assert_close(outs[256], outs[0], mx.bfloat16)
-    _assert_close(outs[512], outs[0], mx.bfloat16)
+    for window in (None, 1024):
+        outs = {}
+        for size in (0, 256, 512):
+            force_gqa.set_gqa_decode_partition_size(size)
+            outs[size] = _run(case, scale=512**-0.5, window=window, expect="gqa")
+        _assert_close(outs[256], outs[0], mx.bfloat16)
+        _assert_close(outs[512], outs[0], mx.bfloat16)
 
 
 def test_automatic_split_follows_the_grid_threshold(force_gqa) -> None:
@@ -283,7 +291,10 @@ def test_automatic_split_follows_the_grid_threshold(force_gqa) -> None:
 def test_partition_rule_follows_the_measured_thresholds() -> None:
     ops = get_ops()
     rule = ops.gqa_decode_partition_size
-    cores = ops.gqa_decode_min_grid() // 8
+    cores = ops.min_decode_grid() // 8
+    assert (
+        ops.gqa_decode_min_grid() == 2 * ops.min_decode_grid()
+    )  # 16 vs 8 threadgroups per core
     edge = -(-3 * cores // 2)  # ceil(1.5 threadgroups per core)
     # Small split grid: 256-token partitions ...
     assert rule(1, 1, 512 * (edge - 1)) == 256
@@ -312,6 +323,34 @@ def test_padded_max_seq_len(force_gqa) -> None:
     _assert_close(got, _reference(case, scale=512**-0.5), mx.bfloat16)
 
 
+def test_padded_cache_rows_read_only_the_layer_head_dim(decode_path) -> None:
+    """A 256-dim layer on 512-wide cache rows, as Gemma 4's sliding layers run."""
+    wide = _make_case(
+        kv_lens=[1500], heads=16, kv_heads=8, hd=512, dtype=mx.bfloat16, seed=47
+    )
+    query = mx.contiguous(wide.query[..., :256])
+    padded = Case(
+        query,
+        wide.key_cache,
+        wide.value_cache,
+        wide.tables,
+        wide.kv_lens,
+        wide.kv_heads,
+        wide.block,
+    )
+    exact = Case(
+        query,
+        wide.key_cache[..., :256],
+        wide.value_cache[..., :256],
+        wide.tables,
+        wide.kv_lens,
+        wide.kv_heads,
+        wide.block,
+    )
+    got = _run(padded, scale=256**-0.5, window=1024, expect=decode_path)
+    _assert_close(got, _reference(exact, scale=256**-0.5, window=1024), mx.bfloat16)
+
+
 def test_bitwise_deterministic_and_default_route_is_the_gqa_kernel() -> None:
     ops = get_ops()
     case = _make_case(kv_lens=[4096, 1000], dtype=mx.bfloat16, seed=31, **GEMMA_FULL)
@@ -324,6 +363,14 @@ def test_bitwise_deterministic_and_default_route_is_the_gqa_kernel() -> None:
     finally:
         _reset(ops)
     assert np.array_equal(a, c)
+    ops.set_gqa_decode_force(True)
+    ops.set_gqa_decode_partition_size(0)
+    try:
+        single_a = _run(case, scale=512**-0.5, expect="gqa")
+        single_b = _run(case, scale=512**-0.5, expect="gqa")
+    finally:
+        _reset(ops)
+    assert np.array_equal(single_a, single_b)
 
 
 def test_varlen_batch_keeps_short_rows_inert(decode_path) -> None:
@@ -420,7 +467,9 @@ def test_sinks_with_and_without_partitions(force_gqa, g, partition) -> None:
     _assert_close(got, _reference(case, scale=512**-0.5, sinks=sinks), mx.bfloat16)
 
 
-def test_softcap(force_gqa) -> None:
+@pytest.mark.parametrize("partition", [-1, 0])
+def test_softcap(force_gqa, partition) -> None:
+    force_gqa.set_gqa_decode_partition_size(partition)
     case = _make_case(kv_lens=[2000], dtype=mx.bfloat16, seed=19, **GEMMA_FULL)
     got = _run(case, scale=0.125, softcap=30.0, expect="gqa")
     _assert_close(got, _reference(case, scale=0.125, softcap=30.0), mx.bfloat16)
@@ -498,7 +547,10 @@ def test_every_pipeline_compiles_and_runs(force_gqa, dtype, block, hd) -> None:
 
 @pytest.mark.slow
 def test_gqa_decode_costs_at_most_half_at_32k() -> None:
-    """Catches a pathologically slow kernel; counters cover silent fallback."""
+    """Catches a pathologically slow kernel; a silent fallback to the
+    per-token kernel fails the ratio, and the routing test pins the
+    default route by counters.
+    """
     ops = get_ops()
     case = _make_case(kv_lens=[32768], dtype=mx.bfloat16, seed=41, **GEMMA_FULL)
     table = mx.array(case.tables)
