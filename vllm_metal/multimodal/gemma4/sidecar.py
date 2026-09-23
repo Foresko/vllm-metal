@@ -83,6 +83,7 @@ class Gemma4VisionSidecar:
         model_path: Path,
         *,
         load_composite: Callable[[Path], Any] = _load_composite,
+        float32: bool = False,
     ) -> Gemma4VisionSidecar:
         """Load only the vision modules of the checkpoint at ``model_path``.
 
@@ -90,6 +91,9 @@ class Gemma4VisionSidecar:
         mlx_lm shard-compatibility view).  Any failure raises: by the time
         this runs the frontend already accepts images, so a silent fallback
         would leave the engine to die on the first image request.
+
+        ``float32`` runs the tower and the embedder in float32 instead of the
+        checkpoint dtype; the pixel dtype follows the patch projection.
         """
         composite = load_composite(model_path)
         vision_tower = getattr(composite, "vision_tower", None)
@@ -99,6 +103,11 @@ class Gemma4VisionSidecar:
                 "mlx_vlm Gemma 4 composite exposes no vision_tower/embed_vision; "
                 "mlx-vlm version drift detected."
             )
+        if float32:
+            # Cast while the weights are still lazy, so only the float32 copy
+            # is ever materialised.
+            vision_tower.set_dtype(mx.float32)
+            embed_vision.set_dtype(mx.float32)
         # `tree_flatten` is overloaded `list[tuple[str, Any]] | dict[str, Any]`
         # depending on the `destination` kwarg; with `destination=None`
         # (default) it returns the list. Narrow at runtime so mypy can add
