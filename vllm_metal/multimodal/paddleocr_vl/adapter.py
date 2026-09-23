@@ -270,8 +270,13 @@ class PaddleOCRVLMultimodalAdapter:
 
     @staticmethod
     def _as_mlx(value: Any) -> Any:
+        # vLLM's multimodal cache hands the same tensors to every later request
+        # with this image, and the pixels arrive in the model dtype. A cast
+        # between fp16 and bf16 (--dtype float16 against a bf16 tower) keeps
+        # the item size, so on a shared import MLX may write the cast into the
+        # donated input buffer and overwrite the cached pixels.
         if isinstance(value, torch.Tensor):
-            return torch_to_mlx(value)
+            return torch_to_mlx(value, copy=True)
         return value
 
     @staticmethod
