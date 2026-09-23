@@ -12,6 +12,7 @@ use adversarial inputs that random data cannot see.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -421,3 +422,98 @@ def test_every_supported_shape_matches_reference_fp16(force_gqa, hd, g) -> None:
     )
     got = _run(case, scale=hd**-0.5, expect="gqa")
     _assert_close(got, _reference(case, scale=hd**-0.5), mx.float16)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("window", [None, 1024])
+@pytest.mark.parametrize("block", [8, 16, 32])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(("hd", "g"), SHAPES)
+def test_shape_matrix(force_gqa, hd, g, dtype, block, window) -> None:
+    for n in (700, 3071, 3073):
+        case = _make_case(
+            kv_lens=[n],
+            heads=2 * g,
+            kv_heads=2,
+            hd=hd,
+            dtype=dtype,
+            block=block,
+            seed=n + hd + g,
+        )
+        got = _run(case, scale=hd**-0.5, window=window, expect="gqa")
+        _assert_close(got, _reference(case, scale=hd**-0.5, window=window), dtype)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("hd", [128, 256, 512])
+@pytest.mark.parametrize("block", [8, 16, 32])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_every_pipeline_compiles_and_runs(force_gqa, dtype, block, hd) -> None:
+    # Sinks off and on for each partition size in one process, so a pipeline
+    # cache key that misses a function constant is caught here.
+    case = _make_case(
+        kv_lens=[600], heads=16, kv_heads=2, hd=hd, dtype=dtype, block=block
+    )
+    sinks = np.linspace(-1.0, 1.0, 16, dtype=np.float32)
+    for size in (0, 256, 512):
+        force_gqa.set_gqa_decode_partition_size(size)
+        for s in (None, sinks):
+            got = _run(case, scale=hd**-0.5, sinks=s, expect="gqa")
+            _assert_close(got, _reference(case, scale=hd**-0.5, sinks=s), dtype)
+
+
+@pytest.mark.slow
+def test_gqa_decode_costs_at_most_half_at_32k() -> None:
+    """Catches a pathologically slow kernel; counters cover silent fallback."""
+    ops = get_ops()
+    case = _make_case(kv_lens=[32768], dtype=mx.bfloat16, seed=41, **GEMMA_FULL)
+    table = mx.array(case.tables)
+    lens = mx.array(case.kv_lens, dtype=mx.int32)
+    cu = mx.array([0, 1], dtype=mx.int32)
+    flush = mx.random.normal((128 * 1024 * 1024,)).astype(mx.bfloat16)  # 256 MB
+    mx.eval(flush, table, lens, cu)
+    calls = 4
+
+    def graph(with_attention: bool) -> None:
+        outs = []
+        for _ in range(calls):
+            f = flush.sum()
+            outs.append(f)
+            if with_attention:
+                q = case.query + (f * 0).astype(case.query.dtype)
+                out = mx.array(0)
+                ops.paged_attention_primitive(
+                    q,
+                    case.key_cache,
+                    case.value_cache,
+                    2,
+                    512**-0.5,
+                    0.0,
+                    table,
+                    lens,
+                    cu,
+                    16,
+                    32768,
+                    -1,
+                    out,
+                )
+                outs.append(out)
+        mx.eval(*outs)
+
+    def median_ms(with_attention: bool) -> float:
+        graph(with_attention)
+        times = []
+        for _ in range(5):
+            t0 = time.perf_counter()
+            graph(with_attention)
+            times.append(time.perf_counter() - t0)
+        return sorted(times)[2] / calls * 1e3
+
+    flush_ms = median_ms(False)
+    ops.set_gqa_decode_enabled(False)
+    try:
+        old = median_ms(True) - flush_ms
+    finally:
+        _reset(ops)
+    new = median_ms(True) - flush_ms
+    assert new <= 0.5 * old, f"per-token {old:.3f} ms, GQA {new:.3f} ms"
