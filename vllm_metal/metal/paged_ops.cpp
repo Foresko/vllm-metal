@@ -198,6 +198,63 @@ static int gqa_decode_partition_override_ = -1;
 static int64_t gqa_decode_single_pass_dispatches_ = 0;
 static int64_t gqa_decode_partitioned_dispatches_ = 0;
 
+// (head_size, G) shapes where the GQA decode kernel measured faster than the
+// per-token kernel; every other supported shape runs only under force.
+//   (512, 8): Gemma 4 full attention (16 q / 2 KV heads), M3 Ultra, 2026-09.
+static bool gqa_decode_measured_win(int head_size, int g) {
+  return head_size == 512 && g == 8;
+}
+
+// head_size -> TILE_KV; must match instantiate_paged_attention_gqa_decode_ps
+// in pagedattention_tiled.metal.  0 = unsupported head size.
+static int gqa_decode_tile_kv(int head_size) {
+  switch (head_size) {
+    case 128: return 32;
+    case 256: return 16;
+    case 512: return 8;
+    default:  return 0;
+  }
+}
+
+// Head-group x token threadgroups below which the GQA kernel splits KV into
+// partitions.  Starts at the per-token kernel's threshold; re-tuned by
+// measurement (plan task 6).
+static int gqa_decode_min_grid() {
+  return min_decode_grid();
+}
+
+static int gqa_decode_partition_size(int num_groups, int total_q_tokens,
+                                     int max_seq_len) {
+  if (gqa_decode_partition_override_ >= 0) {
+    return gqa_decode_partition_override_;
+  }
+  const bool split = num_groups * total_q_tokens < gqa_decode_min_grid()
+                     && max_seq_len > 512;
+  return split ? 512 : 0;
+}
+
+static bool gqa_decode_routes(const array& query, const array& key_cache,
+                              int num_kv_heads, int block_size,
+                              bool use_turboquant) {
+  if (!gqa_decode_enabled_ || use_turboquant || num_kv_heads <= 0) {
+    return false;
+  }
+  const int num_heads = static_cast<int>(query.shape(1));
+  const int head_size = static_cast<int>(query.shape(2));
+  const Dtype dt = query.dtype();
+  if (num_heads % num_kv_heads != 0 || dt != key_cache.dtype()
+      || (dt != float16 && dt != bfloat16)
+      || gqa_decode_tile_kv(head_size) == 0
+      || (block_size != 8 && block_size != 16 && block_size != 32)) {
+    return false;
+  }
+  const int g = num_heads / num_kv_heads;
+  if (g < 2) {
+    return false;
+  }
+  return gqa_decode_force_ || gqa_decode_measured_win(head_size, g);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
@@ -479,6 +536,139 @@ static void dispatch_paged_attention_tiled(
       MTL::Size::Make(cfg.NUM_THREADS, 1, 1));
 }
 
+static void dispatch_paged_attention_gqa_decode(
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int max_seq_len, int sliding_window,
+    Stream s, const array* sinks) {
+  auto& d = metal::device(s.device);
+
+  const int total_q_tokens = static_cast<int>(query.shape(0));
+  const int num_heads = static_cast<int>(query.shape(1));
+  const int head_size = static_cast<int>(query.shape(2));
+  const int g = num_heads / num_kv_heads;
+  const int num_groups = num_kv_heads * ((g + 7) / 8);
+  const int tile_kv = gqa_decode_tile_kv(head_size);
+  const int ps = gqa_decode_partition_size(num_groups, total_q_tokens,
+                                           max_seq_len);
+  const int num_partitions = ps > 0 ? (max_seq_len + ps - 1) / ps : 1;
+  bool use_partitioning = ps > 0;
+  bool use_sinks = sinks != nullptr;
+
+  const std::string dt = dtype_to_metal(query.dtype());
+  const std::string kname =
+      "paged_attention_gqa_decode_" + dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size) +
+      "_tk" + std::to_string(tile_kv) +
+      "_ps" + std::to_string(ps);
+  // MLX caches pipelines by hash name: every function constant goes in it.
+  const std::string hash_name = kname + "_pt" + (use_partitioning ? "1" : "0")
+                                + "_sk" + (use_sinks ? "1" : "0");
+  auto* lib = d.get_library("paged_attention_v2_kern");
+  auto* kernel = d.get_kernel(
+      kname, lib, hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+
+  // Q (8 rows) + K + V tiles with padded rows (mirrors LD in the kernel) and
+  // the partial-S exchange; the fp32 output staging reuses the Q/K region.
+  const int t_size = static_cast<int>(query.itemsize());
+  const int ld = head_size + 16 / t_size;
+  size_t shmem = static_cast<size_t>((8 + 2 * tile_kv) * ld * t_size)
+               + static_cast<size_t>(4 * (tile_kv / 8) * 64 * sizeof(float));
+  shmem = (shmem + 15) & ~size_t(15);
+
+  constexpr int kThreads = 128;
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+  auto& enc = metal::get_command_encoder(s);
+
+  if (!use_partitioning) {
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_threadgroup_memory_length(shmem, 0);
+    bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                            num_kv_heads, softcap, block_tables, seq_lens,
+                            cu_seqlens_q, sliding_window);
+    enc.set_bytes(scale, 9);
+    if (use_sinks) {
+      enc.set_input_array(*sinks, 18);
+    }
+    enc.set_bytes(num_heads_i, 22);
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_groups, total_q_tokens, 1),
+        MTL::Size::Make(kThreads, 1, 1));
+    ++gqa_decode_single_pass_dispatches_;
+    return;
+  }
+
+  // Split-KV: fp32 partials, then the existing reduce (tmpf32 variant).
+  auto make_temp = [&](Shape shape, Dtype dtype) {
+    array a(std::move(shape), dtype, nullptr, {});
+    a.set_data(allocator::malloc(a.nbytes()));
+    enc.add_temporary(a);
+    return a;
+  };
+  array tmp_out = make_temp(
+      Shape{total_q_tokens, num_heads, num_partitions, head_size}, float32);
+  array exp_sums =
+      make_temp(Shape{total_q_tokens, num_heads, num_partitions}, float32);
+  array max_logits =
+      make_temp(Shape{total_q_tokens, num_heads, num_partitions}, float32);
+
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+  bind_paged_attn_buffers(enc, tmp_out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
+  enc.set_bytes(scale, 9);
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  if (use_sinks) {
+    // Declared under function constant 40, so it must be bound; the reduce
+    // folds the sink once for all partitions.
+    enc.set_input_array(*sinks, 18);
+  }
+  enc.set_bytes(num_heads_i, 22);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_groups, total_q_tokens, num_partitions),
+      MTL::Size::Make(kThreads, 1, 1));
+
+  const std::string rname =
+      "paged_attention_v2_reduce_" + dt + "_tmpf32_hs" +
+      std::to_string(head_size) + "_nt256_nsl32_ps" + std::to_string(ps);
+  bool use_tq = false;
+  const std::string rhash =
+      rname + "_v2reduce_tq0_sk" + (use_sinks ? "1" : "0");
+  auto* rkernel = d.get_kernel(
+      rname, lib, rhash,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq,    MTL::DataType::DataTypeBool, NS::UInteger(50)}});
+  enc.set_compute_pipeline_state(rkernel);
+  const size_t reduce_shmem =
+      static_cast<size_t>(2 * num_partitions) * sizeof(float);
+  enc.set_threadgroup_memory_length((reduce_shmem + 15) & ~size_t(15), 0);
+  enc.set_output_array(out, 0);
+  enc.set_input_array(exp_sums, 1);
+  enc.set_input_array(max_logits, 2);
+  enc.set_input_array(tmp_out, 3);
+  enc.set_input_array(seq_lens, 4);
+  int32_t num_partitions_i = static_cast<int32_t>(num_partitions);
+  enc.set_bytes(num_partitions_i, 5);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 6);
+  }
+  enc.set_input_array(cu_seqlens_q, 7);
+  int32_t num_seqs_i = static_cast<int32_t>(cu_seqlens_q.shape(0) - 1);
+  enc.set_bytes(num_seqs_i, 8);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_tokens, 1),
+      MTL::Size::Make(256, 1, 1));
+  ++gqa_decode_partitioned_dispatches_;
+}
+
 static void dispatch_paged_attention_v2_online(
     array& out, const array& query,
     const array& key_cache, const array& value_cache,
@@ -556,6 +746,17 @@ static void dispatch_paged_attention_v2_online(
     throw std::invalid_argument(
         "mm_prefix ranges need the tiled prefill kernel, but this batch was "
         "routed to the per-token kernel");
+  }
+
+  // GQA-packed decode: pure-decode batches whose (head_size, G) is a measured
+  // win (or forced) read each KV head once instead of once per query head.
+  if (!has_prefill && gqa_decode_routes(query, key_cache, num_kv_heads,
+                                        block_size, use_turboquant)) {
+    dispatch_paged_attention_gqa_decode(
+        out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
+        block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
+        sliding_window, s, sinks);
+    return;
   }
 
   // Fallback: original per-token kernel
@@ -1831,6 +2032,10 @@ NB_MODULE(_paged_ops, m) {
                                 gqa_decode_partitioned_dispatches_);
         },
         "(single-pass, partitioned) GQA decode dispatches since process start.");
+
+  m.def("gqa_decode_min_grid", &gqa_decode_min_grid,
+        "Head-group x token threadgroups below which the GQA decode kernel "
+        "splits KV into partitions on this machine.");
 
   m.def("supports_mm_prefix", []() { return true; },
         "True when paged_attention_primitive accepts mm_prefix_ranges "

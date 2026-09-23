@@ -696,3 +696,449 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
 
 instantiate_paged_attention_tiled_all(half);
 instantiate_paged_attention_tiled_all(bfloat16_t);
+
+// ─────────────────────────────────────────────────────────────────────────
+// GQA-packed paged decode.
+//
+// The per-token decode kernel (paged_attention) runs one threadgroup per
+// query head, so every KV head is streamed once per query head that shares
+// it: 8x the KV traffic for Gemma 4's full-attention layers (16 q / 2 KV
+// heads, head_dim 512).  Here one threadgroup serves up to 8 query heads of
+// one KV head at a single decode position: they are the 8 rows of the MMA
+// fragment, so each K/V tile is loaded once per KV head.  The four
+// simdgroups split the head dimension like the tiled kernel's D_SPLIT
+// configuration (partial S exchanged through S_xchg, each owns
+// HEAD_SIZE / 4 columns of O); Q stays register-resident.
+//
+// Grid: x = KV head * ceil(G / 8) head groups (G = num_heads / num_kv_heads),
+//       y = decode token (pure decode: one token per sequence),
+//       z = KV partition (1 when PARTITION_SIZE == 0).
+// PARTITION_SIZE > 0 writes paged_attention_v2_reduce partials: log2-space
+// max, exp-sum and O / l in OUT_T (float).  PARTITION_SIZE == 0 writes the
+// normalized output in T and folds attention sinks itself.
+//
+// exp2 is the precise function: the shaders build with -fno-fast-math and
+// MLX's runtime compile disables fast math; only fast::exp2 is relaxed.
+// ─────────────────────────────────────────────────────────────────────────
+template <typename T, typename OUT_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int TILE_KV, int PARTITION_SIZE>
+[[kernel]] void paged_attention_gqa_decode(
+    device float *exp_sums
+    [[buffer(0), function_constant(use_partitioning)]],
+    device float *max_logits
+    [[buffer(1), function_constant(use_partitioning)]],
+    device OUT_T *out [[buffer(2)]],
+    device const T *q [[buffer(3)]],
+    device const T *k_cache [[buffer(4)]],
+    device const T *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    device const float *sinks
+    [[buffer(18), function_constant(use_sinks)]],
+    const constant int &sliding_window [[buffer(21)]],
+    const constant int &num_heads [[buffer(22)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]],
+    uint3 tpt [[thread_position_in_threadgroup]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  constexpr int ROWS = 8;               // query heads per threadgroup
+  constexpr int NUM_THREADS = 128;
+  constexpr int NUM_SIMD_LANES = 32;
+  constexpr int D_SPLIT = NUM_THREADS / NUM_SIMD_LANES;  // 4 simdgroups
+  constexpr int TD = HEAD_SIZE / 8;     // 8-wide head_dim fragments
+  constexpr int TD_O = TD / D_SPLIT;    // fragments owned per simdgroup
+  constexpr int TK = TILE_KV / 8;       // 8-wide key fragments per tile
+  constexpr bool PARTITIONED = PARTITION_SIZE > 0;
+  static_assert(TD % D_SPLIT == 0, "D_SPLIT must divide HEAD_SIZE / 8");
+  static_assert(TILE_KV % 8 == 0 && TILE_KV % D_SPLIT == 0,
+                "tile rows split evenly across simdgroups");
+  static_assert(!PARTITIONED || PARTITION_SIZE % TILE_KV == 0,
+                "partitions hold whole tiles");
+
+  const int thread_idx = tpt.x;
+  const int d_base = int(sg_idx) * TD_O;
+
+  // ─ Query heads, sequence and KV range of this threadgroup ─────────────
+  const int G = num_heads / num_kv_heads;
+  const int groups_per_kv = (G + ROWS - 1) / ROWS;
+  const int kv_head_idx = int(tgp.x) / groups_per_kv;
+  const int group_in_kv = int(tgp.x) % groups_per_kv;
+  const int head_base = kv_head_idx * G + group_in_kv * ROWS;
+  const int valid_rows = min(ROWS, G - group_in_kv * ROWS);
+
+  const int token_idx = int(tgp.y);   // pure decode: token == sequence
+  const int seq_len = int(context_lens[token_idx]);
+  const int partition_idx = int(tgp.z);
+  const int max_num_partitions = int(tgpg.z);
+
+  const int part_start = PARTITIONED ? partition_idx * PARTITION_SIZE : 0;
+  if (PARTITIONED && part_start >= seq_len) {
+    return;  // beyond this sequence: the reduce never reads it
+  }
+  const int part_end =
+      PARTITIONED ? min(part_start + PARTITION_SIZE, seq_len) : seq_len;
+  // The decode row sits at position seq_len - 1: it attends keys
+  // [seq_len - sliding_window, seq_len) with a window, [0, seq_len) without.
+  const int window_start =
+      (sliding_window >= 0) ? max(0, seq_len - sliding_window) : 0;
+  const int kv_first = max(part_start, window_start);
+
+  if constexpr (PARTITIONED) {
+    if (kv_first >= part_end) {
+      // Every key of this partition lies left of the window: write the
+      // neutral partial paged_attention writes (max 0, sum 0, zeros), which
+      // the reduce weighs by zero.
+      for (int r = 0; r < valid_rows; r++) {
+        const int stat = (token_idx * num_heads + head_base + r)
+                         * max_num_partitions + partition_idx;
+        if (thread_idx == 0) {
+          max_logits[stat] = 0.f;
+          exp_sums[stat] = 0.f;
+        }
+        device OUT_T *o = out + int64_t(stat) * HEAD_SIZE;
+        for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
+          o[d] = OUT_T(0);
+        }
+      }
+      return;
+    }
+  }
+
+  // ─ Threadgroup memory: Q (load only), K and V tiles, partial-S exchange ─
+  constexpr int SMEM_PAD = 16 / sizeof(T);
+  constexpr int LD = HEAD_SIZE + SMEM_PAD;
+  threadgroup T *Q_smem = reinterpret_cast<threadgroup T *>(shared_mem);
+  threadgroup T *K_smem = Q_smem + ROWS * LD;
+  threadgroup T *V_smem = K_smem + TILE_KV * LD;
+  threadgroup float *S_xchg =
+      reinterpret_cast<threadgroup float *>(V_smem + TILE_KV * LD);
+
+  // ─ Q rows: the group's query heads, zero beyond valid_rows ─────────────
+  const device T *q_base =
+      q + int64_t(token_idx) * q_stride + int64_t(head_base) * HEAD_SIZE;
+  for (int i = thread_idx; i < ROWS * HEAD_SIZE; i += NUM_THREADS) {
+    const int r = i / HEAD_SIZE;
+    const int d = i % HEAD_SIZE;
+    Q_smem[r * LD + d] = (r < valid_rows) ? q_base[r * HEAD_SIZE + d] : T(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  using vec2T = vec<T, 2>;
+  using vec2F = vec<float, 2>;
+  vec2T Qreg[TD_O];
+  #pragma unroll
+  for (int dd = 0; dd < TD_O; dd++) {
+    simdgroup_matrix<T, 8, 8> tmp;
+    simdgroup_load(tmp, Q_smem + (d_base + dd) * 8, LD);
+    Qreg[dd] = reinterpret_cast<thread vec2T &>(tmp.thread_elements());
+  }
+
+  const short2 fc = frag_coord(ushort(lane));
+  const short fm = fc.y;   // fragment row: query head within the group
+  const short fn = fc.x;   // fragment column: key within an 8-key block
+
+  float max_score = -INFINITY;
+  float sum_score = 0.0f;
+  vec2F Oreg[TD_O];
+  #pragma unroll
+  for (int dd = 0; dd < TD_O; dd++) {
+    Oreg[dd] = vec2F(0.0f);
+  }
+
+  const device uint32_t *block_table =
+      block_tables + int64_t(token_idx) * max_num_blocks_per_seq;
+  const int kv_token_stride = num_kv_heads * kv_head_stride;
+  const float scale_log2 = scale * M_LOG2E_F;
+
+  constexpr int VEC_BYTES = (HEAD_SIZE >= 256) ? 16 : 8;
+  constexpr int VEC = VEC_BYTES / int(sizeof(T));
+  using vecLoadT = typename LoadUnit<VEC_BYTES>::type;
+  static_assert(LD % VEC == 0, "smem row stride LD must be VEC-aligned");
+
+  // ─ KV tiles of this partition ───────────────────────────────────────────
+  // The first tile holds kv_first, an attended key, and every later tile
+  // starts below part_end <= seq_len, so no tile is fully masked and the
+  // running max is finite after the first tile.
+  const int tile_begin = kv_first - kv_first % TILE_KV;
+  for (int tile_start = tile_begin; tile_start < part_end;
+       tile_start += TILE_KV) {
+    #pragma unroll
+    for (int t_iter = 0; t_iter < TILE_KV / D_SPLIT; t_iter++) {
+      const int t = int(sg_idx) * (TILE_KV / D_SPLIT) + t_iter;
+      const int kv_pos = tile_start + t;
+      if (kv_pos < seq_len) {
+        const int64_t pb = int64_t(block_table[kv_pos / BLOCK_SIZE]);
+        const int64_t off = pb * kv_block_stride
+            + (kv_pos % BLOCK_SIZE) * kv_token_stride
+            + kv_head_idx * kv_head_stride;
+        const device T *k_ptr = k_cache + off;
+        const device T *v_ptr = v_cache + off;
+        #pragma unroll
+        for (int d = int(lane) * VEC; d < HEAD_SIZE;
+             d += NUM_SIMD_LANES * VEC) {
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) =
+              *((const device vecLoadT *)(k_ptr + d));
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) =
+              *((const device vecLoadT *)(v_ptr + d));
+        }
+      } else {
+        const vecLoadT zero = {};
+        #pragma unroll
+        for (int d = int(lane) * VEC; d < HEAD_SIZE;
+             d += NUM_SIMD_LANES * VEC) {
+          *((threadgroup vecLoadT *)&K_smem[t * LD + d]) = zero;
+          *((threadgroup vecLoadT *)&V_smem[t * LD + d]) = zero;
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // K and V visible
+
+    // S[8 heads, TILE_KV] over this simdgroup's head_dim columns.
+    vec2F Sreg[TK];
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      Sreg[k] = vec2F(0.0f);
+    }
+    #pragma unroll
+    for (int dd = 0; dd < TD_O; dd++) {
+      simdgroup_matrix<T, 8, 8> q_frag;
+      reinterpret_cast<thread vec2T &>(q_frag.thread_elements()) = Qreg[dd];
+      #pragma unroll
+      for (int k = 0; k < TK; k++) {
+        simdgroup_matrix<T, 8, 8> k_frag;
+        simdgroup_load(k_frag, K_smem + k * 8 * LD + (d_base + dd) * 8, LD,
+                       ulong2(0), /*transpose=*/true);
+        simdgroup_matrix<float, 8, 8> s_frag;
+        reinterpret_cast<thread vec2F &>(s_frag.thread_elements()) = Sreg[k];
+        simdgroup_multiply_accumulate(s_frag, q_frag, k_frag, s_frag);
+        Sreg[k] = reinterpret_cast<thread vec2F &>(s_frag.thread_elements());
+      }
+    }
+
+    // Sum the four partial S fragments (one per head_dim quarter).
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      simdgroup_matrix<float, 8, 8> part;
+      reinterpret_cast<thread vec2F &>(part.thread_elements()) = Sreg[k];
+      simdgroup_store(part, S_xchg + (int(sg_idx) * TK + k) * 64, 8);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      vec2F acc = vec2F(0.0f);
+      #pragma unroll
+      for (int p = 0; p < D_SPLIT; p++) {
+        simdgroup_matrix<float, 8, 8> part;
+        simdgroup_load(part, S_xchg + (p * TK + k) * 64, 8);
+        acc += reinterpret_cast<thread vec2F &>(part.thread_elements());
+      }
+      Sreg[k] = acc;
+    }
+
+    // Scale, softcap, and mask keys outside [window_start, seq_len).
+    const bool tile_unmasked = tile_start >= window_start
+                               && tile_start + TILE_KV <= seq_len
+                               && softcapping <= 0.0f;
+    if (tile_unmasked) {
+      #pragma unroll
+      for (int k = 0; k < TK; k++) {
+        Sreg[k] *= scale_log2;
+      }
+    } else {
+      #pragma unroll
+      for (int k = 0; k < TK; k++) {
+        #pragma unroll
+        for (int jj = 0; jj < 2; jj++) {
+          float s = Sreg[k][jj] * scale_log2;
+          if (softcapping > 0.0f) {
+            const float s_orig = s / M_LOG2E_F;
+            s = softcapping * precise::tanh(s_orig / softcapping) * M_LOG2E_F;
+          }
+          const int kv_pos = tile_start + k * 8 + fn + jj;
+          const bool masked = kv_pos >= seq_len || kv_pos < window_start;
+          Sreg[k][jj] = masked ? -INFINITY : s;
+        }
+      }
+    }
+
+    // Online softmax per query head (fragment row), in log2 space.
+    float local_max = -INFINITY;
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      local_max = max(local_max, max(Sreg[k][0], Sreg[k][1]));
+    }
+    const float row_max = frag_row_reduce<FragMax>(local_max);
+    float new_max = max(max_score, row_max);
+    float factor;
+    if (new_max > max_score) {
+      factor = (max_score == -INFINITY) ? 0.0f : exp2(max_score - new_max);
+    } else {
+      factor = 1.0f;
+      if (max_score == -INFINITY) new_max = 0.0f;
+    }
+    max_score = new_max;
+
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      #pragma unroll
+      for (int jj = 0; jj < 2; jj++) {
+        const float p = (Sreg[k][jj] == -INFINITY)
+                            ? 0.0f
+                            : exp2(Sreg[k][jj] - new_max);
+        Sreg[k][jj] = p;
+        local_sum += p;
+      }
+    }
+    sum_score = sum_score * factor + frag_row_reduce<FragSum>(local_sum);
+
+    #pragma unroll
+    for (int dd = 0; dd < TD_O; dd++) {
+      Oreg[dd] *= factor;
+    }
+
+    // O += P V over this simdgroup's head_dim columns.
+    #pragma unroll
+    for (int k = 0; k < TK; k++) {
+      simdgroup_matrix<float, 8, 8> p_frag;
+      reinterpret_cast<thread vec2F &>(p_frag.thread_elements()) = Sreg[k];
+      #pragma unroll
+      for (int dd = 0; dd < TD_O; dd++) {
+        simdgroup_matrix<T, 8, 8> v_frag;
+        simdgroup_load(v_frag, V_smem + k * 8 * LD + (d_base + dd) * 8, LD);
+        simdgroup_matrix<float, 8, 8> o_frag;
+        reinterpret_cast<thread vec2F &>(o_frag.thread_elements()) = Oreg[dd];
+        simdgroup_multiply_accumulate(o_frag, p_frag, v_frag, o_frag);
+        Oreg[dd] = reinterpret_cast<thread vec2F &>(o_frag.thread_elements());
+      }
+    }
+    // K_smem, V_smem and S_xchg are rewritten by the next tile.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  const int head = head_base + fm;
+  const bool row_valid = fm < valid_rows;
+
+  if constexpr (PARTITIONED) {
+    // One lane per row (fn == 0) of the first simdgroup stores the stats;
+    // the reduce folds attention sinks once across partitions.
+    if (sg_idx == 0 && fn == 0 && row_valid) {
+      const int stat =
+          (token_idx * num_heads + head) * max_num_partitions + partition_idx;
+      max_logits[stat] = max_score;
+      exp_sums[stat] = sum_score;
+    }
+  } else {
+    if (use_sinks && row_valid) {
+      const float sink_score = sinks[head] * M_LOG2E_F;
+      const float sink_max = max(max_score, sink_score);
+      const float old_corr =
+          (max_score == -INFINITY) ? 0.0f : exp2(max_score - sink_max);
+      sum_score = sum_score * old_corr + exp2(sink_score - sink_max);
+      max_score = sink_max;
+      #pragma unroll
+      for (int dd = 0; dd < TD_O; dd++) {
+        Oreg[dd] *= old_corr;
+      }
+    }
+  }
+
+  const float inv_sum = 1.0f / (sum_score + 1e-6f);
+  #pragma unroll
+  for (int dd = 0; dd < TD_O; dd++) {
+    Oreg[dd] *= inv_sum;
+  }
+
+  // Stage O as fp32 over the Q/K region (8 * LD floats fit in Q + K + V for
+  // every instantiated TILE_KV) and write the valid rows.
+  threadgroup float *O_smem = reinterpret_cast<threadgroup float *>(shared_mem);
+  #pragma unroll
+  for (int dd = 0; dd < TD_O; dd++) {
+    simdgroup_matrix<float, 8, 8> o_frag;
+    reinterpret_cast<thread vec2F &>(o_frag.thread_elements()) = Oreg[dd];
+    simdgroup_store(o_frag, O_smem + (d_base + dd) * 8, LD);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int i = thread_idx; i < valid_rows * HEAD_SIZE; i += NUM_THREADS) {
+    const int r = i / HEAD_SIZE;
+    const int d = i % HEAD_SIZE;
+    const float v = O_smem[r * LD + d];
+    if constexpr (PARTITIONED) {
+      const int stat = (token_idx * num_heads + head_base + r)
+                       * max_num_partitions + partition_idx;
+      out[int64_t(stat) * HEAD_SIZE + d] = OUT_T(v);
+    } else {
+      out[int64_t(token_idx) * q_stride + int64_t(head_base + r) * HEAD_SIZE
+          + d] = OUT_T(v);
+    }
+  }
+}
+
+#define instantiate_paged_attention_gqa_decode_inner(                          \
+    type, out_type, head_size, block_size, tile_kv, ps)                        \
+  template [[host_name("paged_attention_gqa_decode_" #type                     \
+                       "_hs" #head_size "_bs" #block_size                      \
+                       "_tk" #tile_kv "_ps" #ps)]]                             \
+  [[kernel]] void paged_attention_gqa_decode<type, out_type, head_size,        \
+                                             block_size, tile_kv, ps>(         \
+      device float *exp_sums                                                   \
+      [[buffer(0), function_constant(use_partitioning)]],                      \
+      device float *max_logits                                                 \
+      [[buffer(1), function_constant(use_partitioning)]],                      \
+      device out_type *out [[buffer(2)]],                                      \
+      device const type *q [[buffer(3)]],                                      \
+      device const type *k_cache [[buffer(4)]],                                \
+      device const type *v_cache [[buffer(5)]],                                \
+      const constant int &num_kv_heads [[buffer(8)]],                          \
+      const constant float &scale [[buffer(9)]],                               \
+      const constant float &softcapping [[buffer(10)]],                        \
+      device const uint32_t *block_tables [[buffer(11)]],                      \
+      device const uint32_t *context_lens [[buffer(12)]],                      \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],               \
+      const constant int &q_stride [[buffer(15)]],                             \
+      const constant int &kv_block_stride [[buffer(16)]],                      \
+      const constant int &kv_head_stride [[buffer(17)]],                       \
+      device const float *sinks                                                \
+      [[buffer(18), function_constant(use_sinks)]],                            \
+      const constant int &sliding_window [[buffer(21)]],                       \
+      const constant int &num_heads [[buffer(22)]],                            \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 tgp [[threadgroup_position_in_grid]],                              \
+      uint3 tgpg [[threadgroups_per_grid]],                                    \
+      uint3 tpt [[thread_position_in_threadgroup]],                            \
+      uint sg_idx [[simdgroup_index_in_threadgroup]],                          \
+      uint lane [[thread_index_in_simdgroup]]);
+
+// (head_size -> TILE_KV) must match gqa_decode_tile_kv() in paged_ops.cpp.
+#define instantiate_paged_attention_gqa_decode_ps(type, out_type, block_size,  \
+                                                  ps)                          \
+  instantiate_paged_attention_gqa_decode_inner(type, out_type, 128,            \
+                                               block_size, 32, ps);            \
+  instantiate_paged_attention_gqa_decode_inner(type, out_type, 256,            \
+                                               block_size, 16, ps);            \
+  instantiate_paged_attention_gqa_decode_inner(type, out_type, 512,            \
+                                               block_size, 8, ps);
+
+#define instantiate_paged_attention_gqa_decode_block(type, block_size)         \
+  instantiate_paged_attention_gqa_decode_ps(type, type, block_size, 0);        \
+  instantiate_paged_attention_gqa_decode_ps(type, float, block_size, 256);     \
+  instantiate_paged_attention_gqa_decode_ps(type, float, block_size, 512);
+
+#define instantiate_paged_attention_gqa_decode_all(type)                       \
+  instantiate_paged_attention_gqa_decode_block(type, 8);                       \
+  instantiate_paged_attention_gqa_decode_block(type, 16);                      \
+  instantiate_paged_attention_gqa_decode_block(type, 32);
+
+instantiate_paged_attention_gqa_decode_all(half);
+instantiate_paged_attention_gqa_decode_all(bfloat16_t);
