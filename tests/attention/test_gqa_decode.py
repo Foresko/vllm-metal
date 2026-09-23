@@ -212,20 +212,28 @@ def test_gemma_full_layer_matches_reference(decode_path, n, window) -> None:
 
 def test_routing_follows_the_table_and_the_switches() -> None:
     ops = get_ops()
-    full = _make_case(kv_lens=[2048], dtype=mx.bfloat16, **GEMMA_FULL)
+    full = _make_case(kv_lens=[4096], dtype=mx.bfloat16, **GEMMA_FULL)
+    four = _make_case(kv_lens=[1024] * 4, dtype=mx.bfloat16, seed=1, **GEMMA_FULL)
+    short = _make_case(kv_lens=[2048], dtype=mx.bfloat16, seed=2, **GEMMA_FULL)
+    three = _make_case(kv_lens=[1024] * 3, dtype=mx.bfloat16, seed=3, **GEMMA_FULL)
     sliding = _make_case(
-        kv_lens=[2048], heads=16, kv_heads=8, hd=256, dtype=mx.bfloat16
+        kv_lens=[4096], heads=16, kv_heads=8, hd=256, dtype=mx.bfloat16
     )
     mha = _make_case(kv_lens=[600], heads=16, kv_heads=16, hd=512, dtype=mx.bfloat16)
     hd64 = _make_case(kv_lens=[600], heads=16, kv_heads=2, hd=64, dtype=mx.bfloat16)
     fp32 = _make_case(kv_lens=[600], heads=16, kv_heads=2, hd=512, dtype=mx.float32)
     try:
-        _run(full, scale=512**-0.5, expect="gqa")  # (512, 8): measured win
+        # (512, 8) is a measured win once tokens x context reaches 4096.
+        _run(full, scale=512**-0.5, expect="gqa")  # 1 x 4096
+        _run(four, scale=512**-0.5, expect="gqa")  # 4 x 1024
+        _run(short, scale=512**-0.5, expect="per_token")  # 1 x 2048
+        _run(three, scale=512**-0.5, expect="per_token")  # 3 x 1024
         _run(sliding, scale=256**-0.5, expect="per_token")  # (256, 2): not measured
         ops.set_gqa_decode_enabled(False)
         _run(full, scale=512**-0.5, expect="per_token")  # kill switch
         ops.set_gqa_decode_enabled(True)
         ops.set_gqa_decode_force(True)
+        _run(short, scale=512**-0.5, expect="gqa")  # force ignores the bucket
         _run(sliding, scale=256**-0.5, expect="gqa")  # force: any supported shape
         _run(mha, scale=512**-0.5, expect="per_token")  # G = 1: unsupported
         _run(hd64, scale=64**-0.5, expect="per_token")  # head_dim 64: unsupported
@@ -270,6 +278,29 @@ def test_automatic_split_follows_the_grid_threshold(force_gqa) -> None:
     s2, p2 = _counts()
     assert (s2 - s1, p2 - p1) == (1, 0), "a grid at the threshold runs single-pass"
     _assert_close(out_big[:1], out_single, mx.bfloat16)
+
+
+def test_partition_rule_follows_the_measured_thresholds() -> None:
+    ops = get_ops()
+    rule = ops.gqa_decode_partition_size
+    cores = ops.gqa_decode_min_grid() // 8
+    edge = -(-3 * cores // 2)  # ceil(1.5 threadgroups per core)
+    # Small split grid: 256-token partitions ...
+    assert rule(1, 1, 512 * (edge - 1)) == 256
+    # ... until grid x ceil(ctx / 512) reaches 1.5 per core: 512.
+    assert rule(1, 1, 512 * edge) == 512
+    # One partition covering the whole context: single pass.
+    assert rule(1, 1, 256) == 0
+    assert rule(1, edge, 512) == 0
+    # Full grid: single pass; one threadgroup below it: split.
+    grid = ops.gqa_decode_min_grid()
+    assert rule(grid, 1, 65536) == 0
+    assert rule(1, grid - 1, 65536) == 512
+    ops.set_gqa_decode_partition_size(256)
+    try:
+        assert rule(grid, 1, 65536) == 256  # the test override wins
+    finally:
+        _reset(ops)
 
 
 def test_padded_max_seq_len(force_gqa) -> None:
