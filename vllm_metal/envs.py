@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MM_PREFIX_PATH: str | None = None
+    VLLM_METAL_GEMMA4_VISION_FLOAT32: bool = False
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
@@ -152,6 +153,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (the reference path).  Read per forward.
     "VLLM_METAL_MM_PREFIX_PATH": _choice(
         "VLLM_METAL_MM_PREFIX_PATH", None, MM_PREFIX_PATHS
+    ),
+    # Gemma 4 vision sidecar precision (opt-in): run the vision tower and the
+    # multimodal embedder in float32 and keep the processor's float32
+    # pixel_values instead of vLLM's cast to the model dtype. The language
+    # model still receives image rows in its own dtype. Costs a float32 copy
+    # of the tower weights (about 1.1 GB more for the 26B checkpoint) and a
+    # slower encoder pass. Set to "1" to enable.
+    "VLLM_METAL_GEMMA4_VISION_FLOAT32": _bool(
+        "VLLM_METAL_GEMMA4_VISION_FLOAT32", False
     ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
