@@ -289,3 +289,135 @@ def test_bitwise_deterministic_and_default_route_is_the_gqa_kernel() -> None:
     finally:
         _reset(ops)
     assert np.array_equal(a, c)
+
+
+def test_varlen_batch_keeps_short_rows_inert(decode_path) -> None:
+    case = _make_case(
+        kv_lens=[600, 40000, 1, 17, 513], dtype=mx.bfloat16, seed=7, **GEMMA_FULL
+    )
+    for window in (None, 1024):
+        got = _run(case, scale=512**-0.5, window=window, expect=decode_path)
+        _assert_close(
+            got, _reference(case, scale=512**-0.5, window=window), mx.bfloat16
+        )
+
+
+@pytest.mark.parametrize("window", [None, 1024])
+def test_peaked_attention_pins_single_keys(decode_path, window) -> None:
+    """Each head puts logit 40 on one key; a key off by one flips the row."""
+    n, hd, heads, kv_heads = 3073, 512, 16, 2
+    case = _make_case(kv_lens=[n], dtype=mx.bfloat16, seed=11, **GEMMA_FULL)
+    kc = np.array(case.key_cache.astype(mx.float32))
+    table = case.tables[0]
+    g = heads // kv_heads
+    ws = 0 if window is None else n - window
+    targets = [j for j in (ws - 1, ws, 511, 512, 1023, n - 1) if 0 <= j < n]
+    q = np.zeros((1, heads, hd), np.float32)
+    for h in range(heads):
+        j = targets[h % len(targets)]
+        key = kc[table[j // case.block], j % case.block, h // g]
+        q[0, h] = key * (40.0 / (float(key @ key) * hd**-0.5))
+    case.query = mx.array(q).astype(mx.bfloat16)
+    ref = _reference(case, scale=hd**-0.5, window=window)
+    got = _run(case, scale=hd**-0.5, window=window, expect=decode_path)
+    tol = 2.0**-7 * np.abs(ref).max(axis=-1, keepdims=True)
+    assert np.all(np.abs(got - ref) <= tol)
+
+
+@pytest.mark.parametrize("window", [None, 1024])
+def test_poisoned_cache_outside_the_attended_range_never_leaks(
+    decode_path, window
+) -> None:
+    n = 3073
+    clean = _make_case(kv_lens=[n], dtype=mx.bfloat16, seed=13, **GEMMA_FULL)
+    ref = _reference(clean, scale=512**-0.5, window=window)
+    kc = np.array(clean.key_cache.astype(mx.float32))
+    vc = np.array(clean.value_cache.astype(mx.float32))
+    poison_k = np.full_like(kc, 1e3)
+    poison_v = np.full_like(vc, 1e3)
+    lo = 0 if window is None else n - window
+    for p in range(lo, n):
+        b, o = clean.tables[0, p // clean.block], p % clean.block
+        poison_k[b, o] = kc[b, o]
+        poison_v[b, o] = vc[b, o]
+    poisoned = Case(
+        clean.query,
+        mx.array(poison_k).astype(mx.bfloat16),
+        mx.array(poison_v).astype(mx.bfloat16),
+        clean.tables,
+        clean.kv_lens,
+        clean.kv_heads,
+        clean.block,
+    )
+    got = _run(poisoned, scale=512**-0.5, window=window, expect=decode_path)
+    _assert_close(got, ref, mx.bfloat16)
+
+
+def test_realistic_logit_range(decode_path) -> None:
+    """Gemma 4 RMS-normalizes q and k per head and uses scale 1.0."""
+    case = _make_case(kv_lens=[4096], dtype=mx.bfloat16, seed=17, **GEMMA_FULL)
+
+    def rms_normalize(x: mx.array) -> mx.array:
+        a = np.array(x.astype(mx.float32))
+        a = a / np.sqrt((a * a).mean(axis=-1, keepdims=True))
+        return mx.array(a).astype(mx.bfloat16)
+
+    case.query = rms_normalize(case.query)
+    case.key_cache = rms_normalize(case.key_cache)
+    got = _run(case, scale=1.0, expect=decode_path)
+    _assert_close(got, _reference(case, scale=1.0), mx.bfloat16)
+
+
+@pytest.mark.parametrize("partition", [0, 256, 512])
+@pytest.mark.parametrize("g", [8, 12])
+def test_sinks_with_and_without_partitions(force_gqa, g, partition) -> None:
+    force_gqa.set_gqa_decode_partition_size(partition)
+    case = _make_case(
+        kv_lens=[1500, 700],
+        heads=2 * g,
+        kv_heads=2,
+        hd=512,
+        dtype=mx.bfloat16,
+        seed=g,
+    )
+    sinks = np.linspace(-2.0, 3.0, 2 * g, dtype=np.float32)
+    got = _run(case, scale=512**-0.5, sinks=sinks, expect="gqa")
+    _assert_close(got, _reference(case, scale=512**-0.5, sinks=sinks), mx.bfloat16)
+
+
+def test_softcap(force_gqa) -> None:
+    case = _make_case(kv_lens=[2000], dtype=mx.bfloat16, seed=19, **GEMMA_FULL)
+    got = _run(case, scale=0.125, softcap=30.0, expect="gqa")
+    _assert_close(got, _reference(case, scale=0.125, softcap=30.0), mx.bfloat16)
+
+
+def test_accuracy_not_worse_than_the_per_token_kernel() -> None:
+    ops = get_ops()
+    case = _make_case(kv_lens=[2048] * 16, dtype=mx.bfloat16, seed=37, **GEMMA_FULL)
+    ref = _reference(case, scale=512**-0.5)  # 16 x 16 x 512 = 131072 outputs
+    ops.set_gqa_decode_enabled(False)
+    try:
+        old = _run(case, scale=512**-0.5, expect="per_token")
+    finally:
+        _reset(ops)
+    new = _run(case, scale=512**-0.5, expect="gqa")
+    e_old, e_new = np.abs(old - ref), np.abs(new - ref)
+    for stat in (np.mean, lambda e: np.percentile(e, 99), np.max):
+        assert stat(e_new) <= 1.1 * stat(e_old) + 1e-7
+
+
+SHAPES = [(hd, g) for hd in (128, 256, 512) for g in (2, 4, 8, 12, 16)]
+
+
+@pytest.mark.parametrize(("hd", "g"), SHAPES)
+def test_every_supported_shape_matches_reference_fp16(force_gqa, hd, g) -> None:
+    case = _make_case(
+        kv_lens=[1500],
+        heads=2 * g,
+        kv_heads=2,
+        hd=hd,
+        dtype=mx.float16,
+        seed=hd + g,
+    )
+    got = _run(case, scale=hd**-0.5, expect="gqa")
+    _assert_close(got, _reference(case, scale=hd**-0.5), mx.float16)
