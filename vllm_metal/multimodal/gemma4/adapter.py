@@ -257,6 +257,11 @@ class Gemma4MultimodalAdapter:
 
     @staticmethod
     def _as_mlx(value: Any) -> mx.array:
+        # vLLM's multimodal cache hands the same tensors to every later request
+        # with this image, and the pixels already arrive in the tower dtype, so
+        # a shared import would reach the tower's first elementwise ops, which
+        # MLX may run in the donated input buffer: the cached pixels would be
+        # normalized in place and every re-encode would see a different image.
         if isinstance(value, torch.Tensor):
-            return torch_to_mlx(value)
+            return torch_to_mlx(value, copy=True)
         return mx.array(value)

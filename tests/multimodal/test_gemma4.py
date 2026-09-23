@@ -215,6 +215,79 @@ class TestEncodeMultimodal:
             adapter.encode_multimodal([feature])
 
 
+def _real_tower_feature(side: int = 6) -> MultiModalFeatureSpec:
+    """One image as vLLM's multimodal cache holds it: bf16 pixels on a grid."""
+    num_patches = side * side
+    pixels = torch.rand(
+        (1, num_patches, 768), generator=torch.Generator().manual_seed(0)
+    )
+    ys, xs = torch.meshgrid(torch.arange(side), torch.arange(side), indexing="ij")
+    grid = torch.stack([xs.flatten(), ys.flatten()], dim=-1)[None]
+    field = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+    item = MultiModalKwargsItem(
+        {
+            "pixel_values": field.build_elems(
+                "pixel_values", pixels.to(torch.bfloat16)
+            )[0],
+            "pixel_position_ids": field.build_elems("pixel_position_ids", grid)[0],
+        }
+    )
+    return MultiModalFeatureSpec(
+        data=item,
+        modality="image",
+        identifier="image-cached",
+        mm_position=PlaceholderRange(offset=0, length=num_patches // POOL),
+    )
+
+
+class TestEncodeLeavesCachedInputsIntact:
+    def test_reencoding_a_cached_item_gives_the_same_rows(self) -> None:
+        # vLLM hands the same item to every later request with this image,
+        # and a request re-encodes it once the encoder cache has evicted the
+        # output.  The real tower starts with same-dtype elementwise ops on
+        # the pixels, which MLX may run in place of a donated input buffer.
+        from mlx_vlm.models.gemma4.config import VisionConfig
+        from mlx_vlm.models.gemma4.vision import VisionModel
+
+        tower = VisionModel(
+            VisionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=8,
+                global_head_dim=8,
+                patch_size=16,
+                pooling_kernel_size=3,
+                default_output_length=4,
+                position_embedding_size=64,
+            )
+        )
+        sidecar = Gemma4VisionSidecar(
+            vision_tower=tower,
+            embed_vision=_EmbedVision(),
+            pixel_dtype=mx.bfloat16,
+            num_parameters=1,
+            num_bytes=2,
+        )
+        adapter = Gemma4MultimodalAdapter.from_loaded(_TextModel(_Backbone()), sidecar)
+        feature = _real_tower_feature()
+        assert feature.data is not None
+        pixels = feature.data["pixel_values"].data
+        positions = feature.data["pixel_position_ids"].data
+        original_pixels, original_positions = pixels.clone(), positions.clone()
+
+        [first] = adapter.encode_multimodal([feature])
+        mx.eval(first.hidden_states)
+        [second] = adapter.encode_multimodal([feature])
+        mx.eval(second.hidden_states)
+
+        assert torch.equal(pixels, original_pixels)
+        assert torch.equal(positions, original_positions)
+        assert mx.array_equal(first.hidden_states, second.hidden_states).item()
+
+
 class TestPositions:
     def test_empty_input(self) -> None:
         adapter, _ = _adapter()
