@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 import vllm_metal.envs as envs
-from vllm_metal.metal import _try_init_nax_library
+from vllm_metal.metal import _try_init_nax_library, get_ops
 
 
 def _ops(*, supported: bool = True, load_error: Exception | None = None):
@@ -93,3 +93,14 @@ def test_optional_load_failure_warns_and_keeps_fallback(
         prebuilt_path=lib,
     )
     assert "using the non-NAX fallback" in caplog.text
+
+
+def test_nax_loads_where_supported() -> None:
+    # The fallback above keeps prefill working, which is exactly why a NAX load
+    # failure on an M5 is otherwise only a log line.
+    if envs.VLLM_METAL_DISABLE_NAX:
+        pytest.skip("VLLM_METAL_DISABLE_NAX is set")
+    ops = get_ops()
+    if not ops.nax_supported():
+        pytest.skip("no NAX tensor units on this machine")
+    assert ops.nax_ready(), "NAX fell back to the tiled kernel; see the log warning"
