@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 from transformers import AutoConfig
 from transformers.models.auto import configuration_auto
 
@@ -1069,3 +1070,84 @@ class TestQwen3FlatPrefixRealStrictLoad:
             assert not hasattr(pooling, "lm_head")
         finally:
             _unwrap_qwen3_sanitize(model_cls)
+
+
+class TestGemma4Float32PixelsCompatPatch:
+    """``VLLM_METAL_GEMMA4_VISION_FLOAT32`` keeps Gemma 4 pixels out of vLLM's
+    cast of every floating processor output to the model dtype."""
+
+    @pytest.fixture
+    def context_cls(self, monkeypatch):
+        from vllm.multimodal.processing.context import InputProcessingContext
+
+        # Let monkeypatch put the real method back and drop the patch marker.
+        monkeypatch.setattr(
+            InputProcessingContext,
+            "_postprocess_output",
+            InputProcessingContext._postprocess_output,
+        )
+        monkeypatch.setattr(
+            InputProcessingContext,
+            compat._GEMMA4_FLOAT32_PIXELS_PATCHED_ATTR,
+            False,
+            raising=False,
+        )
+        monkeypatch.delenv("VLLM_METAL_GEMMA4_VISION_FLOAT32", raising=False)
+        return InputProcessingContext
+
+    @staticmethod
+    def _postprocess(context_cls, model_type: str) -> dict:
+        model_config = SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(model_type=model_type),
+            get_multimodal_config=lambda: SimpleNamespace(mm_tensor_ipc="direct_rpc"),
+        )
+        context = context_cls(model_config=model_config, tokenizer=None)
+        # Gemma4ImageProcessor output: rescaled pixels k / 255, most of which
+        # bfloat16 cannot represent.
+        return context._postprocess_output(
+            {
+                "pixel_values": torch.arange(256, dtype=torch.float32)[None] / 255,
+                "image_position_ids": torch.zeros((1, 2), dtype=torch.int64),
+                "input_features": torch.full((1, 2), 1 / 3),
+            }
+        )
+
+    def test_enabled_keeps_gemma4_pixel_values_float32(
+        self, context_cls, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_GEMMA4_VISION_FLOAT32", "1")
+        compat._patch_vllm_gemma4_float32_pixels()
+
+        out = self._postprocess(context_cls, "gemma4")
+
+        assert out["pixel_values"].dtype == torch.float32
+        assert torch.equal(
+            out["pixel_values"], torch.arange(256, dtype=torch.float32)[None] / 255
+        )
+        assert out["image_position_ids"].dtype == torch.int64
+        assert out["input_features"].dtype == torch.bfloat16
+
+    def test_enabled_still_casts_other_models(self, context_cls, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_GEMMA4_VISION_FLOAT32", "1")
+        compat._patch_vllm_gemma4_float32_pixels()
+
+        out = self._postprocess(context_cls, "qwen3_vl")
+
+        assert out["pixel_values"].dtype == torch.bfloat16
+
+    def test_disabled_by_default(self, context_cls) -> None:
+        compat._patch_vllm_gemma4_float32_pixels()
+
+        out = self._postprocess(context_cls, "gemma4")
+
+        assert out["pixel_values"].dtype == torch.bfloat16
+
+    def test_apply_compat_patches_installs_it(self, context_cls, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_GEMMA4_VISION_FLOAT32", "1")
+        monkeypatch.setattr(compat, "_APPLIED", False)
+        compat.apply_compat_patches()
+
+        out = self._postprocess(context_cls, "gemma4")
+
+        assert out["pixel_values"].dtype == torch.float32
