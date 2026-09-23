@@ -45,7 +45,12 @@ class STTRuntimeAdapter(ABC):
         if isinstance(value, torch.Tensor):
             from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
 
-            return torch_to_mlx(value).astype(mx.float16)
+            # vLLM's multimodal cache may hand the same features to later
+            # requests with this audio, in the model dtype (usually bf16).
+            # Casting bf16 to fp16 keeps the item size, so on a shared import
+            # MLX may write the cast into the donated input buffer: the cached
+            # features would then hold fp16 bits read as bf16.
+            return torch_to_mlx(value, copy=True).astype(mx.float16)
 
         if not isinstance(value, mx.array):
             return mx.array(value, dtype=mx.float16)
