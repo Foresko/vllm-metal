@@ -204,14 +204,16 @@ static int64_t gqa_decode_partitioned_dispatches_ = 0;
 //     reach kGqaMinTokenContext; below it (1-3 tokens at 1-3K context) the
 //     per-token kernel's many light threadgroups win.
 //   * A threadgroup walks its partition serially (~4.5 us per 8-key tile),
-//     so a single pass pays off only on a full grid.
+//     so a single pass pays off only on a full grid: at 256 decode tokens
+//     (grid 512) 512-token partitions are 14-20% faster, at 512 tokens
+//     (grid 1024) a single pass is 1-3% faster.
 //   * 256-token partitions beat 512 while the split grid stays under 1.5
 //     threadgroups per core; above that 512 is equal or better.
 constexpr int64_t kGqaMinTokenContext = 4096;
-constexpr int kGqaSinglePassGridPerCore = 8;
+constexpr int kGqaSinglePassGridPerCore = 16;
 
 // (head_size, G) shapes where the GQA decode kernel measured faster than the
-// per-token kernel, with the batch sizes where it does; every other
+// per-token kernel, and the tokens x context from which it does; every other
 // supported shape runs only under force.
 //   (512, 8): Gemma 4 full attention (16 q / 2 KV heads), M3 Ultra, 2026-09.
 static bool gqa_decode_measured_win(int head_size, int g, int total_q_tokens,
@@ -2056,8 +2058,8 @@ NB_MODULE(_paged_ops, m) {
         "(single-pass, partitioned) GQA decode dispatches since process start.");
 
   m.def("gqa_decode_min_grid", &gqa_decode_min_grid,
-        "Head-group x token threadgroups below which the GQA decode kernel "
-        "splits KV into partitions on this machine.");
+        "Head-group x token threadgroups from which the GQA decode kernel "
+        "runs a single pass on this machine.");
 
   m.def("gqa_decode_partition_size", &gqa_decode_partition_size,
         nb::arg("num_groups"), nb::arg("total_q_tokens"), nb::arg("max_seq_len"),
