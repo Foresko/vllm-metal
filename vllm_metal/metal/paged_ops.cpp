@@ -182,6 +182,23 @@ static bool nax_eligible(Dtype dtype, int head_size, int block_size) {
 }
 
 // ---------------------------------------------------------------------------
+// GQA-packed decode kernel (paged_attention_gqa_decode in
+// pagedattention_tiled.metal) — switches and counters.
+// ---------------------------------------------------------------------------
+
+// Kill switch (VLLM_METAL_DISABLE_GQA_DECODE): false keeps every decode batch
+// on the per-token kernel.
+static bool gqa_decode_enabled_ = true;
+// Tests and benchmarks: dispatch every supported shape, not only the shapes
+// in the measured-win table.
+static bool gqa_decode_force_ = false;
+// -1: automatic split; 0: single pass; 256 / 512: that partition size.
+static int gqa_decode_partition_override_ = -1;
+// Dispatch counters, so tests can prove routing without comparing outputs.
+static int64_t gqa_decode_single_pass_dispatches_ = 0;
+static int64_t gqa_decode_partitioned_dispatches_ = 0;
+
+// ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
 
@@ -1780,6 +1797,40 @@ NB_MODULE(_paged_ops, m) {
   m.def("set_nax_enabled", [](bool enabled) { nax_enabled_ = enabled; },
         nb::arg("enabled"),
         "Runtime kill-switch for the NAX prefill kernel (tests / A-B runs).");
+
+  m.def("gqa_decode_ready", []() { return gqa_decode_enabled_; },
+        "True when the GQA-packed decode kernel may be dispatched.");
+
+  m.def("set_gqa_decode_enabled",
+        [](bool enabled) { gqa_decode_enabled_ = enabled; },
+        nb::arg("enabled"),
+        "Runtime kill switch for the GQA-packed decode kernel "
+        "(VLLM_METAL_DISABLE_GQA_DECODE).");
+
+  m.def("set_gqa_decode_force",
+        [](bool force) { gqa_decode_force_ = force; },
+        nb::arg("force"),
+        "Dispatch the GQA decode kernel for every supported shape, not only "
+        "the measured ones (tests / benchmarks).");
+
+  m.def("set_gqa_decode_partition_size",
+        [](int size) {
+          if (size != -1 && size != 0 && size != 256 && size != 512) {
+            throw std::invalid_argument(
+                "GQA decode partition size must be -1 (auto), 0, 256 or 512");
+          }
+          gqa_decode_partition_override_ = size;
+        },
+        nb::arg("size"),
+        "Force the GQA decode split: -1 automatic, 0 single pass, 256 or 512 "
+        "(tests / benchmarks).");
+
+  m.def("gqa_decode_dispatch_counts",
+        []() {
+          return nb::make_tuple(gqa_decode_single_pass_dispatches_,
+                                gqa_decode_partitioned_dispatches_);
+        },
+        "(single-pass, partitioned) GQA decode dispatches since process start.");
 
   m.def("supports_mm_prefix", []() { return true; },
         "True when paged_attention_primitive accepts mm_prefix_ranges "

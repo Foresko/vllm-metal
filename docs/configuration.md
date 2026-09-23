@@ -6,6 +6,7 @@
 |----------|---------|-------------|
 | `VLLM_MLX_DEVICE` | `gpu` | MLX device (`gpu` or `cpu`) |
 | `VLLM_METAL_DISABLE_NAX` | `0` | Emergency override for automatic M5 NAX prefill attention. Set to `1` to force the non-NAX fallback. |
+| `VLLM_METAL_DISABLE_GQA_DECODE` | `0` | Emergency override for the GQA-packed decode kernel, which serves the query heads that share a KV head in one threadgroup and reads each KV head once per decode step. It is dispatched only for measured shapes (head_dim 512 with 8 query heads per KV head). Set to `1` to keep every decode batch on the per-token kernel. |
 | `VLLM_METAL_MULTIMODAL_MODE` | `auto` | Multimodal serve mode: `auto` uses the compatibility allowlist (Gemma 4 gets the vision sidecar when its checkpoint allows); `multimodal-native` disables overrides; `text-only` forces the text-only path for every multimodal checkpoint |
 | `VLLM_METAL_MM_PREFIX_PATH` | `kernel` | Gemma 4 image-block attention path: `kernel` hands each query row's image-block range to the tiled Metal prefill kernel; `recompute` keeps the MLX SDPA recompute of the block rows after the kernel (the reference path). Any other value is rejected at first use |
 | `VLLM_USE_MODELSCOPE` | `False` | Set True to change model registry to <https://www.modelscope.cn/> |
