@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar, has_vision_weights
 
@@ -110,3 +111,29 @@ class TestGemma4VisionSidecarLoad:
 
         with pytest.raises(ValueError, match="missing parameters"):
             Gemma4VisionSidecar.load(tmp_path, load_composite=_boom)
+
+    @pytest.mark.parametrize(
+        ("float32", "dtype", "num_bytes"),
+        [(False, mx.bfloat16, 64 * 2), (True, mx.float32, 64 * 4)],
+    )
+    def test_float32_runs_tower_and_embedder_in_float32(
+        self, tmp_path: Path, float32: bool, dtype: mx.Dtype, num_bytes: int
+    ) -> None:
+        tower = _Tower(nn.Linear(4, 4, bias=False))
+        embed = _Embed()
+        tower.set_dtype(mx.bfloat16)
+        embed.set_dtype(mx.bfloat16)
+
+        sidecar = Gemma4VisionSidecar.load(
+            tmp_path,
+            load_composite=lambda _: _composite(tower, embed),
+            float32=float32,
+        )
+
+        params = tree_flatten(sidecar.vision_tower.parameters()) + tree_flatten(
+            sidecar.embed_vision.parameters()
+        )
+        assert {value.dtype for _, value in params} == {dtype}
+        assert sidecar.pixel_dtype == dtype
+        assert sidecar.num_parameters == 64
+        assert sidecar.num_bytes == num_bytes

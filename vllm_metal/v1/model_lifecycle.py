@@ -14,6 +14,7 @@ from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
 
+from vllm_metal import envs
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.compat import apply_compat_patches, embedding_load_scope
@@ -327,7 +328,10 @@ class ModelLifecycle:
                     "support logit softcap or attention sinks"
                 )
         assert request.sidecar_checkpoint is not None  # set by from_runner
-        sidecar = Gemma4VisionSidecar.load(request.sidecar_checkpoint)
+        sidecar = Gemma4VisionSidecar.load(
+            request.sidecar_checkpoint,
+            float32=envs.VLLM_METAL_GEMMA4_VISION_FLOAT32,
+        )
         return LoadedGenerationModel(
             model=model,
             tokenizer=tokenizer,
