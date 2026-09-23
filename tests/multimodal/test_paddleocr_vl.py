@@ -368,6 +368,75 @@ class TestPaddleOCRVLMultimodalAdapterEncodeMultimodal:
             _adapter(visual=None).encode_multimodal([_feature()])
 
 
+def _cached_image_feature(pixel_dtype: torch.dtype) -> MultiModalFeatureSpec:
+    """One image as vLLM's multimodal cache holds it: its split of the batch."""
+    grid = torch.tensor([_IMAGE_GRID_THW_2X2])
+    pixels = torch.rand(
+        (_RAW_PATCH_COUNT_2X2, 3, 14, 14), generator=torch.Generator().manual_seed(0)
+    )
+    per_image = pixels.to(pixel_dtype).split(grid.prod(-1).tolist())
+    pixel_field = MultiModalFieldConfig.batched("image")
+    grid_field = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+    item = MultiModalKwargsItem(
+        {
+            "pixel_values": pixel_field.build_elems("pixel_values", per_image)[0],
+            "image_grid_thw": grid_field.build_elems("image_grid_thw", grid)[0],
+        }
+    )
+    return MultiModalFeatureSpec(
+        data=item,
+        modality="image",
+        identifier="image-cached",
+        mm_position=PlaceholderRange(offset=0, length=_IMAGE_TOKEN_COUNT_2X2),
+    )
+
+
+class TestEncodeLeavesCachedInputsIntact:
+    @pytest.mark.parametrize(
+        "pixel_dtype",
+        # vLLM delivers pixels in the model dtype: bf16 under --dtype auto,
+        # fp16 under --dtype float16, while the tower keeps its bf16 weights.
+        [torch.bfloat16, torch.float16],
+        ids=["dtype-auto", "dtype-float16"],
+    )
+    def test_reencoding_a_cached_item_gives_the_same_rows(
+        self, pixel_dtype: torch.dtype
+    ) -> None:
+        # vLLM hands the same item to every later request with this image,
+        # and a request re-encodes it once the encoder cache has evicted the
+        # output.  Casting fp16 pixels for the bf16 tower keeps the item size,
+        # so MLX may run the cast in place of a donated input buffer.
+        from mlx_vlm.models.paddleocr_vl.config import VisionConfig
+        from mlx_vlm.models.paddleocr_vl.vision import VisionModel
+
+        visual = VisionModel(
+            VisionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=56,
+                patch_size=14,
+            )
+        )
+        visual.set_dtype(mx.bfloat16)  # mlx-community towers ship bf16 weights
+        adapter = _adapter(visual=visual)
+        feature = _cached_image_feature(pixel_dtype)
+        assert feature.data is not None
+        pixels = feature.data["pixel_values"].data
+        grid = feature.data["image_grid_thw"].data
+        original_pixels, original_grid = pixels.clone(), grid.clone()
+
+        [first] = adapter.encode_multimodal([feature])
+        mx.eval(first.hidden_states)
+        [second] = adapter.encode_multimodal([feature])
+        mx.eval(second.hidden_states)
+
+        assert torch.equal(pixels, original_pixels)
+        assert torch.equal(grid, original_grid)
+        assert mx.array_equal(first.hidden_states, second.hidden_states).item()
+
+
 class TestPaddleOCRVLMultimodalAdapterCallLm:
     def test_call_lm_forwards_inputs_embeds_and_positions(self) -> None:
         language_model = _RecordingLanguageModel()
