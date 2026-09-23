@@ -198,11 +198,26 @@ static int gqa_decode_partition_override_ = -1;
 static int64_t gqa_decode_single_pass_dispatches_ = 0;
 static int64_t gqa_decode_partitioned_dispatches_ = 0;
 
+// GQA decode dispatch rules, measured on an M3 Ultra (60 GPU cores) with
+// tools/gqa_decode_bench.py (serial call chain, cold KV), 2026-09-23:
+//   * (512, 8) beats the per-token kernel once a batch's tokens x context
+//     reach kGqaMinTokenContext; below it (1-3 tokens at 1-3K context) the
+//     per-token kernel's many light threadgroups win.
+//   * A threadgroup walks its partition serially (~4.5 us per 8-key tile),
+//     so a single pass pays off only on a full grid.
+//   * 256-token partitions beat 512 while the split grid stays under 1.5
+//     threadgroups per core; above that 512 is equal or better.
+constexpr int64_t kGqaMinTokenContext = 4096;
+constexpr int kGqaSinglePassGridPerCore = 8;
+
 // (head_size, G) shapes where the GQA decode kernel measured faster than the
-// per-token kernel; every other supported shape runs only under force.
+// per-token kernel, with the batch sizes where it does; every other
+// supported shape runs only under force.
 //   (512, 8): Gemma 4 full attention (16 q / 2 KV heads), M3 Ultra, 2026-09.
-static bool gqa_decode_measured_win(int head_size, int g) {
-  return head_size == 512 && g == 8;
+static bool gqa_decode_measured_win(int head_size, int g, int total_q_tokens,
+                                    int max_seq_len) {
+  return head_size == 512 && g == 8
+         && int64_t(total_q_tokens) * max_seq_len >= kGqaMinTokenContext;
 }
 
 // head_size -> TILE_KV; must match instantiate_paged_attention_gqa_decode_ps
@@ -216,11 +231,10 @@ static int gqa_decode_tile_kv(int head_size) {
   }
 }
 
-// Head-group x token threadgroups below which the GQA kernel splits KV into
-// partitions.  Starts at the per-token kernel's threshold; re-tuned by
-// measurement (plan task 6).
+// Head-group x token threadgroups from which the GQA kernel runs a single
+// pass instead of splitting KV into partitions.
 static int gqa_decode_min_grid() {
-  return min_decode_grid();
+  return gpu_core_count() * kGqaSinglePassGridPerCore;
 }
 
 static int gqa_decode_partition_size(int num_groups, int total_q_tokens,
@@ -228,13 +242,18 @@ static int gqa_decode_partition_size(int num_groups, int total_q_tokens,
   if (gqa_decode_partition_override_ >= 0) {
     return gqa_decode_partition_override_;
   }
-  const bool split = num_groups * total_q_tokens < gqa_decode_min_grid()
-                     && max_seq_len > 512;
-  return split ? 512 : 0;
+  const int grid = num_groups * total_q_tokens;
+  if (grid >= gqa_decode_min_grid()) {
+    return 0;
+  }
+  // 256 while grid x ceil(ctx / 512) < 1.5 threadgroups per core.
+  const int partitions_512 = (max_seq_len + 511) / 512;
+  const int ps = 2 * grid * partitions_512 < 3 * gpu_core_count() ? 256 : 512;
+  return max_seq_len > ps ? ps : 0;  // one partition would only add the reduce
 }
 
 static bool gqa_decode_routes(const array& query, const array& key_cache,
-                              int num_kv_heads, int block_size,
+                              int num_kv_heads, int block_size, int max_seq_len,
                               bool use_turboquant) {
   if (!gqa_decode_enabled_ || use_turboquant || num_kv_heads <= 0) {
     return false;
@@ -252,7 +271,9 @@ static bool gqa_decode_routes(const array& query, const array& key_cache,
   if (g < 2) {
     return false;
   }
-  return gqa_decode_force_ || gqa_decode_measured_win(head_size, g);
+  const int total_q_tokens = static_cast<int>(query.shape(0));
+  return gqa_decode_force_
+         || gqa_decode_measured_win(head_size, g, total_q_tokens, max_seq_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +772,8 @@ static void dispatch_paged_attention_v2_online(
   // GQA-packed decode: pure-decode batches whose (head_size, G) is a measured
   // win (or forced) read each KV head once instead of once per query head.
   if (!has_prefill && gqa_decode_routes(query, key_cache, num_kv_heads,
-                                        block_size, use_turboquant)) {
+                                        block_size, max_seq_len,
+                                        use_turboquant)) {
     dispatch_paged_attention_gqa_decode(
         out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
         block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
@@ -2036,6 +2058,11 @@ NB_MODULE(_paged_ops, m) {
   m.def("gqa_decode_min_grid", &gqa_decode_min_grid,
         "Head-group x token threadgroups below which the GQA decode kernel "
         "splits KV into partitions on this machine.");
+
+  m.def("gqa_decode_partition_size", &gqa_decode_partition_size,
+        nb::arg("num_groups"), nb::arg("total_q_tokens"), nb::arg("max_seq_len"),
+        "KV partition size the GQA decode kernel picks for this grid on this "
+        "machine: 0 (single pass), 256 or 512; honours the test override.");
 
   m.def("supports_mm_prefix", []() { return true; },
         "True when paged_attention_primitive accepts mm_prefix_ranges "
