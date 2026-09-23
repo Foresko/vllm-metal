@@ -1043,7 +1043,6 @@ class TestLazyRecurrentDecode:
                 fallback._run_recurrent_fallback(*fallback_args)
             return
         cpp_out = fallback._run_recurrent_fallback(*fallback_args)
-        mx.synchronize()
         mx.eval(
             lazy_out,
             cpp_out,
@@ -1501,7 +1500,6 @@ class TestLazyRecurrentPrefill:
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v))
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv))
-        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
         mx.eval(
             q_flat,
             k_flat,
@@ -1509,9 +1507,8 @@ class TestLazyRecurrentPrefill:
             g_flat,
             beta_flat,
             cache_cpp.recurrent_states[0],
-            cpp_out,
         )
-        _get_native_ops_or_skip().gdn_linear_attention(
+        cpp_out, cpp_state = _get_native_ops_or_skip().gdn_linear_attention(
             q_flat,
             k_flat,
             v_flat,
@@ -1520,13 +1517,12 @@ class TestLazyRecurrentPrefill:
             cache_cpp.recurrent_states[0],
             mx.array(cu_seqlens, dtype=mx.int32),
             mx.array(slot_ids, dtype=mx.int32),
-            cpp_out,
             n_hk,
             n_hv,
             d_k,
             d_v,
         )
-        mx.synchronize()
+        cache_cpp.store_recurrent_state(0, cpp_state)
         mx.eval(
             lazy_out,
             cpp_out,
@@ -1594,7 +1590,6 @@ class TestLazyRecurrentPrefill:
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(mx.float32))
         g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(mx.float32))
         beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(mx.float32))
-        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
         mx.eval(
             q_flat,
             k_flat,
@@ -1602,9 +1597,8 @@ class TestLazyRecurrentPrefill:
             g_flat,
             beta_flat,
             cache_cpp.recurrent_states[0],
-            cpp_out,
         )
-        _get_native_ops_or_skip().gdn_linear_attention(
+        cpp_out, cpp_state = _get_native_ops_or_skip().gdn_linear_attention(
             q_flat,
             k_flat,
             v_flat,
@@ -1613,13 +1607,12 @@ class TestLazyRecurrentPrefill:
             cache_cpp.recurrent_states[0],
             mx.array(cu_seqlens, dtype=mx.int32),
             mx.array(slot_ids, dtype=mx.int32),
-            cpp_out,
             n_hk,
             n_hv,
             d_k,
             d_v,
         )
-        mx.synchronize()
+        cache_cpp.store_recurrent_state(0, cpp_state)
         lazy_cmp = lazy_out.astype(mx.float32)
         cpp_cmp = cpp_out.astype(mx.bfloat16).astype(mx.float32)
         mx.eval(
@@ -1791,6 +1784,40 @@ class TestGDNLazySharedOwner:
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
+
+
+class TestNativeGDNRecurrent:
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_consecutive_recurrences_keep_distinct_outputs(self, compiled):
+        _require_metal()
+        ops = _get_native_ops_or_skip()
+
+        def two_steps(q, v, g, beta, state, cu_seqlens, slots):
+            first, state = ops.gdn_linear_attention(
+                q, q, v, g, beta, state, cu_seqlens, slots, 1, 1, 32, 4
+            )
+            second, state = ops.gdn_linear_attention(
+                q, q, v, g, beta, state, cu_seqlens, slots, 1, 1, 32, 4
+            )
+            return first, second, state
+
+        run = mx.compile(two_steps) if compiled else two_steps
+        first, second, state = run(
+            mx.array([1.0] + [0.0] * 31).reshape(1, 1, 32),
+            mx.full((1, 1, 4), 2, dtype=mx.float32),
+            mx.ones((1, 1)),
+            mx.full((1, 1), 0.5),
+            mx.zeros((3, 1, 4, 32)),
+            mx.array([0, 1], dtype=mx.int32),
+            mx.array([2], dtype=mx.int32),
+        )
+        mx.eval(first, second, state)
+        # The selected column follows s <- (s + 2) / 2 from an initial zero.
+        np.testing.assert_array_equal(np.array(first), 1)
+        np.testing.assert_array_equal(np.array(second), 1.5)
+        expected = np.zeros((3, 1, 4, 32), dtype=np.float32)
+        expected[2, ..., 0] = 1.5
+        np.testing.assert_array_equal(np.array(state), expected)
 
 
 class TestNativeGDNStateScatter:

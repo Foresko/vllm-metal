@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Physical sharing and native writes using vLLM-created cache views."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -13,7 +16,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForwardState
 from vllm_metal.metal import get_ops
 
 
@@ -65,6 +70,47 @@ def test_strided_state_writes_share_upstream_backing():
     assert torch.all(page[16:528].view(torch.float32) == 9)
     assert not storage.tensors["s0"].any()
     assert storage.nbytes == 16384
+
+
+@pytest.mark.parametrize("reader", ["storage", "cross_stream"])
+def test_native_gdn_write_reaches_shared_state_readers(reader):
+    storage = make_storage()
+    cache = PagedStateCache(storage.state_views(["s0", "s1"]))
+    inner = SimpleNamespace(num_k_heads=1, num_v_heads=1, head_k_dim=32, head_v_dim=4)
+    wrapper = GDNPagedAttentionWrapper(inner, 0, 0, cache)
+    mx.eval(*storage.buffers)
+    q = mx.broadcast_to(mx.array([1.0] + [0.0] * 31), (1, 2, 1, 32))
+    output = wrapper._run_recurrent_fallback(
+        q,
+        q,
+        mx.full((1, 2, 1, 4), 2, dtype=mx.float32),
+        mx.ones((1, 2, 1)),
+        mx.full((1, 2, 1), 0.5),
+        _GDNForwardState(
+            x=mx.zeros((1, 2, 4)),
+            cu_seqlens=[0, 1, 2],
+            num_requests=2,
+            total_tokens=2,
+            slot_ids=[2, 0],
+            num_decode_requests=2,
+        ),
+    )
+    expected = np.zeros((4, 1, 4, 32), dtype=np.float32)
+    expected[[2, 0], ..., 0] = 1
+    if reader == "storage":
+        mx.eval(*storage.buffers)
+    else:
+        with mx.stream(mx.new_stream(mx.gpu)):
+            observed = cache.recurrent_states[0] + 0
+            mx.eval(observed)
+        np.testing.assert_array_equal(np.array(observed), expected)
+    # Read the original backing before evaluating output, which could hide a
+    # missing cache-owner dependency. The fp16 conv state occupies 16 bytes.
+    pages = storage.tensors["s0"].squeeze(dim=(1, 2))
+    host_state = pages[:, 16:528].view(torch.float32).reshape(4, 1, 4, 32)
+    np.testing.assert_array_equal(host_state.numpy(), expected)
+    assert not storage.tensors["s1"].any()
+    np.testing.assert_array_equal(np.array(output), 1)
 
 
 def test_copy_cycles_snapshot_sources_and_deduplicate_aliases(monkeypatch):

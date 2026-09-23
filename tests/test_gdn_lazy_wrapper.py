@@ -1081,13 +1081,15 @@ class TestGDNPagedAttentionWrapperLazyKernels:
                 self.called = False
                 self.args: tuple[Any, ...] | None = None
 
-            def gdn_linear_attention(self, *args: Any) -> None:
+            def gdn_linear_attention(self, *args: Any) -> tuple[mx.array, mx.array]:
                 self.called = True
                 self.args = args
                 state_pool = args[5]
-                y_flat = args[8]
-                state_pool[:] = 7
-                y_flat[:] = 0
+                q, hv, dv = args[0], args[9], args[11]
+                return (
+                    mx.zeros((q.shape[0], hv, dv), dtype=q.dtype),
+                    mx.full_like(state_pool, 7),
+                )
 
         def fail_make_kernel(*_: Any) -> None:
             raise AssertionError(
