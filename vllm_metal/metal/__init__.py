@@ -132,6 +132,14 @@ def _try_init_nax_library(
         return False
 
 
+def _configure_gqa_decode(mod: ModuleType, *, disabled: bool) -> bool:
+    """Apply the GQA decode kill switch; return whether the kernel may run."""
+    mod.set_gqa_decode_enabled(not disabled)
+    if disabled:
+        logger.info("GQA decode attention disabled by VLLM_METAL_DISABLE_GQA_DECODE")
+    return bool(mod.gqa_decode_ready())
+
+
 def metal_mla_paged_attention(
     q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
     q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
@@ -295,6 +303,13 @@ def get_ops() -> ModuleType:
     )
     if nax_ready:
         logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
+
+    if _configure_gqa_decode(mod, disabled=envs.VLLM_METAL_DISABLE_GQA_DECODE):
+        logger.info(
+            "GQA-packed decode attention enabled for measured shapes "
+            "(single pass from %d head-group x token threadgroups on this GPU)",
+            mod.gqa_decode_min_grid(),
+        )
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
