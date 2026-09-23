@@ -1611,6 +1611,31 @@ class TestTextSidecarLifecycle:
             {"sliding"}
         )
 
+    @pytest.mark.parametrize(("env", "float32"), [(None, False), ("1", True)])
+    def test_vision_float32_flag_reaches_the_sidecar(
+        self, monkeypatch: pytest.MonkeyPatch, env: str | None, float32: bool
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        if env is not None:
+            monkeypatch.setenv("VLLM_METAL_GEMMA4_VISION_FLOAT32", env)
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+        load_kwargs: list[dict[str, object]] = []
+
+        def _load(path: Path, **kwargs: object) -> Gemma4VisionSidecar:
+            load_kwargs.append(kwargs)
+            return _fake_sidecar()
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_load)
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        assert load_kwargs == [{"float32": float32}]
+
     def test_text_only_mode_keeps_today_s_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

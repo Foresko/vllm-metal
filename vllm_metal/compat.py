@@ -36,6 +36,7 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     _patch_vllm_gemma4_mtp_config_loading()
     _patch_vllm_sliding_window_replay_tail()
+    _patch_vllm_gemma4_float32_pixels()
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
@@ -1010,6 +1011,28 @@ def _patch_vllm_sliding_window_replay_tail() -> None:
     _after_import("vllm.v1.core.single_type_kv_cache_manager", _apply_replay_tail_patch)
 
 
+_GEMMA4_FLOAT32_PIXELS_PATCHED_ATTR = "_vllm_metal_gemma4_float32_pixels_patched"
+
+
+def _patch_vllm_gemma4_float32_pixels() -> None:
+    """Keep Gemma 4 ``pixel_values`` in float32 (opt-in).
+
+    vLLM casts every floating tensor an HF processor returns to the model
+    dtype (``InputProcessingContext._postprocess_output``).  Gemma 4 pixels
+    are ``k / 255``, most of which have no bfloat16 value, so a float32
+    vision tower (``VLLM_METAL_GEMMA4_VISION_FLOAT32``) would still see
+    rounded pixels.  With the flag, Gemma 4 ``pixel_values`` leave that step
+    as float32 and everything else is cast as before; without it nothing is
+    patched.
+    """
+    from vllm_metal import envs
+
+    if envs.VLLM_METAL_GEMMA4_VISION_FLOAT32:
+        _after_import(
+            "vllm.multimodal.processing.context", _apply_gemma4_float32_pixels_patch
+        )
+
+
 def _after_import(module_name: str, callback: Callable[[Any], None]) -> None:
     """Run ``callback(module)`` once ``module_name`` is imported."""
     import sys
@@ -1105,3 +1128,30 @@ def _apply_replay_tail_patch(module: Any) -> None:
 
     cls.reachable_block_mask = classmethod(reachable_block_mask)
     setattr(cls, _REPLAY_TAIL_PATCHED_ATTR, True)
+
+
+def _apply_gemma4_float32_pixels_patch(module: Any) -> None:
+    import torch
+
+    cls = module.InputProcessingContext
+    if getattr(cls, _GEMMA4_FLOAT32_PIXELS_PATCHED_ATTR, False):
+        return
+    original = cls._postprocess_output
+
+    def _postprocess_output(self: Any, output: Any) -> Any:
+        processed = original(self, output)
+        hf_config = getattr(self.model_config, "hf_config", None)
+        pixels = output.get("pixel_values") if isinstance(output, Mapping) else None
+        if (
+            getattr(hf_config, "model_type", None) == "gemma4"
+            and isinstance(pixels, torch.Tensor)
+            and pixels.is_floating_point()
+        ):
+            # vLLM's result keeps deciding the device; only the cast is undone.
+            processed["pixel_values"] = pixels.to(
+                device=processed["pixel_values"].device, dtype=torch.float32
+            )
+        return processed
+
+    cls._postprocess_output = _postprocess_output
+    setattr(cls, _GEMMA4_FLOAT32_PIXELS_PATCHED_ATTR, True)

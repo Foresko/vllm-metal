@@ -53,6 +53,7 @@ class _TextModel:
 class _Tower:
     def __init__(self) -> None:
         self.calls: list[tuple[mx.Dtype, tuple[int, ...], tuple[int, ...]]] = []
+        self.pixels: list[mx.array] = []
         self.pooling_kernel_size = 3
         self.patch_size = 16
         self.default_output_length = 280
@@ -64,6 +65,7 @@ class _Tower:
         self.calls.append(
             (pixel_values.dtype, pixel_values.shape, pixel_position_ids.shape)
         )
+        self.pixels.append(pixel_values)
         rows = pixel_values.shape[-2] // POOL
         return mx.ones((1, rows, TOWER_DIM), dtype=pixel_values.dtype)
 
@@ -199,6 +201,28 @@ class TestEncodeMultimodal:
         # rounded scale again, so this must restore 3.0 within 1 ulp bf16.
         restored = result.hidden_states.astype(mx.float32) * adapter.embed_scale_rounded
         assert mx.abs(restored - 3.0).max().item() <= 3.0 * 2**-7
+
+    def test_float32_tower_gets_exact_pixels_and_lm_gets_its_dtype(self) -> None:
+        # VLLM_METAL_GEMMA4_VISION_FLOAT32: float32 pixels (k / 255, mostly not
+        # bf16-representable) must reach the float32 tower unrounded, while
+        # the rows handed to the bf16 language model stay bf16.
+        tower = _Tower()
+        adapter = Gemma4MultimodalAdapter.from_loaded(
+            _TextModel(_Backbone()),
+            _sidecar(tower, pixel_dtype=mx.float32),
+            bidirectional_attention="vision",
+        )
+        feature = _feature(num_embeds=2)
+        assert feature.data is not None
+        pixels = torch.arange(2 * POOL * 768, dtype=torch.float32) % 256 / 255
+        feature.data["pixel_values"].data.copy_(pixels.reshape(2 * POOL, 768))
+
+        [result] = adapter.encode_multimodal([feature])
+
+        [seen] = tower.pixels
+        assert seen.dtype == mx.float32
+        assert mx.array_equal(seen, mx.array(pixels.reshape(2 * POOL, 768).numpy()))
+        assert result.hidden_states.dtype == mx.bfloat16
 
     def test_row_count_mismatch_raises(self) -> None:
         adapter, _ = _adapter()
