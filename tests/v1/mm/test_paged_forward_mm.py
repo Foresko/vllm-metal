@@ -374,6 +374,104 @@ class TestTextOnlyRoutingForExplicitPositionsAdapter:
         runner._target_forward.assert_called_once()
 
 
+class _SelectiveMmAdapter(_MmAdapter):
+    """Declares ``mm_path_selective_logits_ok``: ``call_lm`` takes
+    ``logits_indices`` and returns logits for those rows only."""
+
+    mm_path_selective_logits_ok = True
+
+    def call_lm(self, *args: Any, logits_indices: Any | None = None, **kwargs: Any):
+        output = super().call_lm(*args, **kwargs)
+        self.call_lm_calls[-1]["logits_indices"] = logits_indices
+        if logits_indices is None:
+            return output
+        return mx.zeros(
+            (1, int(logits_indices.shape[0]), self.vocab_size), dtype=mx.float32
+        )
+
+
+class TestMmSelectiveLogits:
+    """The mm forward drops the prefill rows the sampler never reads, as the
+    text path does, when the adapter can project selected rows."""
+
+    def _run(
+        self,
+        adapter: _MmAdapter,
+        *,
+        supported: bool = True,
+        prompt_logprobs: bool = False,
+    ):
+        adapter.requires_explicit_positions = True
+        runner = _runner(adapter)
+        runner._mm_selective_logits_supported = supported
+        if prompt_logprobs:
+            runner._prompt_logprobs_tracker.register("req-b", 1)
+        state = RequestState(
+            token_ids=[1, 2, 3, 4, 5, 6],
+            prompt_len=5,
+            sampling_params=SamplingParams(),
+            mrope_position_delta=None,
+        )
+        runner._request_states["req-a"] = state
+        segment = PagedDecodeSegment(
+            req_id="req-a",
+            input_token_ids=(6,),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=5,
+            block_ids=((0,),),
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=(segment,)
+        )
+        prefill = _mm_prefill(
+            "req-b", token_ids=[7, 8, 9, 10], prompt_len=4, full_prompt=[7, 8, 9, 10]
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[prefill],
+            decode_reqs=[("req-a", state)],
+            scheduler_output=_scheduler_output(),
+        )
+        return runner
+
+    def test_projects_decode_rows_and_each_prefill_last_row(self) -> None:
+        adapter = _SelectiveMmAdapter()
+        runner = self._run(adapter)
+
+        # Packed rows: [decode][prefill x4]; the sampler reads 0 and 4.
+        assert adapter.call_lm_calls[0]["logits_indices"].tolist() == [0, 4]
+        state = runner._execute_model_state
+        assert state.logits.shape == (1, 2, adapter.vocab_size)
+        assert state.logits_cu_seqlens == [0, 1, 2]
+        assert state.cu_seqlens == [0, 1, 5]
+
+    def test_unsupported_runner_projects_every_row(self) -> None:
+        adapter = _SelectiveMmAdapter()
+        runner = self._run(adapter, supported=False)
+
+        assert adapter.call_lm_calls[0]["logits_indices"] is None
+        assert runner._execute_model_state.logits_cu_seqlens == [0, 1, 5]
+
+    def test_prompt_logprobs_keep_every_row(self) -> None:
+        adapter = _SelectiveMmAdapter()
+        runner = self._run(adapter, prompt_logprobs=True)
+
+        assert adapter.call_lm_calls[0]["logits_indices"] is None
+        assert runner._execute_model_state.logits_cu_seqlens == [0, 1, 5]
+
+    def test_adapter_without_the_capability_never_gets_the_keyword(self) -> None:
+        # _MmAdapter.call_lm has no ``logits_indices`` parameter: passing it
+        # would raise TypeError.
+        adapter = _MmAdapter()
+        runner = self._run(adapter, supported=False)
+
+        assert len(adapter.call_lm_calls) == 1
+        assert runner._execute_model_state.logits_cu_seqlens == [0, 1, 5]
+
+
 class TestMmDecodeSegmentPositions:
     def test_decode_positions_use_cache_start_pos_plus_delta(self) -> None:
         adapter = _MmAdapter()

@@ -33,6 +33,14 @@ class PaddleOCRVLMultimodalAdapter:
     (arange from 0), so every batch — text-only included — must carry
     runner-built ``position_ids`` via the multimodal forward."""
 
+    mm_path_selective_logits_ok: bool = True
+    """``call_lm`` projects the head on the rows the sampler reads only.
+
+    Every batch runs the multimodal forward (see above), and the reader's
+    prefill chunks are image crops of up to thousands of tokens, each read
+    for its last row: the full projection over ERNIE's 103k-token vocab
+    was pure waste on every such row."""
+
     def __init__(
         self,
         *,
@@ -193,8 +201,14 @@ class PaddleOCRVLMultimodalAdapter:
         *,
         visual_pos_masks: Any | None = None,
         deepstack_visual_embeds: Any | None = None,
+        logits_indices: mx.array | None = None,
     ) -> Any:
-        """Invoke the PaddleOCR-VL language model with runner-built embeds."""
+        """Invoke the PaddleOCR-VL language model with runner-built embeds.
+
+        With ``logits_indices`` the head runs on those rows only.  The
+        backbone is called directly: with explicit ``position_ids`` the
+        model's own ``__call__`` does nothing but run it and the head.
+        """
         del visual_pos_masks
         if self._language_model is None:
             raise RuntimeError(
@@ -205,12 +219,21 @@ class PaddleOCRVLMultimodalAdapter:
             raise RuntimeError(
                 "PaddleOCR-VL does not expose deepstack visual residuals."
             )
-        return self._language_model(
+        if logits_indices is None:
+            return self._language_model(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                cache=cache,
+                position_ids=position_ids,
+            )
+        hidden_states = self._language_model.model(
             input_ids,
             inputs_embeds=inputs_embeds,
             cache=cache,
             position_ids=position_ids,
         )
+        selected = mx.take(hidden_states, logits_indices, axis=1)
+        return self._language_model.lm_head(selected)
 
     def _validate_image_features_and_collect_grids(
         self,

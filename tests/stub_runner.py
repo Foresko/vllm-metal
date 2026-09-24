@@ -163,6 +163,7 @@ def make_stub_runner(
         "_draft_token_ids": None,
         "_execute_model_state": None,
         "_selective_logits_supported": False,
+        "_mm_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,
         "_model_adapter": DefaultModelAdapter(),

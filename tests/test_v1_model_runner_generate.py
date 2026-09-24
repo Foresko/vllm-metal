@@ -2353,6 +2353,43 @@ class TestSelectiveLogitsLoRAGate:
         assert self._load(lora_enabled=False)._selective_logits_supported is True
 
 
+class TestMmSelectiveLogitsGate:
+    """The multimodal forward's row selection follows the adapter's flag,
+    under the same LoRA gate as the text path."""
+
+    def _load(self, adapter: object | None, *, lora_enabled: bool = False):
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+            metal_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
+            kv_cache_dtype=None,
+        )
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: None, install_decode_dispatch=lambda: None
+        )
+        runner._lora = SimpleNamespace(
+            enabled=lora_enabled, setup=lambda **kwargs: None
+        )
+        runner._model_adapter = SimpleNamespace(
+            supports_intermediate_forward=lambda model: False,
+            supports_selective_logits=lambda model: False,
+        )
+        runner._multimodal_adapter = adapter
+        runner.load_model()
+        return runner._mm_selective_logits_supported
+
+    def test_enabled_by_the_adapter_flag(self) -> None:
+        assert self._load(SimpleNamespace(mm_path_selective_logits_ok=True)) is True
+
+    def test_absent_flag_or_adapter_keeps_full_logits(self) -> None:
+        assert self._load(SimpleNamespace()) is False
+        assert self._load(None) is False
+
+    def test_disabled_when_lora_is_active(self) -> None:
+        adapter = SimpleNamespace(mm_path_selective_logits_ok=True)
+        assert self._load(adapter, lora_enabled=True) is False
+
+
 class _StageDummyRecorder:
     """Stands in for PipelinedModel: records the ids the dummy forward gets."""
 

@@ -194,6 +194,15 @@ class MultimodalRuntimeAdapter(Protocol):
     assumes False when the attribute is absent.
     """
 
+    mm_path_selective_logits_ok: bool
+    """Whether ``call_lm`` accepts ``logits_indices`` and projects the head
+    on those packed rows only.
+
+    The multimodal forward then drops every prefill row the sampler never
+    reads, as the text path does.  The runner assumes False when the
+    attribute is absent and never passes the keyword to such adapters.
+    """
+
     def text_model(self) -> Any:
         """Return the callable language model for text-only VLM execution."""
 
@@ -240,6 +249,10 @@ class MultimodalRuntimeAdapter(Protocol):
         only when the language model declares both as explicit parameters;
         adapters omit them otherwise to avoid silently dropping the arrays
         into a ``**kwargs`` catch-all.
+
+        Adapters declaring ``mm_path_selective_logits_ok`` also take a
+        ``logits_indices`` keyword: logits for those rows only, shape
+        ``(1, len(logits_indices), vocab)``.
         """
 
 

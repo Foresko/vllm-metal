@@ -312,8 +312,8 @@ def text_path_selective_logits_allowed(is_vlm: bool, adapter: Any | None) -> boo
     declares ``text_path_selective_logits_ok``: its text batches run the
     plain text path on the very object ``runner.model`` refers to, so the
     bit-exactness probe in ``supports_selective_logits`` applies.  The mm
-    forward never requests selected rows, so the flag affects text batches
-    only.
+    forward resolves its own capability (``mm_path_selective_logits_ok``),
+    so the flag affects text batches only.
     """
     if not is_vlm:
         return True
@@ -455,6 +455,8 @@ class MetalModelRunner:
         # Resolved in load_model by probing the output head; False until then so
         # a partially initialized runner keeps full logits.
         self._selective_logits_supported: bool = False
+        # The multimodal forward's counterpart, declared by the adapter.
+        self._mm_selective_logits_supported: bool = False
 
         # Pipeline-parallel group (set by the worker when pipeline_parallel_size
         # > 1). None means single-stage: the forward and sampling paths run
@@ -654,6 +656,13 @@ class MetalModelRunner:
             and not self._lora.enabled
             and self._model_adapter.supports_selective_logits(self._forward_model)
         )
+        self._mm_selective_logits_supported = (
+            self.pp is None
+            and not self._lora.enabled
+            and bool(
+                getattr(self._multimodal_adapter, "mm_path_selective_logits_ok", False)
+            )
+        )
         if self._is_pooling:
             self._model_lifecycle.install_pooling_backend()
 
@@ -774,6 +783,7 @@ class MetalModelRunner:
         cu_seqlens: list[int],
         *,
         num_decode_segments: int,
+        supported: bool | None = None,
     ) -> _PagedLogitsLayout:
         """Pick the rows the sampler reads, and the boundaries they land on.
 
@@ -786,14 +796,19 @@ class MetalModelRunner:
         or one whose prefill segments are all single-token — so those keep the
         model's own ``__call__``, pay no gather, and keep the packed
         boundaries.
+
+        ``supported`` defaults to the text path's capability; the multimodal
+        forward passes its own.
         """
+        if supported is None:
+            supported = self._selective_logits_supported
         decode_bounds = cu_seqlens[: num_decode_segments + 1]
         # Boundaries past the decode prefix are the prefill segment ends; the
         # row before each is the one prefill sampling reads.
         prefill_ends = cu_seqlens[num_decode_segments + 1 :]
         num_decode_rows = decode_bounds[-1]
         num_selected = num_decode_rows + len(prefill_ends)
-        if not self._selective_logits_supported or num_selected == cu_seqlens[-1]:
+        if not supported or num_selected == cu_seqlens[-1]:
             return _PagedLogitsLayout(None, cu_seqlens)
         return _PagedLogitsLayout(
             mx.array(
@@ -1242,11 +1257,23 @@ class MetalModelRunner:
                     offset_caches,
                 )
             elif use_mm_forward:
+                # Same row selection as the text path below, when the adapter
+                # can project the head on selected rows; prompt-logprobs steps
+                # need every prompt row.
+                if not self._prompt_logprobs_tracker.wants_any(
+                    pr.req_id for pr in prefill_reqs
+                ):
+                    logits_layout = self._paged_logits_layout(
+                        cu_seqlens,
+                        num_decode_segments=len(decode_segments),
+                        supported=self._mm_selective_logits_supported,
+                    )
                 model_output, mm_prefill_deltas = self._run_mm_paged_forward(
                     input_ids,
                     offset_caches,
                     prefill_reqs,
                     decode_segments,
+                    logits_indices=logits_layout.indices,
                 )
                 logits = self._extract_logits(model_output)
                 target_hidden_states = None
@@ -1942,6 +1969,8 @@ class MetalModelRunner:
         offset_caches: list[OffsetCache],
         prefill_reqs: list[PrefillRequest],
         decode_segments: tuple[PagedDecodeSegment, ...],
+        *,
+        logits_indices: mx.array | None = None,
     ) -> tuple[Any, dict[str, int]]:
         """Run paged forward through ``adapter.call_lm`` with packed splice.
 
@@ -1954,6 +1983,9 @@ class MetalModelRunner:
         encoder rows whose placeholders land in *this* chunk, and
         concatenates per-layer deepstack residual arrays across all mm
         prefill segments in packed order.
+
+        ``logits_indices`` (only for adapters declaring
+        ``mm_path_selective_logits_ok``) limits the head to those rows.
 
         Sets ``ctx.segment_positions`` so ``apply_packed_rope`` reads
         caller-supplied positions on mm segments and falls back to the
@@ -2183,6 +2215,7 @@ class MetalModelRunner:
             req_id: int(meta[1]) for req_id, meta in mm_request_meta.items()
         }
 
+        selection = {} if logits_indices is None else {"logits_indices": logits_indices}
         model_output = adapter.call_lm(
             input_ids,
             inputs_embeds,
@@ -2190,6 +2223,7 @@ class MetalModelRunner:
             position_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            **selection,
         )
         return model_output, mm_prefill_deltas
 

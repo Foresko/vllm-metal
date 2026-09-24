@@ -468,6 +468,72 @@ class TestPaddleOCRVLMultimodalAdapterCallLm:
             )
 
 
+class TestPaddleOCRVLMultimodalAdapterSelectedLogits:
+    """``logits_indices`` projects the head on those rows only, and the rows
+    match the full projection's."""
+
+    @staticmethod
+    def _tiny_language_model() -> Any:
+        try:
+            from mlx_vlm.models.paddleocr_vl.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
+            from mlx_vlm.models.paddleocr_vl.language import LanguageModel
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("mlx_vlm"):
+                pytest.skip("mlx-vlm is only installed on Darwin/arm64")
+            raise
+        except RuntimeError as exc:
+            if "No Metal device available" in str(exc):
+                pytest.skip("mlx-vlm import requires a Metal device")
+            raise
+
+        # head_dim 128 matches the default mrope_section [16, 24, 24]; the
+        # config's own defaults for head_dim and use_bias are tuples.
+        text_config = TextConfig(
+            hidden_size=256,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=96,
+            head_dim=128,
+            use_bias=False,
+            hidden_act="silu",
+        )
+        mx.random.seed(0)
+        language_model = LanguageModel(
+            text_config,
+            ModelConfig(text_config=text_config, vision_config=VisionConfig()),
+        )
+        mx.eval(language_model.parameters())
+        return language_model
+
+    def test_selected_rows_match_the_full_projection(self) -> None:
+        language_model = self._tiny_language_model()
+        adapter = _adapter(language_model=language_model)
+        seq_len = 7
+        input_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
+        inputs_embeds = adapter.embed_tokens(input_ids)
+        position_ids = mx.broadcast_to(
+            mx.arange(seq_len, dtype=mx.int32)[None, None, :], (3, 1, seq_len)
+        )
+        rows = mx.array([2, 6], dtype=mx.int32)
+
+        full = adapter.call_lm(input_ids, inputs_embeds, None, position_ids).logits
+        selected = adapter.call_lm(
+            input_ids, inputs_embeds, None, position_ids, logits_indices=rows
+        )
+
+        assert selected.shape == (1, 2, 96)
+        assert mx.allclose(selected, full[:, [2, 6]], atol=1e-5).item()
+
+    def test_adapter_declares_the_capability(self) -> None:
+        assert PaddleOCRVLMultimodalAdapter.mm_path_selective_logits_ok is True
+
+
 class TestPaddleOCRVLMultimodalAdapterFromLoadedModel:
     def test_from_loaded_model_resolves_components(self) -> None:
         language_model = _RecordingLanguageModel()
