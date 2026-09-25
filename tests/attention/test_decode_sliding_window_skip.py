@@ -44,7 +44,18 @@ def _cache(seed: int, *, seq_lens: list[int], kv_heads: int, hd: int):
     return key_cache, value_cache, table, rows
 
 
-def _kernel(query, key_cache, value_cache, table, *, kv_heads, kv_lens, cu_seqlens_q, window, **kwargs):
+def _kernel(
+    query,
+    key_cache,
+    value_cache,
+    table,
+    *,
+    kv_heads,
+    kv_lens,
+    cu_seqlens_q,
+    window,
+    **kwargs,
+):
     hd = int(query.shape[-1])
     out = mx.array(0)
     get_ops().paged_attention_primitive(
@@ -97,12 +108,36 @@ def test_partitioned_decode_with_window_matches_reference(window, seq_len) -> No
     """One token, few heads: the split-KV (partitioned) kernel.  Windows and
     lengths chosen so the window start lands mid-partition and mid-block."""
     heads, kv_heads, hd = 4, 2, 64
-    key_cache, value_cache, table, rows = _cache(1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd)
+    # The split-KV gate is invisible from Python: assert the inputs that make
+    # it take the partitioned kernel, so a gate change fails loudly here.
+    ops = get_ops()
+    assert heads < ops.min_decode_grid()
+    assert seq_len > ops.PARTITION_SIZE
+    key_cache, value_cache, table, rows = _cache(
+        1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
     mx.random.seed(2)
     query = mx.random.normal((1, heads, hd)).astype(DTYPE)
     mx.eval(query)
-    got = _kernel(query, key_cache, value_cache, table, kv_heads=kv_heads, kv_lens=[seq_len], cu_seqlens_q=[0, 1], window=window)
-    ref = _reference(query, key_cache, value_cache, rows[0], q_lo=seq_len - 1, seq_len=seq_len, window=window)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, 1],
+        window=window,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        rows[0],
+        q_lo=seq_len - 1,
+        seq_len=seq_len,
+        window=window,
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
@@ -111,16 +146,40 @@ def test_large_decode_batch_with_window_matches_reference() -> None:
     non-partitioned kernel runs; each sequence has its own context and window
     start."""
     heads, kv_heads, hd, window = 4, 2, 64, 200
-    seq_lens = [300 + 37 * i for i in range(128)]
-    key_cache, value_cache, table, rows = _cache(3, seq_lens=seq_lens, kv_heads=kv_heads, hd=hd)
+    # The gate is 8 threadgroups per GPU core: 128 sequences of 4 heads still
+    # take the split on a 65+ core GPU, so size the batch from the gate.
+    ops = get_ops()
+    num_seqs = max(128, -(-ops.min_decode_grid() // heads))  # ceil division
+    assert heads * num_seqs >= ops.min_decode_grid()
+    seq_lens = [300 + 37 * i for i in range(num_seqs)]
+    key_cache, value_cache, table, rows = _cache(
+        3, seq_lens=seq_lens, kv_heads=kv_heads, hd=hd
+    )
     mx.random.seed(4)
     query = mx.random.normal((len(seq_lens), heads, hd)).astype(DTYPE)
     mx.eval(query)
     got = np.array(
-        _kernel(query, key_cache, value_cache, table, kv_heads=kv_heads, kv_lens=seq_lens, cu_seqlens_q=list(range(len(seq_lens) + 1)), window=window)
+        _kernel(
+            query,
+            key_cache,
+            value_cache,
+            table,
+            kv_heads=kv_heads,
+            kv_lens=seq_lens,
+            cu_seqlens_q=list(range(len(seq_lens) + 1)),
+            window=window,
+        )
     )
     for i, n in enumerate(seq_lens):
-        ref = _reference(query[i : i + 1], key_cache, value_cache, rows[i], q_lo=n - 1, seq_len=n, window=window)
+        ref = _reference(
+            query[i : i + 1],
+            key_cache,
+            value_cache,
+            rows[i],
+            q_lo=n - 1,
+            seq_len=n,
+            window=window,
+        )
         np.testing.assert_allclose(got[i : i + 1], ref, atol=ATOL, rtol=RTOL)
 
 
@@ -129,15 +188,36 @@ def test_window_mode_rows_with_sliding_window_match_reference() -> None:
     rows' windows start at different keys and row 0's is the earliest."""
     heads, kv_heads, hd, window = 4, 2, 64, 96
     seq_len, q_len = 2048, 4
-    key_cache, value_cache, table, rows = _cache(5, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd)
+    # Partitioned window mode: the skipped partitions write one partial per row.
+    ops = get_ops()
+    assert heads * q_len < ops.min_decode_grid()
+    assert seq_len > ops.PARTITION_SIZE
+    key_cache, value_cache, table, rows = _cache(
+        5, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
     mx.random.seed(6)
     query = mx.random.normal((q_len, heads, hd)).astype(DTYPE)
     mx.eval(query)
-    try:
-        got = _kernel(query, key_cache, value_cache, table, kv_heads=kv_heads, kv_lens=[seq_len], cu_seqlens_q=[0, q_len], window=window, window_seqlen_q=q_len)
-    except TypeError as exc:  # keyword not exposed by this build
-        pytest.skip(f"window mode not exposed: {exc}")
-    ref = _reference(query, key_cache, value_cache, rows[0], q_lo=seq_len - q_len, seq_len=seq_len, window=window)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, q_len],
+        window=window,
+        window_seqlen_q=q_len,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        rows[0],
+        q_lo=seq_len - q_len,
+        seq_len=seq_len,
+        window=window,
+    )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
@@ -157,13 +237,19 @@ def test_windowed_decode_reads_a_fraction_of_the_context() -> None:
     a full-attention step reads.  The mask-only kernel ran the whole context
     and landed near 1.0x; require at least 4x."""
     heads, kv_heads, hd, seq_len = 16, 8, 256, 32768
-    key_cache, value_cache, table, _ = _cache(7, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd)
+    key_cache, value_cache, table, _ = _cache(
+        7, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
     mx.random.seed(8)
     query = mx.random.normal((1, heads, hd)).astype(DTYPE)
     mx.eval(query)
     common = {"kv_heads": kv_heads, "kv_lens": [seq_len], "cu_seqlens_q": [0, 1]}
-    full = _median_seconds(lambda: _kernel(query, key_cache, value_cache, table, window=None, **common))
-    windowed = _median_seconds(lambda: _kernel(query, key_cache, value_cache, table, window=1024, **common))
+    full = _median_seconds(
+        lambda: _kernel(query, key_cache, value_cache, table, window=None, **common)
+    )
+    windowed = _median_seconds(
+        lambda: _kernel(query, key_cache, value_cache, table, window=1024, **common)
+    )
     assert full / windowed >= 4.0, (
         f"windowed decode {windowed * 1e3:.2f} ms vs full {full * 1e3:.2f} ms: "
         "the block range is not bounded by the window"
