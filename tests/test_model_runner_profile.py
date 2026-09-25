@@ -15,8 +15,10 @@ from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 class _ProfilingAdapter:
     forward_ready = True
 
-    def __init__(self) -> None:
+    def __init__(self, deepstack: list[mx.array] | None = None) -> None:
         self.encode_calls: list[list[MultiModalFeatureSpec]] = []
+        self.hidden_states = mx.zeros((4, 8))
+        self.deepstack = deepstack
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:
         return [
@@ -30,7 +32,12 @@ class _ProfilingAdapter:
 
     def encode_multimodal(self, features: list[MultiModalFeatureSpec]) -> list[Any]:
         self.encode_calls.append(list(features))
-        return [SimpleNamespace(hidden_states=mx.zeros((4, 8)))]
+        return [
+            SimpleNamespace(
+                hidden_states=self.hidden_states,
+                deepstack_visual_embeds=self.deepstack,
+            )
+        ]
 
 
 class _PlainAdapter:
@@ -100,3 +107,14 @@ class TestProfileRunEncoder:
         runner.profile_run()
 
         assert adapter.encode_calls == []
+
+    def test_deepstack_residuals_are_profiled(self) -> None:
+        deepstack = [mx.ones((4, 8)), mx.ones((4, 8))]
+        adapter = _ProfilingAdapter(deepstack=deepstack)
+        runner = _runner(adapter)
+
+        outputs = runner._dummy_encoder_outputs()
+
+        expected = [adapter.hidden_states, *deepstack]
+        assert len(outputs) == len(expected)
+        assert all(out is exp for out, exp in zip(outputs, expected, strict=True))

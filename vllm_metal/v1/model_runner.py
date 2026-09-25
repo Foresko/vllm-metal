@@ -904,7 +904,14 @@ class MetalModelRunner:
         features = profile_features()
         if not features:
             return []
-        return [result.hidden_states for result in adapter.encode_multimodal(features)]
+        # Deepstack residuals are separate encoder outputs that the mm forward
+        # consumes, so they belong in the measured peak too.
+        outputs: list[mx.array] = []
+        for result in adapter.encode_multimodal(features):
+            outputs.append(result.hidden_states)
+            if result.deepstack_visual_embeds is not None:
+                outputs.extend(result.deepstack_visual_embeds)
+        return outputs
 
     def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
         if self._is_pooling:
