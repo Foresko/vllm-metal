@@ -8,8 +8,9 @@ that is 32x the KV traffic the layer needs, on 25 of 30 layers.  These tests
 pin the contract: results match the fp32 reference for the partitioned path
 (few query tokens), the non-partitioned path (a large decode batch), a
 window start inside a partition and inside a block, and the spec-decode
-window-mode rows; and a windowed decode step over a long context must be
-several times cheaper than full attention.
+window-mode rows; a zero window, whose block range can be empty, writes a
+zero output on both paths; and a windowed decode step over a long context
+must be several times cheaper than full attention.
 """
 
 from __future__ import annotations
@@ -219,6 +220,72 @@ def test_window_mode_rows_with_sliding_window_match_reference() -> None:
         window=window,
     )
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+
+
+def _zero_window_output(query, key_cache, value_cache, table, **common):
+    """Decode with sliding_window == 0, which masks every key: the neutral
+    result is a zero output.  A full-attention call of the same shape runs
+    first and is dropped, so MLX's buffer cache hands its non-zero buffers to
+    the windowed call and anything that call leaves unwritten reads as stale
+    data rather than zeros."""
+    stale = np.array(
+        _kernel(query, key_cache, value_cache, table, window=None, **common)
+    )
+    assert np.abs(stale).max() > 0
+    return np.array(_kernel(query, key_cache, value_cache, table, window=0, **common))
+
+
+@pytest.mark.parametrize("seq_len", [2048, 2050])
+def test_zero_window_partitioned_decode_writes_zeros(seq_len) -> None:
+    """On a block-aligned context every partition's block range is empty and
+    each must still write its neutral partial; the unaligned length runs one
+    fully masked block instead."""
+    heads, kv_heads, hd = 4, 2, 64
+    ops = get_ops()
+    assert heads < ops.min_decode_grid()
+    assert seq_len > ops.PARTITION_SIZE
+    key_cache, value_cache, table, _ = _cache(
+        9, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
+    mx.random.seed(10)
+    query = mx.random.normal((1, heads, hd)).astype(DTYPE)
+    mx.eval(query)
+    got = _zero_window_output(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, 1],
+    )
+    np.testing.assert_array_equal(got, 0)
+
+
+def test_zero_window_single_pass_decode_writes_zeros() -> None:
+    """The same boundary on the non-partitioned kernel: block-aligned
+    sequences have an empty block range, unaligned ones one masked block."""
+    heads, kv_heads, hd = 4, 2, 64
+    ops = get_ops()
+    num_seqs = max(128, -(-ops.min_decode_grid() // heads))  # ceil division
+    assert heads * num_seqs >= ops.min_decode_grid()
+    seq_lens = [BLOCK * (8 + i) + i % 2 for i in range(num_seqs)]
+    key_cache, value_cache, table, _ = _cache(
+        11, seq_lens=seq_lens, kv_heads=kv_heads, hd=hd
+    )
+    mx.random.seed(12)
+    query = mx.random.normal((num_seqs, heads, hd)).astype(DTYPE)
+    mx.eval(query)
+    got = _zero_window_output(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=seq_lens,
+        cu_seqlens_q=list(range(num_seqs + 1)),
+    )
+    np.testing.assert_array_equal(got, 0)
 
 
 def _median_seconds(fn, repeats: int = 5) -> float:

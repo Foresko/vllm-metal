@@ -904,6 +904,8 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   const int partition_idx = threadgroup_position_in_grid.z;
   const int max_num_partitions = threadgroups_per_grid.z;
   const int thread_idx = thread_position_in_threadgroup.x;
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int num_heads = threadgroups_per_grid.x;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   const uint32_t context_len = context_lens[seq_idx];  // total KV length for this seq
 
@@ -949,25 +951,24 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       MIN(partition_block_idx + num_blocks_per_partition, num_context_blocks);
   const int num_blocks = end_block_idx - start_block_idx;
 
-  if (USE_PARTITIONING && num_blocks <= 0) {
-    // Every key of this partition lies left of the window.  Write the same
-    // partial the masked loop produced for it (max 0, sum 0, zero output:
-    // the reduce gives it zero merge weight) and leave.
-    // num_heads / head_idx are declared further down; the same values.
-    const int nh = threadgroups_per_grid.x;
-    const int hi = threadgroup_position_in_grid.x;
+  if (num_blocks <= 0) {
+    // Every key in range lies left of the window: this partition's, or the
+    // whole context's when sliding_window == 0 and the context is
+    // block-aligned.  Write what the masked loop produces for such a range
+    // and leave: a zero output, plus max 0 and sum 0 when partitioned (the
+    // reduce gives such a partial zero merge weight).
     const int rows = WINDOW_MODE ? num_rows : 1;
     for (int r = 0; r < rows; r++) {
       const int out_row = q_token_idx + r;
-      if (thread_idx == 0 && use_partitioning) {
-        max_logits[out_row * nh * max_num_partitions +
-                   hi * max_num_partitions + partition_idx] = 0.f;
-        exp_sums[out_row * nh * max_num_partitions +
-                 hi * max_num_partitions + partition_idx] = 0.f;
+      if (USE_PARTITIONING && thread_idx == 0 && use_partitioning) {
+        max_logits[out_row * num_heads * max_num_partitions +
+                   head_idx * max_num_partitions + partition_idx] = 0.f;
+        exp_sums[out_row * num_heads * max_num_partitions +
+                 head_idx * max_num_partitions + partition_idx] = 0.f;
       }
       device T *out_ptr =
-          out + out_row * nh * max_num_partitions * HEAD_SIZE +
-          hi * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
+          out + out_row * num_heads * max_num_partitions * HEAD_SIZE +
+          head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
       for (int d = thread_idx; d < HEAD_SIZE; d += NUM_THREADS) {
         out_ptr[d] = T(0);
       }
@@ -992,8 +993,6 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   const int warp_idx = simd_tid;
   const int lane = simd_lid;
 
-  const int head_idx = threadgroup_position_in_grid.x;
-  const int num_heads = threadgroups_per_grid.x;
   const int num_queries_per_kv = num_heads / num_kv_heads;
   const int kv_head_idx = head_idx / num_queries_per_kv;
   const float alibi_slope = !use_alibi ? 0.f : alibi_slopes[head_idx];
