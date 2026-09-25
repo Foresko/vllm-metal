@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +34,33 @@ def apply_compat_patches() -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _patch_torch_mps_empty_host_cache()
     _patch_vllm_gemma4_mtp_config_loading()
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
     _patch_transformers_exaone4_config()
+
+
+def _patch_torch_mps_empty_host_cache() -> None:
+    """Avoid PyTorch's unsupported MPS host-cache cleanup during vLLM exit."""
+    import torch
+
+    original = getattr(torch.accelerator, "empty_host_cache", None)
+    if original is None or getattr(original, "_metal_mps_guard", False):
+        return
+
+    @wraps(original)
+    def empty_host_cache() -> None:
+        accelerator = torch.accelerator.current_accelerator()
+        # MLX owns model memory, and MPS has no pinned-host caching allocator.
+        # Calling PyTorch's native emptyHostCache on MPS can segfault.
+        if accelerator is not None and accelerator.type == "mps":
+            return
+        original()
+
+    empty_host_cache._metal_mps_guard = True  # type: ignore[attr-defined]
+    torch.accelerator.empty_host_cache = empty_host_cache
 
 
 def _apply_bytelevel_patch_during_registration() -> None:

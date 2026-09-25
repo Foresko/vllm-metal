@@ -18,6 +18,27 @@ from transformers.models.auto import configuration_auto
 import vllm_metal.compat as compat
 
 
+@pytest.mark.parametrize("device", ["mps", "cuda", None])
+def test_host_cache_cleanup_only_skips_mps(monkeypatch, device) -> None:
+    import torch
+
+    calls = []
+    monkeypatch.setattr(
+        torch.accelerator, "empty_host_cache", lambda: calls.append(True)
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: None if device is None else torch.device(device),
+    )
+    compat._patch_torch_mps_empty_host_cache()
+    first = torch.accelerator.empty_host_cache
+    compat._patch_torch_mps_empty_host_cache()
+    assert torch.accelerator.empty_host_cache is first
+    first()
+    assert calls == ([] if device == "mps" else [True])
+
+
 def _write_bytelevel_tokenizer_json(path) -> None:
     from tokenizers import Tokenizer
     from tokenizers.decoders import ByteLevel
