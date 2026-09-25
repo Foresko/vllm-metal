@@ -95,6 +95,22 @@ class TestTensorConversion:
         gc.collect()
         assert (mlx_array + 1).tolist() == [[4.0] * 3] * 2
 
+    def test_torch_to_mlx_copy_owns_its_storage(self) -> None:
+        """A copied import neither sees nor makes writes to the source."""
+        source = torch.linspace(0, 1, 8, dtype=torch.bfloat16)
+        original = source.clone()
+
+        array = torch_to_mlx(source, copy=True)
+        source.fill_(3)
+        assert array.tolist() == original.float().tolist()
+
+        # MLX may hand an input buffer to an op's output once the graph holds
+        # the last reference to it; a copy's buffer belongs to MLX alone.
+        source.copy_(original)
+        normalized = 2 * (torch_to_mlx(source, copy=True) - 0.5)
+        mx.eval(normalized)
+        assert torch.equal(source, original)
+
     def test_torch_to_mlx_int32(self) -> None:
         """Test PyTorch to MLX conversion for int32."""
         torch_tensor = torch.randint(0, 100, (2, 3), dtype=torch.int32)

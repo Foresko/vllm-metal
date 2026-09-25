@@ -412,6 +412,84 @@ class TestQwen3VLMultimodalAdapterEncodeMultimodal:
         assert feature.identifier in str(exc_info.value)
 
 
+_TINY_PATCH_SIZE = 4
+
+
+def _cached_image_feature(pixel_dtype: torch.dtype) -> MultiModalFeatureSpec:
+    """One image as vLLM's multimodal cache holds it (Qwen2-VL field layout)."""
+    grid = torch.tensor([_IMAGE_GRID_THW_2X2])
+    pixels = torch.rand(
+        (int(grid.prod()), 3 * 2 * _TINY_PATCH_SIZE**2),
+        generator=torch.Generator().manual_seed(0),
+    )
+    pixel_field = MultiModalFieldConfig.flat_from_sizes("image", grid.prod(-1))
+    grid_field = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+    item = MultiModalKwargsItem(
+        {
+            "pixel_values": pixel_field.build_elems(
+                "pixel_values", pixels.to(pixel_dtype)
+            )[0],
+            "image_grid_thw": grid_field.build_elems("image_grid_thw", grid)[0],
+        }
+    )
+    return MultiModalFeatureSpec(
+        data=item,
+        modality="image",
+        identifier="image-cached",
+        mm_position=PlaceholderRange(offset=0, length=_IMAGE_TOKEN_COUNT_2X2),
+    )
+
+
+class TestEncodeLeavesCachedInputsIntact:
+    @pytest.mark.parametrize(
+        "pixel_dtype",
+        # vLLM delivers pixels in the model dtype: bf16 under --dtype auto,
+        # fp16 under --dtype float16, while the tower keeps its bf16 weights.
+        [torch.bfloat16, torch.float16],
+        ids=["dtype-auto", "dtype-float16"],
+    )
+    def test_reencoding_a_cached_item_gives_the_same_rows(
+        self, pixel_dtype: torch.dtype
+    ) -> None:
+        # vLLM hands the same item to every later request with this image,
+        # and a request re-encodes it once the encoder cache has evicted the
+        # output.  Casting fp16 pixels for the bf16 tower keeps the item size,
+        # so MLX may run the cast in place of a donated input buffer.
+        from mlx_vlm.models.qwen3_vl.config import VisionConfig
+        from mlx_vlm.models.qwen3_vl.vision import VisionModel
+
+        tower = VisionModel(
+            VisionConfig(
+                depth=1,
+                hidden_size=16,
+                intermediate_size=32,
+                out_hidden_size=16,
+                num_heads=2,
+                patch_size=_TINY_PATCH_SIZE,
+                num_position_embeddings=16,
+                deepstack_visual_indexes=[0],
+            )
+        )
+        tower.set_dtype(mx.bfloat16)  # mlx-community towers ship bf16 weights
+        adapter = Qwen3VLMultimodalAdapter(
+            spatial_merge_size=_SPATIAL_MERGE_SIZE, vision_tower=tower
+        )
+        feature = _cached_image_feature(pixel_dtype)
+        assert feature.data is not None
+        pixels = feature.data["pixel_values"].data
+        grid = feature.data["image_grid_thw"].data
+        original_pixels, original_grid = pixels.clone(), grid.clone()
+
+        [first] = adapter.encode_multimodal([feature])
+        mx.eval(first.hidden_states, first.deepstack_visual_embeds)
+        [second] = adapter.encode_multimodal([feature])
+        mx.eval(second.hidden_states, second.deepstack_visual_embeds)
+
+        assert torch.equal(pixels, original_pixels)
+        assert torch.equal(grid, original_grid)
+        assert mx.array_equal(first.hidden_states, second.hidden_states).item()
+
+
 class _RecordingLanguageModel:
     """Captures call kwargs for ``call_lm`` assertions.
 
