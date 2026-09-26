@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import mlx.core as mx
 from vllm.logger import init_logger
@@ -17,6 +19,109 @@ if TYPE_CHECKING:
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
 logger = init_logger(__name__)
+
+BackboneMode = Literal["native", "text_sidecar", "text_only"]
+"""How a multimodal checkpoint is served.
+
+- ``native``: the mlx-vlm composite runs both towers (Qwen3-VL family).
+- ``text_sidecar``: the mlx_lm text model serves text, a
+  :class:`Gemma4VisionSidecar` serves images (Gemma 4).
+- ``text_only``: ``multimodal_config`` is cleared and images are refused.
+"""
+
+_GEMMA4_MODEL_TYPE = "gemma4"
+_backbone_mode_cache: dict[tuple[Any, ...], BackboneMode] = {}
+
+
+def reset_backbone_mode_cache() -> None:
+    """Forget cached mode decisions (tests)."""
+    _backbone_mode_cache.clear()
+
+
+def _probe_processor(model_config: Any) -> None:
+    """Build the HF processor the way vLLM will; raises when it cannot."""
+    from vllm.transformers_utils.processor import cached_processor_from_config
+
+    cached_processor_from_config(model_config)
+
+
+def _resolve_cached_snapshot(model_config: Any) -> Path | None:
+    """Resolve a fully cached Hugging Face snapshot for a repo id, offline.
+
+    Returns ``None`` on a cache miss, while offline, or when ``model_config.model``
+    is not a Hugging Face repo id at all -- any exception from
+    ``huggingface_hub`` falls back rather than propagating, since this is only
+    a best-effort activation check for the sidecar.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        resolved = Path(
+            snapshot_download(
+                model_config.model,
+                revision=getattr(model_config, "revision", None),
+                local_files_only=True,
+            )
+        )
+    except Exception:  # cache miss, offline, or not a repo id: fall back
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _local_checkpoint_dir(model_config: Any) -> Path | None:
+    from vllm_metal.utils import get_model_download_path
+
+    path = Path(
+        get_model_download_path(
+            model_config.model, revision=getattr(model_config, "revision", None)
+        )
+    )
+    if path.is_dir():
+        return path
+    return _resolve_cached_snapshot(model_config)
+
+
+def _has_vision_weights(model_path: Path) -> bool:
+    from vllm_metal.multimodal.gemma4.sidecar import has_vision_weights
+
+    return has_vision_weights(model_path)
+
+
+def _gemma4_text_only_reason(model_config: Any, speculative_config: Any) -> str | None:
+    """Why a Gemma 4 checkpoint must stay text-only, or ``None`` for the sidecar."""
+    hf_config = getattr(model_config, "hf_config", None)
+    if speculative_config is not None:
+        return "speculative decoding is configured; vision needs a plain decode path"
+    if getattr(model_config, "quantization", None) == "gguf":
+        return "vision needs a safetensors checkpoint (GGUF)"
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    quant_method = (
+        quantization_config.get("quant_method")
+        if isinstance(quantization_config, dict)
+        else getattr(quantization_config, "quant_method", None)
+    )
+    if quant_method == "awq":
+        return "vision needs a safetensors checkpoint (AWQ)"
+    checkpoint = _local_checkpoint_dir(model_config)
+    if checkpoint is None:
+        return (
+            "vision needs a local checkpoint directory or a fully cached "
+            f"Hugging Face repo, got {model_config.model!r}"
+        )
+    try:
+        has_vision = _has_vision_weights(checkpoint)
+    except Exception as exc:
+        return f"could not inspect the checkpoint for vision weights: {exc}"
+    if not has_vision:
+        return "no vision weights in the checkpoint"
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0:
+        return "per-layer inputs are unsupported on the sidecar path"
+    try:
+        _probe_processor(model_config)
+    except Exception as exc:
+        return f"HF processor failed to build: {exc}"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +244,22 @@ class ModelAdapter(Protocol):
     def should_force_text_backbone(self, hf_config: Any) -> bool:
         """Whether a multimodal config should run on the text-only path."""
 
-    def normalize_model_config(self, model_config: ModelConfig) -> None:
+    def multimodal_backbone_mode(
+        self, model_config: ModelConfig, *, speculative_config: Any | None = None
+    ) -> BackboneMode:
+        """Decide how a multimodal checkpoint is served (see ``BackboneMode``)."""
+
+    def sidecar_checkpoint_dir(self, model_config: ModelConfig) -> Path | None:
+        """Local checkpoint directory the ``text_sidecar`` mode loads from.
+
+        The directory ``multimodal_backbone_mode`` accepted: a local path, or
+        the snapshot of a fully cached Hugging Face repo.  ``None`` when it no
+        longer resolves.
+        """
+
+    def normalize_model_config(
+        self, model_config: ModelConfig, *, speculative_config: Any | None = None
+    ) -> None:
         """Apply model-specific normalisations to ``model_config`` in place.
 
         Called early during platform setup so the engine sees a consistent
@@ -205,9 +325,13 @@ class ModelAdapter(Protocol):
         """
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any
+        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
     ) -> MultimodalRuntimeAdapter | None:
-        """Return a model-owned multimodal adapter for native VLM execution."""
+        """Return a model-owned multimodal adapter for native VLM execution.
+
+        ``sidecar`` is the loaded :class:`Gemma4VisionSidecar` on the
+        ``text_sidecar`` path and ``None`` otherwise.
+        """
 
     def build_yoco_cache_mapping(
         self, args: dict[str, Any]
@@ -341,31 +465,108 @@ class DefaultModelAdapter(ModelAdapter):
             return False
         return self._matches_auto_text_backbone_override(hf_config)
 
-    def normalize_model_config(self, model_config: ModelConfig) -> None:
-        """Clear ``multimodal_config`` for models served on the text backbone.
+    def multimodal_backbone_mode(
+        self, model_config: ModelConfig, *, speculative_config: Any | None = None
+    ) -> BackboneMode:
+        hf_config = getattr(model_config, "hf_config", None)
+        mode_env = self._multimodal_mode()
+        if mode_env == "text-only":
+            return "text_only"
+        if mode_env == "multimodal-native":
+            return "native"
+        if getattr(hf_config, "model_type", None) != _GEMMA4_MODEL_TYPE:
+            return (
+                "text_only" if self.should_force_text_backbone(hf_config) else "native"
+            )
 
-        When the active serve mode routes a multimodal checkpoint through the
-        text-only compatibility path, leaving ``multimodal_config`` populated
-        causes vLLM to eagerly initialize multimodal processors that the
-        compatibility path intentionally bypasses. Clearing it here makes
+        key = (
+            str(getattr(model_config, "model", "")),
+            getattr(model_config, "revision", None),
+            bool(getattr(model_config, "trust_remote_code", False)),
+            json.dumps(
+                getattr(model_config, "mm_processor_kwargs", None),
+                sort_keys=True,
+                default=str,
+            ),
+            speculative_config is not None,
+            mode_env,
+        )
+        cached = _backbone_mode_cache.get(key)
+        if cached is not None:
+            return cached
+        reason = _gemma4_text_only_reason(model_config, speculative_config)
+        mode: BackboneMode
+        if reason is None:
+            mode = "text_sidecar"
+        else:
+            logger.warning(
+                "Metal: Gemma 4 vision disabled, serving text-only: %s", reason
+            )
+            mode = "text_only"
+        _backbone_mode_cache[key] = mode
+        return mode
+
+    def sidecar_checkpoint_dir(self, model_config: ModelConfig) -> Path | None:
+        return _local_checkpoint_dir(model_config)
+
+    def normalize_model_config(
+        self, model_config: ModelConfig, *, speculative_config: Any | None = None
+    ) -> None:
+        """Apply the checkpoint's backbone mode to ``model_config`` in place.
+
+        When the resolved mode is ``text_only``, leaving ``multimodal_config``
+        populated causes vLLM to eagerly initialize multimodal processors
+        that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
-        setup. The ``should_force_text_backbone`` predicate is the single
-        source of truth for whether the compatibility path applies.
+        setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
+        kept but restricted to images only, so the frontend rejects video
+        and audio inputs the sidecar cannot serve. ``native`` leaves the
+        config untouched. :meth:`multimodal_backbone_mode` is the single
+        source of truth for which mode applies.
         """
         if model_config.multimodal_config is None:
             return
         hf_config = getattr(model_config, "hf_config", None)
-        if not self.should_force_text_backbone(hf_config):
-            return
-
-        multimodal_mode = self._multimodal_mode()
-        model_config.multimodal_config = None
-        logger.info(
-            "Metal: forcing text-only backbone for model_type=%s "
-            "(multimodal_mode=%s, cleared multimodal_config)",
-            getattr(hf_config, "model_type", "unknown"),
-            multimodal_mode,
+        mode = self.multimodal_backbone_mode(
+            model_config, speculative_config=speculative_config
         )
+        if mode == "text_only":
+            multimodal_mode = self._multimodal_mode()
+            model_config.multimodal_config = None
+            logger.info(
+                "Metal: forcing text-only backbone for model_type=%s "
+                "(multimodal_mode=%s, cleared multimodal_config)",
+                getattr(hf_config, "model_type", "unknown"),
+                multimodal_mode,
+            )
+            return
+        if mode == "text_sidecar":
+            self._restrict_to_images(model_config.multimodal_config)
+            logger.info(
+                "Metal: Gemma 4 serves images through the vision sidecar on the "
+                "mlx_lm text backbone; video and audio inputs are refused"
+            )
+
+    @staticmethod
+    def _restrict_to_images(multimodal_config: Any) -> None:
+        """Set video/audio limits to 0 so the frontend rejects them (idempotent)."""
+        from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
+
+        limits = multimodal_config.limit_per_prompt
+        for modality, options_cls in (
+            ("video", VideoDummyOptions),
+            ("audio", AudioDummyOptions),
+        ):
+            current = limits.get(modality)
+            if current is not None and int(getattr(current, "count", 0)) > 0:
+                logger.warning(
+                    "Metal: %s inputs are unsupported on the Gemma 4 sidecar path; "
+                    "overriding --limit-mm-per-prompt %s=%s with 0",
+                    modality,
+                    modality,
+                    current.count,
+                )
+            limits[modality] = options_cls(count=0)
 
     def resolve_max_head_dim(
         self, args: dict[str, Any], head_dim: int | None
@@ -636,9 +837,16 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         return apply_pipeline_split(self.text_model(model), pp)
 
     def build_multimodal_adapter(
-        self, model: Any, hf_config: Any
+        self, model: Any, hf_config: Any, *, sidecar: Any | None = None
     ) -> MultimodalRuntimeAdapter | None:
         """Build the native multimodal adapter for supported model families."""
+        if sidecar is not None:
+            from vllm_metal.multimodal.gemma4 import Gemma4MultimodalAdapter
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                Gemma4MultimodalAdapter.from_loaded(model, sidecar),
+            )
         if hf_config is None:
             return None
 

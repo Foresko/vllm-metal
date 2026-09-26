@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for model adapter behavior."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 from mlx_lm.models import cohere2, gemma3_text
 from mlx_lm.models.cache import KVCache, RotatingKVCache
+from vllm.config.multimodal import (
+    AudioDummyOptions,
+    ImageDummyOptions,
+    VideoDummyOptions,
+)
 
 import vllm_metal.envs as envs
+import vllm_metal.v1.model_adapter as model_adapter_module
 from vllm_metal.config import reset_config
 from vllm_metal.multimodal.paddleocr_vl import PaddleOCRVLMultimodalAdapter
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
@@ -552,10 +559,10 @@ class TestNormalizeModelConfig:
     """Tests for normalize_model_config()."""
 
     def test_clears_multimodal_config_for_gemma4(self) -> None:
-        model_config = SimpleNamespace(
-            multimodal_config=SimpleNamespace(language_model_only=False),
-            hf_config=SimpleNamespace(model_type="gemma4"),
-        )
+        """A gemma4 checkpoint whose ``model`` is not a local path fails the
+        sidecar's local-checkpoint-directory check, so normalize falls back
+        to clearing ``multimodal_config`` same as any other text-only model."""
+        model_config = _gemma4_model_config(Path("/nonexistent"))
 
         DefaultModelAdapter().normalize_model_config(model_config)
 
@@ -1241,3 +1248,292 @@ class TestBuildSlidingWindowPerLayer:
         )
 
         assert result == [1024, -1, 1024, -1]
+
+
+def _gemma4_model_config(
+    tmp_path: Path,
+    *,
+    per_layer_inputs: int = 0,
+    quantization: str | None = None,
+    quantization_config: dict | None = None,
+    model: str | None = None,
+    limit_per_prompt: dict | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=str(tmp_path) if model is None else model,
+        revision=None,
+        trust_remote_code=False,
+        mm_processor_kwargs=None,
+        quantization=quantization,
+        multimodal_config=SimpleNamespace(
+            language_model_only=False,
+            limit_per_prompt={} if limit_per_prompt is None else limit_per_prompt,
+        ),
+        hf_config=SimpleNamespace(
+            model_type="gemma4",
+            architectures=["Gemma4ForConditionalGeneration"],
+            quantization_config=quantization_config,
+            text_config=SimpleNamespace(hidden_size_per_layer_input=per_layer_inputs),
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_mode_cache():
+    model_adapter_module.reset_backbone_mode_cache()
+    yield
+    model_adapter_module.reset_backbone_mode_cache()
+
+
+@pytest.fixture
+def _sidecar_ready(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
+    monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
+
+
+class TestMultimodalBackboneMode:
+    def test_gemma4_with_everything_present_is_text_sidecar(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        mode = DefaultModelAdapter().multimodal_backbone_mode(
+            _gemma4_model_config(tmp_path)
+        )
+        assert mode == "text_sidecar"
+
+    def test_text_only_env_forces_text_only(
+        self, tmp_path: Path, _sidecar_ready, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only")
+        reset_config()
+        assert (
+            DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+            == "text_only"
+        )
+
+    def test_native_env_keeps_native(
+        self, tmp_path: Path, _sidecar_ready, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+        assert (
+            DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+            == "native"
+        )
+
+    def test_text_only_env_forces_non_gemma4_models_text_only(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "text-only")
+        reset_config()
+        sentinel = SimpleNamespace(language_model_only=False, limit_per_prompt={})
+        config = SimpleNamespace(
+            model="mlx-community/Qwen3-VL-4B-Instruct-4bit",
+            revision=None,
+            trust_remote_code=False,
+            mm_processor_kwargs=None,
+            quantization=None,
+            multimodal_config=sentinel,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_vl",
+                architectures=["Qwen3VLForConditionalGeneration"],
+                quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            ),
+        )
+
+        assert DefaultModelAdapter().multimodal_backbone_mode(config) == "text_only"
+        DefaultModelAdapter().normalize_model_config(config)
+        assert config.multimodal_config is None
+
+    @pytest.mark.parametrize(
+        ("kwargs", "speculative", "reason"),
+        [
+            ({}, object(), "speculative decoding"),
+            ({"quantization": "gguf"}, None, "safetensors"),
+            ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
+            ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
+            ({"per_layer_inputs": 256}, None, "per-layer inputs"),
+        ],
+    )
+    def test_fallback_reasons(
+        self, tmp_path: Path, _sidecar_ready, caplog, kwargs, speculative, reason
+    ) -> None:
+        config = _gemma4_model_config(tmp_path, **kwargs)
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(
+                config, speculative_config=speculative
+            )
+        assert mode == "text_only"
+        assert reason in caplog.text
+
+    def test_missing_vision_weights_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(
+            model_adapter_module, "_has_vision_weights", lambda _: False
+        )
+        monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+        assert mode == "text_only"
+        assert "no vision weights" in caplog.text
+
+    def test_vision_weight_probe_failure_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        def _boom(_path: Path) -> bool:
+            raise ValueError("bad index")
+
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", _boom)
+        monkeypatch.setattr(model_adapter_module, "_probe_processor", lambda _: None)
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+        assert mode == "text_only"
+        assert "could not inspect the checkpoint for vision weights: bad index" in (
+            caplog.text
+        )
+
+    def test_processor_failure_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
+
+        def _boom(_):
+            raise OSError("Can't load video processor")
+
+        monkeypatch.setattr(model_adapter_module, "_probe_processor", _boom)
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path)
+            )
+        assert mode == "text_only"
+        assert "Can't load video processor" in caplog.text
+
+    def test_result_is_cached_per_key(self, tmp_path: Path, monkeypatch) -> None:
+        calls: list[int] = []
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
+        monkeypatch.setattr(
+            model_adapter_module, "_probe_processor", lambda _: calls.append(1)
+        )
+        adapter = DefaultModelAdapter()
+        assert (
+            adapter.multimodal_backbone_mode(_gemma4_model_config(tmp_path))
+            == "text_sidecar"
+        )
+        assert (
+            adapter.multimodal_backbone_mode(_gemma4_model_config(tmp_path))
+            == "text_sidecar"
+        )
+        assert len(calls) == 1
+        # A drafter changes the key, so the mode is recomputed.
+        assert (
+            adapter.multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path), speculative_config=object()
+            )
+            == "text_only"
+        )
+
+    def test_non_gemma4_follows_should_force_text_backbone(self) -> None:
+        config = SimpleNamespace(
+            model="x",
+            revision=None,
+            trust_remote_code=False,
+            mm_processor_kwargs=None,
+            quantization=None,
+            multimodal_config=SimpleNamespace(
+                language_model_only=False, limit_per_prompt={}
+            ),
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                quantization_config={"quant_method": "fp8"},
+            ),
+        )
+        assert DefaultModelAdapter().multimodal_backbone_mode(config) == "text_only"
+
+    def test_should_force_text_backbone_still_true_for_gemma4(self) -> None:
+        assert (
+            DefaultModelAdapter().should_force_text_backbone(
+                SimpleNamespace(model_type="gemma4")
+            )
+            is True
+        )
+
+    def test_repo_id_activates_sidecar_via_cached_snapshot(
+        self, tmp_path: Path, _sidecar_ready, monkeypatch
+    ) -> None:
+        # A Hugging Face repo id is not a local directory, so
+        # `get_model_download_path` returns it unchanged; the mode must still
+        # resolve to text_sidecar when a fully cached snapshot exists.
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda _: tmp_path
+        )
+        config = _gemma4_model_config(tmp_path, model="mlx-community/gemma-4-repo")
+
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+
+        assert mode == "text_sidecar"
+
+    def test_repo_id_without_a_cached_snapshot_falls_back(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda _: None
+        )
+        config = _gemma4_model_config(tmp_path, model="mlx-community/not-cached")
+
+        with caplog.at_level("WARNING"):
+            mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+
+        assert mode == "text_only"
+        assert "fully cached Hugging Face repo" in caplog.text
+
+
+class TestNormalizeModelConfigSidecar:
+    def test_text_sidecar_keeps_config_and_restricts_modalities(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(
+            tmp_path, limit_per_prompt={"image": ImageDummyOptions(count=4)}
+        )
+        sentinel = config.multimodal_config
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        assert config.multimodal_config is sentinel
+        limits = config.multimodal_config.limit_per_prompt
+        assert limits["image"].count == 4
+        assert (
+            isinstance(limits["video"], VideoDummyOptions)
+            and limits["video"].count == 0
+        )
+        assert (
+            isinstance(limits["audio"], AudioDummyOptions)
+            and limits["audio"].count == 0
+        )
+
+    def test_restriction_is_idempotent_and_warns_on_override(
+        self, tmp_path: Path, _sidecar_ready, caplog
+    ) -> None:
+        config = _gemma4_model_config(
+            tmp_path, limit_per_prompt={"video": VideoDummyOptions(count=2)}
+        )
+        with caplog.at_level("WARNING"):
+            DefaultModelAdapter().normalize_model_config(config)
+            DefaultModelAdapter().normalize_model_config(config)
+        assert config.multimodal_config.limit_per_prompt["video"].count == 0
+        assert caplog.text.count("overriding") == 1
+
+    def test_text_only_clears_config(self, tmp_path: Path, _sidecar_ready) -> None:
+        config = _gemma4_model_config(tmp_path)
+        DefaultModelAdapter().normalize_model_config(
+            config, speculative_config=object()
+        )
+        assert config.multimodal_config is None

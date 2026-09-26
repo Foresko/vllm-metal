@@ -322,6 +322,51 @@ class TestIsEmbedSplice:
         assert mx.allclose(embeds[0, 1], zeros).item()  # boi keeps its text embedding
         assert mx.allclose(embeds[0, 4], zeros).item()  # eoi keeps its text embedding
 
+    def test_two_is_embed_features_in_one_chunk_splice_independently(self) -> None:
+        adapter = _MmAdapter()
+        runner = _runner(adapter)
+        # text, boi, img, img, eoi, boi, img, img, eoi, text
+        tokens = [10, 5, 99, 99, 6, 5, 99, 99, 6, 11]
+        runner.encoder_cache.add_request(
+            "req-0",
+            [
+                _boi_eoi_feature("img-0", offset=1, num_embeds=2),
+                _boi_eoi_feature("img-1", offset=5, num_embeds=2),
+            ],
+        )
+        _put_encode(
+            runner, "img-0", hidden_states=mx.full((2, adapter.hidden_size), 1.0)
+        )
+        _put_encode(
+            runner, "img-1", hidden_states=mx.full((2, adapter.hidden_size), 2.0)
+        )
+        runner._spec_decode_controller.build_decode_segments = MagicMock(
+            return_value=()
+        )
+
+        runner._start_paged_forward(
+            batch=MagicMock(),
+            prefill_reqs=[
+                _mm_prefill(
+                    "req-0", token_ids=tokens, prompt_len=10, full_prompt=tokens
+                )
+            ],
+            decode_reqs=[],
+            scheduler_output=_scheduler_output(),
+        )
+
+        call = adapter.call_lm_calls[0]
+        assert call["visual_pos_masks"].tolist() == [
+            [False, False, True, True, False, False, True, True, False, False]
+        ]
+        embeds = call["inputs_embeds"]
+        ones = mx.full((adapter.hidden_size,), 1.0, dtype=mx.float32)
+        twos = mx.full((adapter.hidden_size,), 2.0, dtype=mx.float32)
+        assert mx.allclose(embeds[0, 2], ones).item()
+        assert mx.allclose(embeds[0, 3], ones).item()
+        assert mx.allclose(embeds[0, 6], twos).item()
+        assert mx.allclose(embeds[0, 7], twos).item()
+
     def test_chunk_with_only_boi_skips_the_feature(self) -> None:
         adapter = _MmAdapter()
         runner = _runner(adapter)

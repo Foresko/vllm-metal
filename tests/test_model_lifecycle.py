@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import mlx.core as mx
+import mlx.nn as nn
 import pytest
 import torch
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
@@ -22,10 +24,13 @@ from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_stub_runner
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.config import reset_config
 from vllm_metal.distributed.pipeline import PipelineGroup
+from vllm_metal.multimodal.gemma4 import Gemma4MultimodalAdapter, Gemma4VisionSidecar
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.v1 import model_adapter as model_adapter_module
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
+from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_lifecycle import GenerationLoadRequest, ModelLifecycle
 
 _TEXT_MODEL_ARGS = {
@@ -1505,3 +1510,278 @@ class TestResolveModelDims:
         assert runner.head_dim == 512
         assert runner.kv_heads_per_layer == [1, 1, 1, 1]
         assert runner.head_dim_per_layer == [256, 512, 256, 512]
+
+
+class _Gemma4Backbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, 8)
+        self.embed_scale = 8**0.5
+
+
+class _Gemma4TextModel:
+    """Shape of the mlx_lm ``gemma4.Model`` wrapper."""
+
+    def __init__(self) -> None:
+        # hidden_size/num_attention_heads/num_hidden_layers/num_key_value_heads
+        # are the minimum resolve_model_dims() needs to compute a head_dim:
+        # with only hidden_size present, num_layers/num_kv_heads/head_dim all
+        # come back None and _install_runner_attention_dims raises before
+        # load() reaches any of this test's own assertions.
+        self.args = {
+            "model_type": "gemma4",
+            "vocab_size": 16,
+            "text_config": {
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+            },
+        }
+        self.language_model = SimpleNamespace(model=_Gemma4Backbone())
+
+    def __call__(self, inputs, cache=None, input_embeddings=None):
+        return SimpleNamespace(logits=mx.zeros((1, inputs.shape[1], 16)))
+
+
+def _fake_sidecar() -> Gemma4VisionSidecar:
+    return Gemma4VisionSidecar(
+        vision_tower=object(),
+        embed_vision=object(),
+        pixel_dtype=mx.bfloat16,
+        num_parameters=1,
+        num_bytes=2,
+    )
+
+
+def _gemma4_runner_config(
+    *,
+    multimodal_config: object | None = None,
+    is_multimodal_model: bool = True,
+) -> object:
+    return _runner_model_config(
+        hf_config=SimpleNamespace(
+            model_type="gemma4",
+            architectures=["Gemma4ForConditionalGeneration"],
+            text_config=SimpleNamespace(model_type="gemma4_text", hidden_size=8),
+        ),
+        is_multimodal_model=is_multimodal_model,
+        multimodal_config=multimodal_config,
+    )
+
+
+_CACHED_SNAPSHOT = Path("/hf-cache/models--org--gemma-4/snapshots/0123abcd")
+
+
+class TestTextSidecarLifecycle:
+    def _force_mode(self, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+        monkeypatch.setattr(
+            DefaultModelAdapter,
+            "multimodal_backbone_mode",
+            lambda self, model_config, speculative_config=None: mode,
+        )
+        # "stub-model" is no local directory, so it resolves like a repo id:
+        # to the cached snapshot mode selection accepted.
+        monkeypatch.setattr(
+            model_adapter_module,
+            "_resolve_cached_snapshot",
+            lambda model_config: _CACHED_SNAPSHOT,
+        )
+
+    def test_text_sidecar_loads_mlx_lm_backbone_and_sidecar(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        loaded_paths: list[Path] = []
+        sidecar = _fake_sidecar()
+
+        def _load(path: Path, **_: object) -> Gemma4VisionSidecar:
+            loaded_paths.append(Path(path))
+            return sidecar
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_load)
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        # The text model loaded from "stub-model" (_stub_generation_model
+        # asserts it); mlx-vlm's load_model reads a path, so the sidecar gets
+        # the resolved snapshot.
+        assert loaded_paths == [_CACHED_SNAPSHOT]
+        assert runner._is_vlm is True
+        assert isinstance(runner._multimodal_adapter, Gemma4MultimodalAdapter)
+        assert runner._multimodal_adapter.text_model() is runner.model
+        assert runner._forward_model is runner.model
+        assert runner.encoder_cache is not None
+
+    def test_text_only_mode_keeps_today_s_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_only")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
+
+    def test_drafter_with_text_sidecar_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+        runner.vllm_config.speculative_config = object()
+
+        with pytest.raises(RuntimeError, match="speculative decoding"):
+            lifecycle.load()
+
+    def test_sidecar_failure_is_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        _stub_generation_model(
+            monkeypatch, config=None, is_vlm=False, model=_Gemma4TextModel()
+        )
+
+        def _boom(path: Path, **_: object) -> Gemma4VisionSidecar:
+            raise ValueError("Missing parameters: vision_tower.encoder")
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_boom)
+        )
+        lifecycle, _ = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        with pytest.raises(ValueError, match="Missing parameters"):
+            lifecycle.load()
+
+    def test_from_runner_without_mode_method_falls_back_to_predicate(self) -> None:
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+        request = GenerationLoadRequest.from_runner(
+            runner, SimpleNamespace(should_force_text_backbone=lambda _: True)
+        )
+        assert request.backbone_mode == "text_only"
+        assert request.is_vlm is False
+
+    def test_drift_to_text_only_with_multimodal_config_kept_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The API process kept `multimodal_config` (it decided text_sidecar
+        # or native earlier), but this process's own mode resolution now
+        # says text_only -- the checkpoint directory or
+        # VLLM_METAL_MULTIMODAL_MODE changed between the two processes.
+        self._force_mode(monkeypatch, "text_only")
+        runner = make_stub_runner(
+            model_config=_gemma4_runner_config(multimodal_config=SimpleNamespace())
+        )
+
+        with pytest.raises(RuntimeError, match="drifted"):
+            GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+    def test_load_request_carries_the_resolved_sidecar_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        request = GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+        assert request.model_name == "stub-model"
+        assert request.sidecar_checkpoint == _CACHED_SNAPSHOT
+
+    def test_unresolvable_sidecar_checkpoint_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Mode selection accepted the checkpoint, but by the time this
+        # process loads, the snapshot no longer resolves (cache cleared).
+        self._force_mode(monkeypatch, "text_sidecar")
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda model_config: None
+        )
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        with pytest.raises(RuntimeError, match="no longer resolves"):
+            GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+    def test_other_modes_carry_no_sidecar_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "native")
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        request = GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+        assert request.sidecar_checkpoint is None
+
+    def test_sidecar_not_loaded_when_not_flagged_multimodal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # backbone_mode can resolve to text_sidecar while is_multimodal_model
+        # is False (e.g. a stub/adapter disagreement); is_vlm then stays
+        # False, and the sidecar must not be loaded for a request nothing
+        # will ever route images to.
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        sidecar_loads: list[Path] = []
+
+        def _load(path: Path, **_: object) -> Gemma4VisionSidecar:
+            sidecar_loads.append(Path(path))
+            return _fake_sidecar()
+
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar, "load", staticmethod(_load)
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_config=_gemma4_runner_config(is_multimodal_model=False)
+        )
+
+        lifecycle.load()
+
+        assert sidecar_loads == []
+        assert runner._is_vlm is False
+        assert runner._multimodal_adapter is None
+        assert runner.encoder_cache is None
+
+    def test_sidecar_is_not_reachable_from_runner_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec invariant (5.1/10.1): sidecar submodules never hang off
+        runner.model, or patch_model/CompiledMLPBlocks/LoRA would walk them."""
+        self._force_mode(monkeypatch, "text_sidecar")
+        text_model = _Gemma4TextModel()
+        _stub_generation_model(monkeypatch, config=None, is_vlm=False, model=text_model)
+        sidecar = _fake_sidecar()
+        monkeypatch.setattr(
+            model_lifecycle.Gemma4VisionSidecar,
+            "load",
+            staticmethod(lambda path, **_: sidecar),
+        )
+        lifecycle, runner = _make_lifecycle(model_config=_gemma4_runner_config())
+
+        lifecycle.load()
+
+        visited: set[int] = set()
+
+        def _reaches_sidecar_submodule(obj: object) -> bool:
+            if id(obj) in visited:
+                return False
+            visited.add(id(obj))
+            if obj is sidecar.vision_tower or obj is sidecar.embed_vision:
+                return True
+            if isinstance(obj, dict):
+                children = obj.values()
+            elif hasattr(obj, "__dict__"):
+                children = vars(obj).values()
+            else:
+                return False
+            return any(_reaches_sidecar_submodule(child) for child in children)
+
+        assert _reaches_sidecar_submodule(runner.model) is False

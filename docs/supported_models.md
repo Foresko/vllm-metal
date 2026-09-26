@@ -48,6 +48,22 @@ Native multimodal support currently targets image-only vision-language requests 
 | Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
 | Qwen3.5 (dense) | 🔵 | native multimodal paged generation | image input, no video; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
 | PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, causal attention over image tokens | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+
+Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
+selective logits, intermediate forward); only `vision_tower` and `embed_vision`
+are loaded from the checkpoint through mlx-vlm. The sidecar activates in
+`VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
+safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
+builds (the checkpoint's `processor_config.json` needs a `video_processor`
+block with transformers 5.14+), the text config has no per-layer inputs, and
+no speculative decoding is configured; otherwise the model stays text-only and
+the reason is logged. A repo id such as the example above only resolves when
+it is already fully cached locally (`hf download <repo>` first) — the sidecar
+never triggers a download itself, and an uncached repo id falls back to
+text-only with a logged reason exactly like a nonexistent local path. Image
+tokens attend causally in this version; bidirectional attention inside an
+image block is not implemented yet.
 
 ## Text-Only Language Models
 
