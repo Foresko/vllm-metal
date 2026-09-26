@@ -82,6 +82,8 @@ class GenerationLoadRequest:
     gguf_source: GGUFLoadSource | None
     lazy_weights: bool
     backbone_mode: str = "native"
+    sidecar_checkpoint: Path | None = None
+    """Directory the vision sidecar loads from; set for ``text_sidecar`` only."""
 
     @classmethod
     def from_runner(
@@ -121,6 +123,18 @@ class GenerationLoadRequest:
             raise NotImplementedError(
                 "Multimodal GGUF checkpoints are not supported by vllm-metal."
             )
+        sidecar_checkpoint = None
+        if backbone_mode == "text_sidecar" and is_vlm:
+            # ``model_name`` stays a repo id for a cached Hugging Face snapshot:
+            # mlx_lm resolves that itself, the sidecar's mlx-vlm loader does
+            # not, so hand it the directory mode selection accepted.
+            sidecar_checkpoint = model_adapter.sidecar_checkpoint_dir(model_config)
+            if sidecar_checkpoint is None:
+                raise RuntimeError(
+                    "Metal: the Gemma 4 vision sidecar was selected, but "
+                    f"{model_config.model!r} no longer resolves to a local "
+                    "checkpoint directory or a fully cached Hugging Face repo"
+                )
         gguf_source = (
             None
             if is_vlm
@@ -152,6 +166,7 @@ class GenerationLoadRequest:
             gguf_source=gguf_source,
             lazy_weights=lazy_weights,
             backbone_mode=backbone_mode,
+            sidecar_checkpoint=sidecar_checkpoint,
         )
 
 
@@ -297,7 +312,8 @@ class ModelLifecycle:
             gguf_source=None,
             lazy_weights=request.lazy_weights,
         )
-        sidecar = Gemma4VisionSidecar.load(Path(request.model_name))
+        assert request.sidecar_checkpoint is not None  # set by from_runner
+        sidecar = Gemma4VisionSidecar.load(request.sidecar_checkpoint)
         return LoadedGenerationModel(
             model=model,
             tokenizer=tokenizer,

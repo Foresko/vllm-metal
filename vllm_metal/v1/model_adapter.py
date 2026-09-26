@@ -254,6 +254,14 @@ class ModelAdapter(Protocol):
     ) -> BackboneMode:
         """Decide how a multimodal checkpoint is served (see ``BackboneMode``)."""
 
+    def sidecar_checkpoint_dir(self, model_config: ModelConfig) -> Path | None:
+        """Local checkpoint directory the ``text_sidecar`` mode loads from.
+
+        The directory ``multimodal_backbone_mode`` accepted: a local path, or
+        the snapshot of a fully cached Hugging Face repo.  ``None`` when it no
+        longer resolves.
+        """
+
     def normalize_model_config(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None
     ) -> None:
@@ -499,6 +507,9 @@ class DefaultModelAdapter(ModelAdapter):
             mode = "text_only"
         _backbone_mode_cache[key] = mode
         return mode
+
+    def sidecar_checkpoint_dir(self, model_config: ModelConfig) -> Path | None:
+        return _local_checkpoint_dir(model_config)
 
     def normalize_model_config(
         self, model_config: ModelConfig, *, speculative_config: Any | None = None

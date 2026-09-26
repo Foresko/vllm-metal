@@ -26,6 +26,7 @@ from vllm_metal.config import reset_config
 from vllm_metal.distributed.pipeline import PipelineGroup
 from vllm_metal.multimodal.gemma4 import Gemma4MultimodalAdapter, Gemma4VisionSidecar
 from vllm_metal.multimodal.qwen3_vl import Qwen3VLMultimodalAdapter
+from vllm_metal.v1 import model_adapter as model_adapter_module
 from vllm_metal.v1 import model_lifecycle
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mm import EncoderCache
@@ -1569,12 +1570,22 @@ def _gemma4_runner_config(
     )
 
 
+_CACHED_SNAPSHOT = Path("/hf-cache/models--org--gemma-4/snapshots/0123abcd")
+
+
 class TestTextSidecarLifecycle:
     def _force_mode(self, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
         monkeypatch.setattr(
             DefaultModelAdapter,
             "multimodal_backbone_mode",
             lambda self, model_config, speculative_config=None: mode,
+        )
+        # "stub-model" is no local directory, so it resolves like a repo id:
+        # to the cached snapshot mode selection accepted.
+        monkeypatch.setattr(
+            model_adapter_module,
+            "_resolve_cached_snapshot",
+            lambda model_config: _CACHED_SNAPSHOT,
         )
 
     def test_text_sidecar_loads_mlx_lm_backbone_and_sidecar(
@@ -1597,7 +1608,10 @@ class TestTextSidecarLifecycle:
 
         lifecycle.load()
 
-        assert loaded_paths == [Path("stub-model")]
+        # The text model loaded from "stub-model" (_stub_generation_model
+        # asserts it); mlx-vlm's load_model reads a path, so the sidecar gets
+        # the resolved snapshot.
+        assert loaded_paths == [_CACHED_SNAPSHOT]
         assert runner._is_vlm is True
         assert isinstance(runner._multimodal_adapter, Gemma4MultimodalAdapter)
         assert runner._multimodal_adapter.text_model() is runner.model
@@ -1670,6 +1684,41 @@ class TestTextSidecarLifecycle:
 
         with pytest.raises(RuntimeError, match="drifted"):
             GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+    def test_load_request_carries_the_resolved_sidecar_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "text_sidecar")
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        request = GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+        assert request.model_name == "stub-model"
+        assert request.sidecar_checkpoint == _CACHED_SNAPSHOT
+
+    def test_unresolvable_sidecar_checkpoint_is_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Mode selection accepted the checkpoint, but by the time this
+        # process loads, the snapshot no longer resolves (cache cleared).
+        self._force_mode(monkeypatch, "text_sidecar")
+        monkeypatch.setattr(
+            model_adapter_module, "_resolve_cached_snapshot", lambda model_config: None
+        )
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        with pytest.raises(RuntimeError, match="no longer resolves"):
+            GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+    def test_other_modes_carry_no_sidecar_checkpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._force_mode(monkeypatch, "native")
+        runner = make_stub_runner(model_config=_gemma4_runner_config())
+
+        request = GenerationLoadRequest.from_runner(runner, runner._model_adapter)
+
+        assert request.sidecar_checkpoint is None
 
     def test_sidecar_not_loaded_when_not_flagged_multimodal(
         self, monkeypatch: pytest.MonkeyPatch
