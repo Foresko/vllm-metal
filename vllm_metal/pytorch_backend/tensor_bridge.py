@@ -29,14 +29,14 @@ def get_torch_device() -> torch.device:
 
 
 def torch_to_mlx(tensor: torch.Tensor, *, copy: bool = False) -> mx.array:
-    """Share a detached tensor's storage with MLX, or raise if unsupported.
+    """Share a detached tensor's storage with MLX, or copy it with ``copy=True``.
 
-    MPS writes are synchronized before MLX can read them. The source must not
-    be mutated while MLX is using the shared data. Sharing also runs the other
-    way: once a lazy graph holds the last reference to a shared array, MLX may
-    donate its buffer to an op's output and write into the source tensor.
-    ``copy=True`` gives MLX its own buffer, for tensors the caller keeps using
-    or does not own.
+    Raises if the tensor is unsupported. MPS writes are synchronized before
+    MLX can read them. When shared, the source must not be mutated while MLX
+    is using the data. Sharing also runs the other way: once a lazy graph
+    holds the last reference to a shared array, MLX may donate its buffer to
+    an op's output and write into the source tensor. ``copy=True`` gives MLX
+    its own buffer, for tensors the caller keeps using or does not own.
     """
     if tensor.device.type == "mps":
         torch.mps.synchronize()
