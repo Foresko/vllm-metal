@@ -280,7 +280,9 @@ class TestEncodeLeavesCachedInputsIntact:
             num_parameters=1,
             num_bytes=2,
         )
-        adapter = Gemma4MultimodalAdapter.from_loaded(_TextModel(_Backbone()), sidecar)
+        adapter = Gemma4MultimodalAdapter.from_loaded(
+            _TextModel(_Backbone()), sidecar, bidirectional_attention="vision"
+        )
         feature = _real_tower_feature()
         assert feature.data is not None
         pixels = feature.data["pixel_values"].data

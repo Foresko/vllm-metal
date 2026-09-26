@@ -1204,18 +1204,41 @@ class TestSDPAForward:
 class TestBidirectionalDispatch:
     """The bidirectional path is entered only for the configured layer kinds."""
 
-    def _run(self, kinds: frozenset[str], ranges, layer_idx: int):
-        layout = MHAKVCacheLayout(
-            num_blocks=11,
-            allocation_bytes=2,
-            layers=(
-                MHALayerKVLayout(0, 0, 32, _N_KV_HEADS, _HEAD_DIM, -1),
-                MHALayerKVLayout(1, 1, 16, _N_KV_HEADS, _HEAD_DIM, 1024),
-            ),
-            group_block_sizes=(32, 16),
-            slot_layers=((0,), (1,)),
+    @staticmethod
+    def _cache() -> MetalPagedKVCache:
+        """Gemma 4's layer mix over upstream storage: one full-attention layer
+        at block 32 beside one sliding layer (window 1024) at block 16."""
+        full = FullAttentionSpec(
+            block_size=32,
+            num_kv_heads=_N_KV_HEADS,
+            head_size=_HEAD_DIM,
+            dtype=torch.float16,
         )
-        cache = MetalPagedKVCache.from_layout(layout, mx.float16)
+        sliding = SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=_N_KV_HEADS,
+            head_size=_HEAD_DIM,
+            dtype=torch.float16,
+            sliding_window=1024,
+            page_size_padded=full.page_size_bytes,
+        )
+        vllm_config = VllmConfig()
+        vllm_config.cache_config.kv_cache_layout = "LBNHC"
+        config = get_kv_cache_config_from_groups(
+            vllm_config,
+            [
+                KVCacheGroupSpec(layer_names=["full"], kv_cache_spec=full),
+                KVCacheGroupSpec(layer_names=["sliding"], kv_cache_spec=sliding),
+            ],
+            11 * full.page_size_bytes,
+        )
+        config.kv_cache_layout = "LBNHC"
+        return MetalPagedKVCache.from_upstream(
+            KVCacheStorage(config), ["full", "sliding"]
+        )
+
+    def _run(self, kinds: frozenset[str], ranges, layer_idx: int):
+        cache = self._cache()
         prepare_grouped([([[3], [8, 9]], 17, 1)], [([[4], [10]], 2, 0)], (32, 16))
         ctx = get_context()
         assert ctx is not None
