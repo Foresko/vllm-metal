@@ -25,10 +25,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-os.environ.setdefault("VLLM_METAL_MEMORY_FRACTION", "0.3")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "INFO")
-# Production runs the engine in-process this way; it also keeps EngineCore
-# logs in this process so `_ModeCapture` sees the mode-selection log lines.
+# EngineCore runs in this process, so `_ModeCapture` sees its mode-selection
+# log lines.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 SIZES = [(1, 1), (900, 3), (3, 900), (224, 224), (300, 200), (4096, 4096)]
