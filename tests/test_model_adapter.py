@@ -1440,6 +1440,33 @@ class TestMultimodalBackboneMode:
             == "text_only"
         )
 
+    def test_cache_keeps_only_the_most_recent_keys(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        probed: list[str] = []
+        monkeypatch.setattr(model_adapter_module, "_has_vision_weights", lambda _: True)
+        monkeypatch.setattr(
+            model_adapter_module,
+            "_probe_processor",
+            lambda config: probed.append(Path(config.model).name),
+        )
+        monkeypatch.setattr(model_adapter_module, "_BACKBONE_MODE_CACHE_SIZE", 2)
+        adapter = DefaultModelAdapter()
+
+        def resolve(name: str) -> None:
+            checkpoint = tmp_path / name
+            checkpoint.mkdir(exist_ok=True)
+            adapter.multimodal_backbone_mode(
+                _gemma4_model_config(tmp_path, model=str(checkpoint))
+            )
+
+        for name in ["a", "b", "a", "c", "a", "b"]:
+            resolve(name)
+
+        # "a" stays cached because every hit refreshes it; "c" evicts "b",
+        # the least recently used, so "b" is probed again.
+        assert probed == ["a", "b", "c", "b"]
+
     def test_non_gemma4_follows_should_force_text_backbone(self) -> None:
         config = SimpleNamespace(
             model="x",

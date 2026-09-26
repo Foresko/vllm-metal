@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +31,11 @@ BackboneMode = Literal["native", "text_sidecar", "text_only"]
 """
 
 _GEMMA4_MODEL_TYPE = "gemma4"
-_backbone_mode_cache: dict[tuple[Any, ...], BackboneMode] = {}
+# Mode selection probes the checkpoint and builds the HF processor, and a
+# process asks more than once (platform normalization, then the load
+# request).  A server resolves one model, so a few recent keys suffice.
+_BACKBONE_MODE_CACHE_SIZE = 16
+_backbone_mode_cache: OrderedDict[tuple[Any, ...], BackboneMode] = OrderedDict()
 
 
 def reset_backbone_mode_cache() -> None:
@@ -493,6 +498,7 @@ class DefaultModelAdapter(ModelAdapter):
         )
         cached = _backbone_mode_cache.get(key)
         if cached is not None:
+            _backbone_mode_cache.move_to_end(key)
             return cached
         reason = _gemma4_text_only_reason(model_config, speculative_config)
         mode: BackboneMode
@@ -504,6 +510,8 @@ class DefaultModelAdapter(ModelAdapter):
             )
             mode = "text_only"
         _backbone_mode_cache[key] = mode
+        if len(_backbone_mode_cache) > _BACKBONE_MODE_CACHE_SIZE:
+            _backbone_mode_cache.popitem(last=False)
         return mode
 
     def sidecar_checkpoint_dir(self, model_config: ModelConfig) -> Path | None:
