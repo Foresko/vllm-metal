@@ -814,10 +814,14 @@ class MetalPlatform(Platform):
                     "Data parallelism (data_parallel_size > 1) is not "
                     "supported for speech-to-text models."
                 )
+            cache_config = vllm_config.cache_config
             was_async_scheduling = bool(scheduler_config.async_scheduling)
-            apply_stt_scheduler_policy(model_config, scheduler_config)
+            was_prefix_caching = bool(cache_config.enable_prefix_caching)
+            apply_stt_scheduler_policy(model_config, scheduler_config, cache_config)
             if was_async_scheduling and not scheduler_config.async_scheduling:
                 logger.info("STT: disabled async_scheduling")
+            if was_prefix_caching and not cache_config.enable_prefix_caching:
+                logger.info("STT: disabled prefix caching (no KV cache to reuse)")
             logger.info("STT model detected")
 
         # The text AWQ and GGUF loaders materialize the full checkpoint before

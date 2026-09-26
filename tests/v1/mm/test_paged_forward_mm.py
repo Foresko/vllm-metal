@@ -180,7 +180,7 @@ def _mm_prefill(
     req_id: str,
     *,
     token_ids: list[int],
-    prompt_len: int,
+    prompt_len: int | None,
     start_pos: int = 0,
     full_prompt: list[int] | None = None,
 ) -> PrefillRequest:

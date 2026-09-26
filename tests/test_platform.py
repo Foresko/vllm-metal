@@ -1432,6 +1432,36 @@ class TestMetalPlatform:
         assert vllm_config.scheduler_config.async_scheduling is False
 
     @pytest.mark.parametrize(
+        ("model", "model_type", "is_stt", "prefix_caching"),
+        [
+            ("Qwen/Qwen3-ASR-0.6B", "qwen3_asr", True, False),
+            ("Qwen/Qwen3-0.6B", "qwen3", False, True),
+        ],
+        ids=["stt", "text"],
+    )
+    def test_check_and_update_config_disables_prefix_caching_for_stt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model: str,
+        model_type: str,
+        is_stt: bool,
+        prefix_caching: bool,
+    ) -> None:
+        """The one-shot STT runner keeps no KV cache for a prefix-cache hit to
+        reuse, and vLLM strips the audio features of any request whose audio
+        placeholder the hit covers, so a repeated request would reach the
+        runner without its audio."""
+        self._patch_stt_resolution(monkeypatch, is_stt=is_stt)
+        vllm_config = self._detection_platform_config(
+            model=model, model_type=model_type
+        )
+        assert vllm_config.cache_config.enable_prefix_caching is True
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.cache_config.enable_prefix_caching is prefix_caching
+
+    @pytest.mark.parametrize(
         ("mode", "hf_fields", "should_clear"),
         [
             (None, {"model_type": "gemma4"}, True),

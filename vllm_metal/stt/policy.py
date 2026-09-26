@@ -26,15 +26,28 @@ class _SchedulerConfigLike(Protocol):
     async_scheduling: bool
 
 
+class _CacheConfigLike(Protocol):
+    enable_prefix_caching: bool
+
+
 def apply_stt_scheduler_policy(
-    model_config: _ModelConfigLike, scheduler_config: _SchedulerConfigLike
+    model_config: _ModelConfigLike,
+    scheduler_config: _SchedulerConfigLike,
+    cache_config: _CacheConfigLike,
 ) -> None:
     """Apply STT scheduler compatibility policy for Metal runtime.
 
     STT requests are processed as one-shot execute calls, so async scheduling
     (which expects decode-phase queuing) must be disabled.
+
+    The one-shot runner keeps no KV cache, so a prefix-cache hit has nothing
+    to reuse, and vLLM strips the audio features of any request whose audio
+    placeholder the hit covers. Prefix caching must be disabled so every
+    request reaches the runner with its audio.
     """
     if not model_config.tokenizer:
         model_config.tokenizer = model_config.model
     if scheduler_config.async_scheduling:
         scheduler_config.async_scheduling = False
+    if cache_config.enable_prefix_caching:
+        cache_config.enable_prefix_caching = False
