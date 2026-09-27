@@ -260,6 +260,26 @@ def test_single_pass_and_partitions_agree(force_gqa) -> None:
         _assert_close(outs[512], outs[0], mx.bfloat16)
 
 
+@pytest.mark.parametrize("partition", [256, 512])
+@pytest.mark.parametrize("magnitude", [1.0, 1.5, 2.0])
+def test_window_skipped_partitions_are_neutral(force_gqa, partition, magnitude) -> None:
+    """A partition left of the window must not pin the reduce's global max.
+
+    q = a*ones and k = -a*ones + noise put every in-window scaled score near
+    -16*a*a; a skipped partition that reported a max of 0 attenuated such a
+    head or zeroed it (vllm-project/vllm-metal#837).
+    """
+    case = _make_case(
+        kv_lens=[1500], heads=16, kv_heads=2, hd=256, dtype=mx.bfloat16, seed=7
+    )
+    noise = np.random.default_rng(7).standard_normal(case.key_cache.shape)
+    case.query = (mx.ones(case.query.shape) * magnitude).astype(mx.bfloat16)
+    case.key_cache = mx.array(-magnitude + 0.05 * noise).astype(mx.bfloat16)
+    force_gqa.set_gqa_decode_partition_size(partition)
+    got = _run(case, scale=256**-0.5, window=96, expect="gqa")
+    _assert_close(got, _reference(case, scale=256**-0.5, window=96), mx.bfloat16)
+
+
 def test_automatic_split_follows_the_grid_threshold(force_gqa) -> None:
     # 16 query / 2 KV heads: two head groups per token.
     tokens_above = -(-force_gqa.gqa_decode_min_grid() // 2)
