@@ -14,6 +14,8 @@ without MLX or torch.
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 MM_PREFIX_PATHS = ("kernel", "recompute")
@@ -58,8 +60,8 @@ def resolve_mm_prefix_path(value: str | None, supported: bool) -> str:
 
     ``None`` (unset) means ``"kernel"``.  The kernel path needs the compiled
     ops to advertise ``supports_mm_prefix`` and becomes ``"recompute"``
-    otherwise.  Any other value raises so an A/B typo cannot quietly measure
-    the wrong path.
+    otherwise, with a warning the first time.  Any other value raises so an
+    A/B typo cannot quietly measure the wrong path.
     """
     if value is None:
         value = "kernel"
@@ -68,5 +70,23 @@ def resolve_mm_prefix_path(value: str | None, supported: bool) -> str:
             f"VLLM_METAL_MM_PREFIX_PATH must be 'kernel' or 'recompute', got {value!r}"
         )
     if value == "kernel" and not supported:
+        _warn_kernel_path_unavailable()
         return "recompute"
     return value
+
+
+@functools.cache
+def _warn_kernel_path_unavailable() -> None:
+    """Warn once that image blocks fell back from the kernel to the recompute.
+
+    The native ops always advertise ``supports_mm_prefix``, so this is a build
+    that predates it, which would otherwise serve every image block through the
+    slower recompute without a trace.
+    """
+    from vllm.logger import init_logger  # here, so this module stays numpy-only
+
+    init_logger(__name__).warning(
+        "Metal: the compiled ops predate mm_prefix support, so image blocks take "
+        "the MLX recompute path; rebuild the native extension to use the tiled "
+        "prefill kernel"
+    )

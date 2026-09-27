@@ -688,6 +688,22 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
 
 
+class _PreMmPrefixOps:
+    """Ops of a native build that predates mm_prefix: no probe, no keyword."""
+
+    def __init__(self) -> None:
+        self._spy = _PagedRoutingOpsSpy()
+        self.calls = self._spy.calls
+
+    def reshape_and_cache(self, *args):
+        return self._spy.reshape_and_cache(*args)
+
+    def paged_attention_primitive(self, *args, window_seqlen_q=1, sinks=None):
+        self._spy.paged_attention_primitive(
+            *args, window_seqlen_q=window_seqlen_q, sinks=sinks
+        )
+
+
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
 
@@ -1263,6 +1279,7 @@ class TestBidirectionalDispatch:
         supports: bool = True,
         repeat: int = 1,
         dtype: mx.Dtype = mx.float16,
+        ops: object | None = None,
     ):
         cache = self._cache(dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
@@ -1282,7 +1299,7 @@ class TestBidirectionalDispatch:
         keys = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
         values = mx.ones((_BATCH, _N_KV_HEADS, 3, _HEAD_DIM))
         bidi = MagicMock(side_effect=lambda out, *a, **k: out)
-        spy = _PagedRoutingOpsSpy(supports_mm_prefix=supports)
+        spy = ops or _PagedRoutingOpsSpy(supports_mm_prefix=supports)
         env = {k: v for k, v in os.environ.items() if k != "VLLM_METAL_MM_PREFIX_PATH"}
         if path is not None:
             env["VLLM_METAL_MM_PREFIX_PATH"] = path
@@ -1356,6 +1373,13 @@ class TestBidirectionalDispatch:
         )
         assert bidi.call_count == 1
         assert spy.calls[-1].mm_prefix_ranges is None
+
+    def test_ops_predating_mm_prefix_serve_the_recompute(self) -> None:
+        # No probe and no keyword: the image rows still reach the recompute.
+        bidi, _, _ = self._run(
+            frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
+        )
+        assert bidi.call_count == 1
 
     def test_unknown_path_value_raises(self) -> None:
         with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):

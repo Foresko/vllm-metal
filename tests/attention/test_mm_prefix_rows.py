@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 import torch
 from vllm.v1.attention.backends.utils import fill_mm_prefix_query_ranges
 
+import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 from vllm_metal.attention.impls.mm_prefix import (
     MM_PREFIX_PATHS,
     build_mm_prefix_rows,
@@ -104,6 +107,28 @@ def test_decode_rows_and_text_segments_stay_minus_one() -> None:
 )
 def test_resolve_mm_prefix_path(value, supported, expected) -> None:
     assert resolve_mm_prefix_path(value, supported) == expected
+
+
+def _fallback_warnings(caplog, calls) -> int:
+    metal_logger = logging.getLogger("vllm_metal")
+    mm_prefix_module._warn_kernel_path_unavailable.cache_clear()
+    metal_logger.addHandler(caplog.handler)
+    try:
+        for value, supported in calls:
+            resolve_mm_prefix_path(value, supported)
+    finally:
+        metal_logger.removeHandler(caplog.handler)
+    return caplog.text.count("predate mm_prefix")
+
+
+def test_kernel_fallback_warns_once(caplog) -> None:
+    calls = [(None, False), ("kernel", False), (None, False)]
+    assert _fallback_warnings(caplog, calls) == 1
+
+
+def test_no_warning_when_the_kernel_runs_or_recompute_is_chosen(caplog) -> None:
+    calls = [(None, True), ("kernel", True), ("recompute", False)]
+    assert _fallback_warnings(caplog, calls) == 0
 
 
 def test_unknown_path_is_rejected() -> None:

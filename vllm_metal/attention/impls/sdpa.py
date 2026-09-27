@@ -233,11 +233,10 @@ def _kernel_metadata(
 def _mm_prefix_path(ops: Any) -> str:
     """The configured image-block attention path for this forward.
 
-    The ``getattr`` probe guards the shape of the *ops object* -- test fakes
-    and any future ops module that does not implement the entry point -- not
-    a stale native build: both ``paged_attention_primitive`` call sites pass
-    ``mm_prefix_ranges=`` unconditionally, so a native build predating the
-    keyword fails at the call regardless of what this reports.
+    The native ops always advertise ``supports_mm_prefix``, so the probe only
+    fails for a build that predates it (or a test fake).  Such ops serve image
+    blocks through the recompute: ``mm_prefix_ranges=`` is passed only on the
+    kernel path, and ``resolve_mm_prefix_path`` warns once about the fallback.
     """
     supported = bool(getattr(ops, "supports_mm_prefix", lambda: False)())
     return resolve_mm_prefix_path(envs.VLLM_METAL_MM_PREFIX_PATH, supported)
@@ -827,6 +826,11 @@ def sdpa_forward(
                     )
             else:
                 recompute_after_kernel = True
+    # Only the kernel path passes the ranges, so ops that predate the keyword
+    # still run the kernel for text rows and leave image rows to the recompute.
+    mm_kwargs = (
+        {} if mm_prefix_ranges is None else {"mm_prefix_ranges": mm_prefix_ranges}
+    )
     out = mx.array(0)
     if kv_cache.turboquant:
         # Reshape scale/zero caches for kernel block size
@@ -876,7 +880,7 @@ def sdpa_forward(
             quant_type=kv_cache.k_quant,
             v_bits=kv_cache.v_bits,
             window_seqlen_q=ctx.verify_window_q,
-            mm_prefix_ranges=mm_prefix_ranges,
+            **mm_kwargs,
         )
     else:
         ops.paged_attention_primitive(
@@ -895,7 +899,7 @@ def sdpa_forward(
             out,
             window_seqlen_q=ctx.verify_window_q,
             sinks=sinks,
-            mm_prefix_ranges=mm_prefix_ranges,
+            **mm_kwargs,
         )
 
     if recompute_after_kernel:
