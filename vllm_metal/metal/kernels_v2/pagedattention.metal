@@ -960,9 +960,11 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   const int num_blocks = end_block_idx - start_block_idx;
 
   if (USE_PARTITIONING && num_blocks <= 0) {
-    // Every key of this partition lies left of the window.  Write the same
-    // partial the masked loop produced for it (max 0, sum 0, zero output:
-    // the reduce gives it zero merge weight) and leave.
+    // Every key of this partition lies left of the window.  Write a partial
+    // that is neutral in the reduce and leave: max -FLT_MAX and sum 0, so
+    // exp2(max - global_max) is 0 and it neither carries weight nor pins the
+    // global max (a max of 0 did, attenuating heads whose in-window scores
+    // are all far below 0; vllm-project/vllm-metal#837), plus a zero output.
     // num_heads / head_idx are declared further down; the same values.
     const int nh = threadgroups_per_grid.x;
     const int hi = threadgroup_position_in_grid.x;
@@ -971,7 +973,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       const int out_row = q_token_idx + r;
       if (thread_idx == 0 && use_partitioning) {
         max_logits[out_row * nh * max_num_partitions +
-                   hi * max_num_partitions + partition_idx] = 0.f;
+                   hi * max_num_partitions + partition_idx] = -FLT_MAX;
         exp_sums[out_row * nh * max_num_partitions +
                  hi * max_num_partitions + partition_idx] = 0.f;
       }
