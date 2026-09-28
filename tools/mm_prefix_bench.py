@@ -15,8 +15,9 @@ image blocks, three ways:
 Each rep chains LAYERS_PER_REP calls between mx.synchronize fences, feeding
 one layer's output to the next as its query, the way a forward runs its
 layers.  The kernel's row ranges are built once per rep, as the attention
-impl builds them once per forward.  ``max|k-r|`` compares the two image paths
-on one layer.
+impl builds them once per forward.  Before timing a scenario, ``max|k-r|``
+compares the two image paths on one layer, and the script stops if they
+differ by more than MAX_ABS_DIFF.
 
 On an M5 the calls without ranges (causal, and the recompute's kernel call)
 run on NAX, while a batch with ranges stays on the tiled kernel.  ``--no-nax``
@@ -55,6 +56,11 @@ SLIDING_LAYERS = 25
 LAYERS_PER_REP = SLIDING_LAYERS
 WARMUP_REPS = 3
 TIMED_REPS = 10
+# The two image paths round differently in bf16; measured runs stay within
+# 2**-6, one bf16 ulp for outputs in [2, 4).  A path that attends to the
+# wrong keys misses by far more, and its timings would compare different
+# computations.
+MAX_ABS_DIFF = 2**-5
 
 
 @dataclass(frozen=True)
@@ -195,12 +201,17 @@ def _bench(ops, s: Scenario) -> tuple[int, float, float, float, float]:
             q = recompute_layer(q, ctx)
         return q
 
-    causal = _median_us(run_causal)
-    kernel = _median_us(run_kernel)
-    recompute = _median_us(run_recompute)
     got_kernel = paged(query, ranges()).astype(mx.float32)
     got_recompute = recompute_layer(query, context()).astype(mx.float32)
     diff = mx.max(mx.abs(got_kernel - got_recompute)).item()
+    if not diff <= MAX_ABS_DIFF:  # also stops on NaN
+        raise SystemExit(
+            f"{s.name}: max|k-r| {diff:.4f} exceeds {MAX_ABS_DIFF}: the image "
+            "paths disagree, so their timings are not comparable"
+        )
+    causal = _median_us(run_causal)
+    kernel = _median_us(run_kernel)
+    recompute = _median_us(run_recompute)
     return rows, causal, kernel, recompute, diff
 
 
