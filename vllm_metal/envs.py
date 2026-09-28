@@ -50,8 +50,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gemma 4 vision image-block attention path: "kernel" (default) hands the
     # per-row block ranges to the tiled Metal prefill kernel; "recompute"
     # keeps the MLX SDPA recompute of the block rows after the kernel
-    # (the reference path).  Read per forward; any other value is rejected at
-    # first use (impls.mm_prefix.resolve_mm_prefix_path).
+    # (the reference path).  Read per forward, and once at warm-up for a model
+    # with image blocks, which rejects any other value at startup
+    # (impls.mm_prefix.resolve_mm_prefix_path).
     "VLLM_METAL_MM_PREFIX_PATH": lambda: os.getenv("VLLM_METAL_MM_PREFIX_PATH"),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),

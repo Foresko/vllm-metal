@@ -19,6 +19,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
+import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import (
@@ -207,6 +208,49 @@ class TestV1MetalModelRunnerGenerate:
 
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
+
+    def _warm_up(self, monkeypatch: pytest.MonkeyPatch, adapter, ops) -> None:
+        runner = self._make_runner()
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        runner._paged_attention_runtime = Mock()
+        runner._multimodal_adapter = adapter
+        monkeypatch.setattr(mr, "get_ops", lambda: ops)
+        runner.warm_up()
+        runner._paged_attention_runtime.warm_up.assert_called_once_with()
+
+    def test_warm_up_rejects_a_bad_mm_prefix_path_for_image_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", "kernle")
+        adapter = SimpleNamespace(bidirectional_layer_kinds=frozenset({"sliding"}))
+        ops = SimpleNamespace(supports_mm_prefix=lambda: True)
+
+        with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
+            self._warm_up(monkeypatch, adapter, ops)
+
+    def test_warm_up_warns_when_the_ops_predate_mm_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("VLLM_METAL_MM_PREFIX_PATH", raising=False)
+        warn = Mock()
+        monkeypatch.setattr(mm_prefix_module, "_warn_kernel_path_unavailable", warn)
+        adapter = SimpleNamespace(bidirectional_layer_kinds=frozenset({"sliding"}))
+
+        self._warm_up(monkeypatch, adapter, SimpleNamespace())
+
+        warn.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "adapter",
+        [None, SimpleNamespace(bidirectional_layer_kinds=frozenset())],
+        ids=["text-only", "causal-image-tokens"],
+    )
+    def test_warm_up_leaves_the_mm_prefix_path_alone_without_image_blocks(
+        self, monkeypatch: pytest.MonkeyPatch, adapter
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", "kernle")
+
+        self._warm_up(monkeypatch, adapter, SimpleNamespace())
 
 
 class TestV1MetalModelRunnerSampleTokens:

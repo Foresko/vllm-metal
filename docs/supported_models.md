@@ -73,7 +73,10 @@ batch carries image-block rows; `VLLM_METAL_MM_PREFIX_PATH=recompute` selects
 the reference path instead, which recomputes the block rows with MLX SDPA
 after the kernel and logs `Metal: bidirectional image attention: N
 segment(s), M block(s), R row(s)`. Both paths give the same mask; the kernel
-path attends each row once. An image block that does not fit inside one prefill
+path attends each row once. A native build that predates the kernel's
+`mm_prefix` support takes the recompute path instead and says so once at
+startup (`the compiled ops predate mm_prefix support`). An image block that
+does not fit inside one prefill
 step falls back to causal attention for the rest of the request, with a
 warning containing `falling back to causal attention`; raise
 `--max-num-batched-tokens` or lower `--max-num-seqs` to keep the block inside

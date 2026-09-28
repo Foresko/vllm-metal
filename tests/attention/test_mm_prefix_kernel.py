@@ -9,6 +9,7 @@ import pytest
 
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
+from vllm_metal.attention.impls.mm_prefix import mm_prefix_path
 from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
 
@@ -146,8 +147,16 @@ def _reference(
     )
 
 
-def test_supports_mm_prefix() -> None:
-    assert get_ops().supports_mm_prefix() is True
+def test_supports_mm_prefix(monkeypatch) -> None:
+    """The compiled ops advertise mm_prefix, and the dispatch probe sees it.
+
+    If either side drifted, every image block would take the recompute with
+    only the one-time warning to show for it.
+    """
+    monkeypatch.delenv("VLLM_METAL_MM_PREFIX_PATH", raising=False)
+    ops = get_ops()
+    assert ops.supports_mm_prefix() is True
+    assert mm_prefix_path(ops) == "kernel"
 
 
 @pytest.mark.parametrize("window", [128, None])
