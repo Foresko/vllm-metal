@@ -12,11 +12,57 @@ During plugin registration (``vllm_metal._register``), the
 ``vllm.envs.environment_variables`` so that ``validate_environ()``
 recognises our variables and does not emit spurious "Unknown vLLM
 environment variable" warnings.
+
+``validate_environment`` parses every variable once at startup (from
+``MetalPlatform.check_and_update_config``) and reports every bad value
+together, so a typo fails the startup rather than the first request that
+reads it.  Boolean switches treat ``"1"`` as on and anything else as off.
 """
 
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
+
+MLX_DEVICES = ("gpu", "cpu")
+MULTIMODAL_MODES = ("auto", "multimodal-native", "text-only")
+MM_PREFIX_PATHS = ("kernel", "recompute")
+
+
+def _choice(
+    name: str, default: str | None, choices: tuple[str, ...]
+) -> Callable[[], str | None]:
+    """A variable limited to ``choices``; a bad value lists them."""
+
+    def parse() -> str | None:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        if raw not in choices:
+            raise ValueError(f"{name} must be one of {', '.join(choices)}, got {raw!r}")
+        return raw
+
+    return parse
+
+
+def _int(
+    name: str, default: int, *, minimum: int | None = None, note: str = ""
+) -> Callable[[], int]:
+    """An integer variable; a bad value names the variable and the value."""
+
+    def parse() -> int:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        if minimum is not None and value < minimum:
+            raise ValueError(f"{name} must be at least {minimum}{note}, got {value}")
+        return value
+
+    return parse
+
 
 if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
@@ -37,23 +83,23 @@ if TYPE_CHECKING:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # MLX device type: "gpu" (default) or "cpu".
-    "VLLM_MLX_DEVICE": lambda: os.getenv("VLLM_MLX_DEVICE", "gpu"),
+    "VLLM_MLX_DEVICE": _choice("VLLM_MLX_DEVICE", "gpu", MLX_DEVICES),
     # Multimodal serving mode:
     # - "auto": known-incompatible multimodal checkpoints fall back to the
     #   text-only compatibility path; Gemma 4 serves images through the
     #   vision sidecar on the mlx_lm text backbone when the checkpoint allows.
     # - "multimodal-native": keep native multimodal loading enabled.
     # - "text-only": force the text-only path for every multimodal checkpoint.
-    "VLLM_METAL_MULTIMODAL_MODE": lambda: os.getenv(
-        "VLLM_METAL_MULTIMODAL_MODE", "auto"
+    "VLLM_METAL_MULTIMODAL_MODE": _choice(
+        "VLLM_METAL_MULTIMODAL_MODE", "auto", MULTIMODAL_MODES
     ),
     # Gemma 4 vision image-block attention path: "kernel" (default) hands the
     # per-row block ranges to the tiled Metal prefill kernel; "recompute"
     # keeps the MLX SDPA recompute of the block rows after the kernel
-    # (the reference path).  Read per forward, and once at warm-up for a model
-    # with image blocks, which rejects any other value at startup
-    # (impls.mm_prefix.resolve_mm_prefix_path).
-    "VLLM_METAL_MM_PREFIX_PATH": lambda: os.getenv("VLLM_METAL_MM_PREFIX_PATH"),
+    # (the reference path).  Read per forward.
+    "VLLM_METAL_MM_PREFIX_PATH": _choice(
+        "VLLM_METAL_MM_PREFIX_PATH", None, MM_PREFIX_PATHS
+    ),
     # Custom cache directory for ModelScope downloads (None if unset).
     "VLLM_METAL_MODELSCOPE_CACHE": lambda: os.getenv("VLLM_METAL_MODELSCOPE_CACHE"),
     # Enable lazy GDN kernels by default.
@@ -112,8 +158,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens is ~2 ms of draft-model work on a modern M-series chip; a
     # multiple of the block size is recommended. Set to "0" to restore the
     # single-forward behavior.
-    "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
-        os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    "VLLM_METAL_SPEC_INGEST_CHUNK": _int(
+        "VLLM_METAL_SPEC_INGEST_CHUNK",
+        1024,
+        minimum=0,
+        note=" (0 means single-forward ingest)",
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended
@@ -131,10 +180,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage r binds base + r (default 32323/32324 for two stages). Set the same
     # value on every node to move the ring off a busy port. Default matches
     # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
-    "VLLM_METAL_RING_BASE_PORT": lambda: int(
-        os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
-    ),
+    "VLLM_METAL_RING_BASE_PORT": _int("VLLM_METAL_RING_BASE_PORT", 32323),
 }
+
+
+def validate_environment() -> None:
+    """Parse every variable once and report all bad values together."""
+    errors = []
+    for parse in environment_variables.values():
+        try:
+            parse()
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise ValueError("Invalid vllm-metal environment: " + "; ".join(errors))
 
 
 def __getattr__(name: str) -> Any:

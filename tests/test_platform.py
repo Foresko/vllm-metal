@@ -219,6 +219,29 @@ class TestMetalPlatform:
         ):
             MetalPlatform.check_and_update_config(vllm_config)
 
+    def test_check_and_update_config_validates_the_environment_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bad ``VLLM_METAL_*`` value fails the config hook before the PP+TP
+        check that this config would otherwise trip."""
+        monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1k")
+        vllm_config = self._platform_config(
+            speculative_config=None,
+            cache_config=SimpleNamespace(kv_cache_dtype_skip_layers=[]),
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="mp",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=2,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(
+            ValueError, match="VLLM_METAL_SPEC_INGEST_CHUNK must be an integer"
+        ):
+            MetalPlatform.check_and_update_config(vllm_config)
+
     @pytest.mark.parametrize(
         ("quantization", "multimodal_config", "rejects_pp"),
         [

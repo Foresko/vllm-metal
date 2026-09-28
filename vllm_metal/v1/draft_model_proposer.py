@@ -164,17 +164,7 @@ class DraftModelProposer:
         # versa).
         self._merge_ingest_windows = merge_ingest_windows
         # Resolve once during drafter construction so invalid values fail before serving.
-        try:
-            self._ingest_chunk = envs.VLLM_METAL_SPEC_INGEST_CHUNK
-        except ValueError as exc:
-            raise ValueError(
-                f"VLLM_METAL_SPEC_INGEST_CHUNK must be an integer: {exc}"
-            ) from exc
-        if self._ingest_chunk < 0:
-            raise ValueError(
-                "VLLM_METAL_SPEC_INGEST_CHUNK must be a positive chunk size, or 0 "
-                f"for single-forward ingest; got {self._ingest_chunk}"
-            )
+        self._ingest_chunk = envs.VLLM_METAL_SPEC_INGEST_CHUNK
         # Stateless RoPE/mask shims for the draft forward (one per layer). The
         # real per-request offsets come from the paged context, so these carry
         # no state — allocate once and reuse across steps, not per propose().

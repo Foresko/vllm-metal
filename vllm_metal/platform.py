@@ -404,6 +404,8 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        envs.validate_environment()
+
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
         # Retry after vLLM is fully imported, before serving tokenizers are built.

@@ -1059,9 +1059,8 @@ class MetalModelRunner:
     def _log_image_block_path(self) -> None:
         """Say at startup which path image blocks take, as the forward will.
 
-        Resolving it here also fails a bad ``VLLM_METAL_MM_PREFIX_PATH`` and
-        warns about a build without mm_prefix support before the first image
-        request.
+        Resolving it here also warns about a build without mm_prefix support
+        before the first image request.
         """
         dtype = self.kv_cache_dtype
         path = image_block_path(get_ops(), float32_cache=dtype == mx.float32)

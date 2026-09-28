@@ -20,7 +20,7 @@ import numpy as np
 
 import vllm_metal.envs as envs
 
-MM_PREFIX_PATHS = ("kernel", "recompute")
+MM_PREFIX_PATHS = envs.MM_PREFIX_PATHS
 
 
 def build_mm_prefix_rows(
