@@ -11,6 +11,7 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.models.base import scaled_dot_product_attention
 
+import vllm_metal.attention.runtime.mla as mla_runtime
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
@@ -598,6 +599,58 @@ def _make_decode_ctx(num_seqs: int = 1) -> SimpleNamespace:
         cu_seqlens=list(range(num_seqs + 1)),
         block_tables=[[0]] * num_seqs,
     )
+
+
+class TestDecodePathLog:
+    """At warm-up the MLA runtime says whether decode takes the single-pass
+    kernel, and why not when it doesn't."""
+
+    def _warm_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        kernel_env: bool,
+        kv_lora_rank: int = _KERNEL_KV_RANK,
+    ) -> list[str]:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", kernel_env)
+        inners = [_KernelDimsAbsorbedInner() for _ in range(2)]
+        for inner in inners:
+            inner.kv_lora_rank = kv_lora_rank
+        layers = [SimpleNamespace(self_attn=inner) for inner in inners]
+        model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+        backend = MLAPagedAttentionRuntime(
+            num_layers=2,
+            latent_dim=_KERNEL_KV_RANK + _KERNEL_ROPE_DIM,
+            block_size=16,
+            dtype=mx.float16,
+        )
+        backend.initialize(4)
+        backend.patch_model(model)
+        info = MagicMock()
+        monkeypatch.setattr(mla_runtime.logger, "info", info)
+        backend.warm_up()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
+
+    def test_logs_the_kernel(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, kernel_env=True)
+
+        assert "Metal: MLA decode uses the single-pass Metal kernel" in lines
+
+    def test_logs_the_env_switch_when_off(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, kernel_env=False)
+
+        assert (
+            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "(VLLM_METAL_MLA_KERNEL is off)"
+        ) in lines
+
+    def test_logs_the_shape_the_kernel_lacks(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, kernel_env=True, kv_lora_rank=256)
+
+        assert (
+            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "(kv_lora_rank 256, the kernel takes 512)"
+        ) in lines
 
 
 class TestSinglePassRouting:

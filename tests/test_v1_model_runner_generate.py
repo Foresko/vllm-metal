@@ -2394,6 +2394,74 @@ class TestMergeVerifyWindows:
         assert runner.merge_verify_windows is False
 
 
+class TestVerifyLayoutLog:
+    """With speculative decoding on, warm-up names the verify layout the
+    forward will use (``merge_verify_windows``) and why it stays expanded."""
+
+    def _warm_up(self, monkeypatch, runner, *, speculative: bool = True) -> list[str]:
+        runner.vllm_config.speculative_config = (
+            SimpleNamespace(method="ngram") if speculative else None
+        )
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        runner._paged_attention_runtime = Mock()
+        info = Mock()
+        monkeypatch.setattr(mr.logger, "info", info)
+        runner.warm_up()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
+
+    def test_window_layout(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+
+        lines = self._warm_up(monkeypatch, make_stub_runner())
+
+        assert "Metal: spec-decode verify uses the window layout" in lines
+
+    @pytest.mark.parametrize(
+        ("window_env", "runner_kwargs", "reason"),
+        [
+            ("0", {}, "VLLM_METAL_SPEC_VERIFY_WINDOW is off"),
+            (
+                "1",
+                {"model_args": {"kv_lora_rank": 512}},
+                "MLA decode takes one-row segments",
+            ),
+            (
+                "1",
+                {"is_hybrid": True},
+                "the hybrid decode check takes one-row segments",
+            ),
+            (
+                "1",
+                {
+                    "model_config": SimpleNamespace(
+                        runner_type="generate",
+                        get_head_size=lambda: 512,
+                        is_hybrid=False,
+                    )
+                },
+                "head size 512 exceeds 256",
+            ),
+        ],
+        ids=["off", "mla", "hybrid", "head-size"],
+    )
+    def test_expanded_layout_names_the_reason(
+        self, monkeypatch, window_env, runner_kwargs, reason
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+
+        lines = self._warm_up(monkeypatch, make_stub_runner(**runner_kwargs))
+
+        assert (
+            f"Metal: spec-decode verify uses the expanded per-token layout ({reason})"
+            in lines
+        )
+
+    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+
+        assert not any("spec-decode verify" in line for line in lines)
+
+
 class TestLoadModelPipelineSplitOrdering:
     def test_split_runs_before_lora_setup_on_pp_stage(self) -> None:
         # The pipeline split must run adjacent to the (lazy) load and before LoRA

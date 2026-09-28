@@ -524,16 +524,23 @@ class MetalModelRunner:
         config head size (head_dim_per_layer), and every layer of the
         step shares one verify layout.
         """
+        return self._verify_window_mismatch() is None
+
+    def _verify_window_mismatch(self) -> str | None:
+        """Why spec-verify windows stay expanded, or ``None`` when they merge."""
+        if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
+            return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
+        if self.is_mla:
+            return "MLA decode takes one-row segments"
+        if self.is_hybrid:
+            return "the hybrid decode check takes one-row segments"
         head_dims = self.head_dim_per_layer
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
-        return (
-            envs.VLLM_METAL_SPEC_VERIFY_WINDOW
-            and not self.is_mla
-            and not self.is_hybrid
-            and max_head_dim <= PA_WINDOW_MAX_HEAD_SIZE
-        )
+        if max_head_dim > PA_WINDOW_MAX_HEAD_SIZE:
+            return f"head size {max_head_dim} exceeds {PA_WINDOW_MAX_HEAD_SIZE}"
+        return None
 
     @property
     def _forward_model(self) -> Any:
@@ -1039,7 +1046,9 @@ class MetalModelRunner:
         """Warm up the model with a dummy forward pass, then load the kernels.
 
         For a model whose image blocks attend bidirectionally, also resolve
-        and log the image-block attention path (``_log_image_block_path``).
+        and log the image-block attention path (``_log_image_block_path``),
+        and with speculative decoding, log the verify layout
+        (``_log_verify_layout``).
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
@@ -1055,6 +1064,19 @@ class MetalModelRunner:
             self._paged_attention_runtime.warm_up()
             if getattr(self._multimodal_adapter, "bidirectional_layer_kinds", None):
                 self._log_image_block_path()
+            if self.vllm_config.speculative_config is not None:
+                self._log_verify_layout()
+
+    def _log_verify_layout(self) -> None:
+        """Say at startup which layout spec-verify windows take."""
+        mismatch = self._verify_window_mismatch()
+        if mismatch is None:
+            logger.info("Metal: spec-decode verify uses the window layout")
+        else:
+            logger.info(
+                "Metal: spec-decode verify uses the expanded per-token layout (%s)",
+                mismatch,
+            )
 
     def _log_image_block_path(self) -> None:
         """Say at startup which path image blocks take, as the forward will.
