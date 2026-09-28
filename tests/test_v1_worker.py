@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -365,3 +366,29 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.build_paged_attention_runtime(block_size=16)
+
+    def test_capacity_path_refuses_a_runtime_it_cannot_initialize(
+        self, monkeypatch
+    ) -> None:
+        # Hybrid models always take the layout-budget path; a hybrid runtime on
+        # the capacity path is a routing bug and must say so, not raise an
+        # AttributeError for the missing ``initialize``.
+        hybrid = HybridPagedAttentionRuntime.__new__(HybridPagedAttentionRuntime)
+        runner = SimpleNamespace(
+            validate_paged_attention_support=lambda: None,
+            build_paged_attention_runtime=lambda *, block_size: hybrid,
+        )
+        planner = WorkerCachePlanner(_make_worker(runner))
+        plan = SimpleNamespace(
+            block_size=16,
+            num_blocks=64,
+            per_block_bytes=1,
+            format_breakdown=lambda: "stub",
+        )
+        monkeypatch.setattr(planner, "_paged_attention_plan", lambda **_: plan)
+        monkeypatch.setattr(
+            planner, "_validate_paged_attention_plan", lambda *a, **k: None
+        )
+
+        with pytest.raises(RuntimeError, match="HybridPagedAttentionRuntime"):
+            planner.setup_paged_attention(overhead=0)

@@ -93,7 +93,8 @@ def _layout(s: Scenario) -> tuple[int, list[tuple[int, int]]]:
         pos = start + soft + 1 + TEXT_GAP  # eoi, then text
     rows = pos - s.history
     if s.rows is not None:
-        assert rows <= s.rows, (s.name, rows)
+        if rows > s.rows:
+            raise SystemExit(f"{s.name}: the layout needs {rows} rows, over {s.rows}")
         rows = s.rows
     return rows, blocks
 
@@ -148,7 +149,8 @@ def _bench(ops, s: Scenario) -> tuple[int, float, float, float, float]:
 
     def ranges():
         found = build_mm_prefix_rows(cu, [seq_len], [blocks])
-        assert found is not None
+        if found is None:
+            raise SystemExit(f"{s.name}: no query row lies inside an image block")
         return mx.array(found)
 
     def recompute_layer(q, ctx):

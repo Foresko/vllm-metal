@@ -852,6 +852,17 @@ class WorkerCachePlanner:
         backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
+        # Hybrid models always size their cache from vLLM's KV cache config
+        # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
+        # MLA runtimes, which own ``initialize``, reach this path.
+        if not isinstance(
+            backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
+        ):
+            raise RuntimeError(
+                "Paged attention: the capacity path initializes only the SDPA "
+                f"and MLA runtimes; {type(backend).__name__} sizes its cache "
+                "from vLLM's KV cache config"
+            )
         backend.initialize(plan.num_blocks)
         self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
