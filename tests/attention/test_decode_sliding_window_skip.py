@@ -8,14 +8,20 @@ that is 32x the KV traffic the layer needs, on 25 of 30 layers.  These tests
 pin the contract: results match the fp32 reference for the partitioned path
 (few query tokens), the non-partitioned path (a large decode batch), a
 window start inside a partition and inside a block, and the spec-decode
-window-mode rows; a zero window, whose block range can be empty, writes a
-zero output on both paths; and a windowed decode step over a long context
-must be several times cheaper than full attention.
+window-mode rows; and a zero window, whose block range can be empty, writes
+a zero output on both paths.
+
+The per-token reference cases run the kernel on caches whose blocks wholly
+left of the window hold NaN.  The per-token body adds every token it reads
+into the output with its softmax weight, 0 for a masked token, so a kernel
+that read those blocks, even only to mask them, would carry 0 * NaN into its
+output: a match with the reference proves the block range is bounded by the
+window.  Window mode skips V for rows whose weight is 0, so NaN would not
+reveal its reads; it takes its block range from the same first-block
+computation.
 """
 
 from __future__ import annotations
-
-import time
 
 import mlx.core as mx
 import numpy as np
@@ -103,6 +109,17 @@ def _reference(query, key_cache, value_cache, table_row, *, q_lo, seq_len, windo
     return np.einsum("hqk,khd->qhd", probs, v)
 
 
+def _nan_left_of_window(key_cache, value_cache, rows, q_positions, window):
+    """Copies of the caches with NaN in each sequence's blocks that lie wholly
+    left of its window; q_positions holds each sequence's query position."""
+    k, v = np.array(key_cache), np.array(value_cache)
+    for row, pos in zip(rows, q_positions, strict=True):
+        skipped = row[: max(0, pos - window + 1) // BLOCK]
+        k[skipped] = np.nan
+        v[skipped] = np.nan
+    return mx.array(k), mx.array(v)
+
+
 @pytest.mark.parametrize("window", [96, 1000, 1024])
 @pytest.mark.parametrize("seq_len", [1500, 4096, 4103])
 def test_partitioned_decode_with_window_matches_reference(window, seq_len) -> None:
@@ -120,10 +137,13 @@ def test_partitioned_decode_with_window_matches_reference(window, seq_len) -> No
     mx.random.seed(2)
     query = mx.random.normal((1, heads, hd)).astype(DTYPE)
     mx.eval(query)
+    nan_keys, nan_values = _nan_left_of_window(
+        key_cache, value_cache, rows, [seq_len - 1], window
+    )
     got = _kernel(
         query,
-        key_cache,
-        value_cache,
+        nan_keys,
+        nan_values,
         table,
         kv_heads=kv_heads,
         kv_lens=[seq_len],
@@ -205,11 +225,14 @@ def test_large_decode_batch_with_window_matches_reference() -> None:
     mx.random.seed(4)
     query = mx.random.normal((len(seq_lens), heads, hd)).astype(DTYPE)
     mx.eval(query)
+    nan_keys, nan_values = _nan_left_of_window(
+        key_cache, value_cache, rows, [n - 1 for n in seq_lens], window
+    )
     got = np.array(
         _kernel(
             query,
-            key_cache,
-            value_cache,
+            nan_keys,
+            nan_values,
             table,
             kv_heads=kv_heads,
             kv_lens=seq_lens,
@@ -332,38 +355,3 @@ def test_zero_window_single_pass_decode_writes_zeros() -> None:
         cu_seqlens_q=list(range(num_seqs + 1)),
     )
     np.testing.assert_array_equal(got, 0)
-
-
-def _median_seconds(fn, repeats: int = 5) -> float:
-    fn()
-    samples = []
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        fn()
-        samples.append(time.perf_counter() - t0)
-    return sorted(samples)[len(samples) // 2]
-
-
-@pytest.mark.slow
-def test_windowed_decode_reads_a_fraction_of_the_context() -> None:
-    """A decode step on a 32K context with window 1024 needs 1/32 of the KV
-    a full-attention step reads.  The mask-only kernel ran the whole context
-    and landed near 1.0x; require at least 4x."""
-    heads, kv_heads, hd, seq_len = 16, 8, 256, 32768
-    key_cache, value_cache, table, _ = _cache(
-        7, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
-    )
-    mx.random.seed(8)
-    query = mx.random.normal((1, heads, hd)).astype(DTYPE)
-    mx.eval(query)
-    common = {"kv_heads": kv_heads, "kv_lens": [seq_len], "cu_seqlens_q": [0, 1]}
-    full = _median_seconds(
-        lambda: _kernel(query, key_cache, value_cache, table, window=None, **common)
-    )
-    windowed = _median_seconds(
-        lambda: _kernel(query, key_cache, value_cache, table, window=1024, **common)
-    )
-    assert full / windowed >= 4.0, (
-        f"windowed decode {windowed * 1e3:.2f} ms vs full {full * 1e3:.2f} ms: "
-        "the block range is not bounded by the window"
-    )
