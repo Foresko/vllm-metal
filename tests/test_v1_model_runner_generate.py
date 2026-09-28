@@ -209,14 +209,25 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(RuntimeError, match="dummy forward failed"):
             runner.warm_up()
 
-    def _warm_up(self, monkeypatch: pytest.MonkeyPatch, adapter, ops) -> None:
+    def _warm_up(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        adapter,
+        ops,
+        kv_dtype: mx.Dtype = mx.bfloat16,
+    ) -> list[str]:
+        """Warm up a stub runner; returns the runner's info log lines."""
         runner = self._make_runner()
         runner._dummy_forward_outputs = Mock(return_value=[])
         runner._paged_attention_runtime = Mock()
         runner._multimodal_adapter = adapter
+        runner.kv_cache_dtype = kv_dtype
+        info = Mock()
         monkeypatch.setattr(mr, "get_ops", lambda: ops)
+        monkeypatch.setattr(mr.logger, "info", info)
         runner.warm_up()
         runner._paged_attention_runtime.warm_up.assert_called_once_with()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
 
     def test_warm_up_rejects_a_bad_mm_prefix_path_for_image_blocks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -250,7 +261,60 @@ class TestV1MetalModelRunnerGenerate:
     ) -> None:
         monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", "kernle")
 
-        self._warm_up(monkeypatch, adapter, SimpleNamespace())
+        lines = self._warm_up(monkeypatch, adapter, SimpleNamespace())
+
+        assert not any("image blocks attend" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        ("path", "kv_dtype", "supported", "expected"),
+        [
+            (
+                None,
+                mx.bfloat16,
+                True,
+                "tiled prefill kernel (VLLM_METAL_MM_PREFIX_PATH=kernel, "
+                "bfloat16 KV cache)",
+            ),
+            (
+                "recompute",
+                mx.bfloat16,
+                True,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=recompute, "
+                "bfloat16 KV cache)",
+            ),
+            (
+                None,
+                mx.float32,
+                True,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=kernel, float32 KV cache)",
+            ),
+            (
+                "kernel",
+                mx.float16,
+                False,
+                "MLX recompute (VLLM_METAL_MM_PREFIX_PATH=kernel, float16 KV cache)",
+            ),
+        ],
+        ids=["kernel", "recompute-chosen", "float32-cache", "ops-predate-mm-prefix"],
+    )
+    def test_warm_up_logs_the_path_image_blocks_take(
+        self, monkeypatch: pytest.MonkeyPatch, path, kv_dtype, supported, expected
+    ) -> None:
+        if path is None:
+            monkeypatch.delenv("VLLM_METAL_MM_PREFIX_PATH", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", path)
+        monkeypatch.setattr(mm_prefix_module, "_warn_kernel_path_unavailable", Mock())
+        adapter = SimpleNamespace(bidirectional_layer_kinds=frozenset({"sliding"}))
+        ops = (
+            SimpleNamespace(supports_mm_prefix=lambda: True)
+            if supported
+            else SimpleNamespace()
+        )
+
+        lines = self._warm_up(monkeypatch, adapter, ops, kv_dtype)
+
+        assert f"Metal: image blocks attend through the {expected}" in lines
 
 
 class TestV1MetalModelRunnerSampleTokens:

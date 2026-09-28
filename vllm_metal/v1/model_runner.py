@@ -51,7 +51,7 @@ from vllm_metal.attention.context import (
     prepare_grouped,
 )
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
-from vllm_metal.attention.impls.mm_prefix import mm_prefix_path
+from vllm_metal.attention.impls.mm_prefix import image_block_path
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
@@ -1039,9 +1039,7 @@ class MetalModelRunner:
         """Warm up the model with a dummy forward pass, then load the kernels.
 
         For a model whose image blocks attend bidirectionally, also resolve
-        the image-block attention path, so a bad ``VLLM_METAL_MM_PREFIX_PATH``
-        or a build without mm_prefix support shows at startup rather than on
-        the first image request.
+        and log the image-block attention path (``_log_image_block_path``).
         """
         if self.model is None:
             logger.warning("Model not loaded, skipping warm-up")
@@ -1056,7 +1054,24 @@ class MetalModelRunner:
         if self._paged_attention_runtime is not None:
             self._paged_attention_runtime.warm_up()
             if getattr(self._multimodal_adapter, "bidirectional_layer_kinds", None):
-                mm_prefix_path(get_ops())
+                self._log_image_block_path()
+
+    def _log_image_block_path(self) -> None:
+        """Say at startup which path image blocks take, as the forward will.
+
+        Resolving it here also fails a bad ``VLLM_METAL_MM_PREFIX_PATH`` and
+        warns about a build without mm_prefix support before the first image
+        request.
+        """
+        dtype = self.kv_cache_dtype
+        path = image_block_path(get_ops(), float32_cache=dtype == mx.float32)
+        logger.info(
+            "Metal: image blocks attend through the %s "
+            "(VLLM_METAL_MM_PREFIX_PATH=%s, %s KV cache)",
+            "tiled prefill kernel" if path == "kernel" else "MLX recompute",
+            envs.VLLM_METAL_MM_PREFIX_PATH or "kernel",
+            str(dtype).rsplit(".", 1)[-1],
+        )
 
     # ------------------------------------------------------------------
     # Unified prefill + decode (single forward pass)

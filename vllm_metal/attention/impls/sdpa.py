@@ -47,7 +47,7 @@ from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import apply_bidirectional_segments
 from vllm_metal.attention.impls.mm_prefix import (
     build_mm_prefix_rows,
-    mm_prefix_path,
+    image_block_path,
 )
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
@@ -799,10 +799,8 @@ def sdpa_forward(
         kind = "sliding" if layer_sliding_window >= 0 else "full"
         if kind in ctx.bidi_layer_kinds:
             assert ctx.cu_seqlens is not None
-            # The tiled kernel has no float32 instantiation, so float32
-            # caches keep the recompute instead of reaching the
-            # primitive's eager ValueError mid-request.
-            if mm_prefix_path(ops) == "kernel" and kernel_k_cache.dtype != mx.float32:
+            float32_cache = kernel_k_cache.dtype == mx.float32
+            if image_block_path(ops, float32_cache=float32_cache) == "kernel":
                 mm_prefix_ranges = _mm_prefix_rows(ctx)
                 if mm_prefix_ranges is not None and not ctx.bidi_logged:
                     ctx.bidi_logged = True

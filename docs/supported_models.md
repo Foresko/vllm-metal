@@ -75,7 +75,11 @@ after the kernel and logs `Metal: bidirectional image attention: N
 segment(s), M block(s), R row(s)`. Both paths give the same mask; the kernel
 path attends each row once. A native build that predates the kernel's
 `mm_prefix` support takes the recompute path instead and says so once at
-startup (`the compiled ops predate mm_prefix support`). An image block that
+startup (`the compiled ops predate mm_prefix support`); a float32 KV cache
+keeps the recompute too, since the tiled kernel has no float32 instantiation.
+At startup the engine logs which path image blocks take, for example
+`Metal: image blocks attend through the tiled prefill kernel
+(VLLM_METAL_MM_PREFIX_PATH=kernel, bfloat16 KV cache)`. An image block that
 does not fit inside one prefill
 step falls back to causal attention for the rest of the request, with a
 warning containing `falling back to causal attention`; raise

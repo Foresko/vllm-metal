@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ import vllm_metal.attention.impls.mm_prefix as mm_prefix_module
 from vllm_metal.attention.impls.mm_prefix import (
     MM_PREFIX_PATHS,
     build_mm_prefix_rows,
+    image_block_path,
     resolve_mm_prefix_path,
 )
 
@@ -135,3 +137,24 @@ def test_unknown_path_is_rejected() -> None:
     assert MM_PREFIX_PATHS == ("kernel", "recompute")
     with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
         resolve_mm_prefix_path("kernle", True)
+
+
+@pytest.mark.parametrize(
+    ("supported", "float32_cache", "expected"),
+    [(True, False, "kernel"), (True, True, "recompute"), (False, False, "recompute")],
+)
+def test_image_block_path(monkeypatch, supported, float32_cache, expected) -> None:
+    monkeypatch.delenv("VLLM_METAL_MM_PREFIX_PATH", raising=False)
+    monkeypatch.setattr(mm_prefix_module, "_warn_kernel_path_unavailable", lambda: None)
+    ops = SimpleNamespace(supports_mm_prefix=lambda: supported)
+
+    assert image_block_path(ops, float32_cache=float32_cache) == expected
+
+
+def test_image_block_path_rejects_a_bad_value_for_a_float32_cache(monkeypatch) -> None:
+    """The float32 rule applies after the value is checked, not instead of it."""
+    monkeypatch.setenv("VLLM_METAL_MM_PREFIX_PATH", "kernle")
+    ops = SimpleNamespace(supports_mm_prefix=lambda: True)
+
+    with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
+        image_block_path(ops, float32_cache=True)
