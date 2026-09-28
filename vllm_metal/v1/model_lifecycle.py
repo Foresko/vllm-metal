@@ -96,18 +96,10 @@ class GenerationLoadRequest:
         # vLLM model_config shape varies across backends.
         hf_config = getattr(model_config, "hf_config", None)
         is_vlm = bool(getattr(model_config, "is_multimodal_model", False))
-        mode_fn = getattr(model_adapter, "multimodal_backbone_mode", None)
-        if mode_fn is not None:
-            backbone_mode = mode_fn(
-                model_config,
-                speculative_config=runner.vllm_config.speculative_config,
-            )
-        else:
-            backbone_mode = (
-                "text_only"
-                if model_adapter.should_force_text_backbone(hf_config)
-                else "native"
-            )
+        backbone_mode = model_adapter.multimodal_backbone_mode(
+            model_config,
+            speculative_config=runner.vllm_config.speculative_config,
+        )
         if (
             getattr(model_config, "multimodal_config", None) is not None
             and backbone_mode == "text_only"

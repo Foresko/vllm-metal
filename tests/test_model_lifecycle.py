@@ -74,6 +74,13 @@ def _runner_model_config(**overrides: object) -> object:
     return SimpleNamespace(**values)
 
 
+def _mode_adapter(mode: str) -> SimpleNamespace:
+    """A ModelAdapter stand-in that only decides the backbone mode."""
+    return SimpleNamespace(
+        multimodal_backbone_mode=lambda model_config, speculative_config=None: mode
+    )
+
+
 _GDN_HYBRID_ARGS = {
     "model_type": "qwen3_5",
     "num_hidden_layers": 8,
@@ -221,9 +228,7 @@ class TestModelLifecycle:
                 is_multimodal_model=backend == "vlm",
             )
         )
-        request = GenerationLoadRequest.from_runner(
-            runner, SimpleNamespace(should_force_text_backbone=lambda _: False)
-        )
+        request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
 
         result = lifecycle._load_generation_model(
             request.model_name,
@@ -310,9 +315,11 @@ class TestModelLifecycle:
         calls: list[object] = []
 
         class _Adapter:
-            def should_force_text_backbone(self, config: object) -> bool:
-                calls.append(config)
-                return True
+            def multimodal_backbone_mode(
+                self, model_config: object, speculative_config: object = None
+            ) -> str:
+                calls.append(model_config)
+                return "text_only"
 
         runner = make_stub_runner(
             model_config=_runner_model_config(
@@ -329,7 +336,7 @@ class TestModelLifecycle:
         assert request.is_vlm is False
         assert request.target_dtype is not None
         assert request.tokenizer_config == {"trust_remote_code": True}
-        assert calls == [hf_config]
+        assert calls == [runner.model_config]
 
     def test_effective_multimodal_gguf_is_rejected(self) -> None:
         runner = make_stub_runner(
@@ -342,19 +349,12 @@ class TestModelLifecycle:
         )
 
         with pytest.raises(NotImplementedError, match="Multimodal GGUF"):
-            GenerationLoadRequest.from_runner(
-                runner,
-                SimpleNamespace(should_force_text_backbone=lambda _: False),
-            )
+            GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
 
     def test_model_load_request_marks_pipeline_stage_lazy(self) -> None:
         # A pipeline-parallel stage (pp.size > 1) loads weights lazily so it can
         # prune its non-owned layers before the first eval; a single-stage load
         # stays eager. lazy_weights is the typed contract the mlx_lm loader reads.
-        class _Adapter:
-            def should_force_text_backbone(self, config: object) -> bool:
-                return False
-
         class _FakeGroup:
             def __init__(self, size: int) -> None:
                 self._size = size
@@ -370,7 +370,8 @@ class TestModelLifecycle:
                 model_config=_runner_model_config(),
                 pp=pp,
             )
-            return GenerationLoadRequest.from_runner(runner, _Adapter()).lazy_weights
+            request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
+            return request.lazy_weights
 
         assert _lazy_for(None) is False
         assert _lazy_for(PipelineGroup(_FakeGroup(1))) is False
@@ -1669,14 +1670,6 @@ class TestTextSidecarLifecycle:
 
         with pytest.raises(ValueError, match="Missing parameters"):
             lifecycle.load()
-
-    def test_from_runner_without_mode_method_falls_back_to_predicate(self) -> None:
-        runner = make_stub_runner(model_config=_gemma4_runner_config())
-        request = GenerationLoadRequest.from_runner(
-            runner, SimpleNamespace(should_force_text_backbone=lambda _: True)
-        )
-        assert request.backbone_mode == "text_only"
-        assert request.is_vlm is False
 
     def test_drift_to_text_only_with_multimodal_config_kept_is_fatal(
         self, monkeypatch: pytest.MonkeyPatch

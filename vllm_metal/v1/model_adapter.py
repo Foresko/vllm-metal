@@ -178,6 +178,12 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
+      kinds (``"sliding"``, ``"full"``) on which the rows of an image block
+      attend to the whole block, not only causally.  Gemma 4 sets
+      ``{"sliding"}`` when its checkpoint asks for
+      ``use_bidirectional_attention == "vision"``; empty keeps image tokens
+      causal.
     """
 
     forward_ready: bool
