@@ -717,6 +717,17 @@ def test_ingest_chunk_size_zero_single_forward(
     assert drafts.draft_token_ids == [[20 % VOCAB_SIZE]]
 
 
+def test_bad_ingest_chunk_fails_when_the_proposer_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-integer chunk fails when the drafter is built at engine startup,
+    not on the first cold ingest mid-request, and the error names it."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1k")
+
+    with pytest.raises(ValueError, match="VLLM_METAL_SPEC_INGEST_CHUNK"):
+        _proposer(_PositionEncodingDraftModel())
+
+
 def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ingests at or below the decode threshold keep the single decode-path
     forward whatever the chunk size -- the knob only governs cold ingests."""
