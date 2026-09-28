@@ -1741,7 +1741,13 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         device float *max_logits_ptr =
             max_logits + out_row * num_heads * max_num_partitions +
             head_idx * max_num_partitions + partition_idx;
-        *max_logits_ptr = warp_m[r];
+        // The block range starts at the window of the threadgroup's first
+        // row, so a later row can read a partition that lies wholly left of
+        // its own window.  Such a row sees no unmasked key: its sum stays 0
+        // while its running max was clamped to 0 above.  Store -FLT_MAX, as
+        // the skipped-partition early return does, so the partial does not
+        // pin the reduce's global max (#837).
+        *max_logits_ptr = warp_l[r] > 0.f ? warp_m[r] : -FLT_MAX;
         device float *exp_sums_ptr = exp_sums +
                                      out_row * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions + partition_idx;
