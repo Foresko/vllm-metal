@@ -629,7 +629,7 @@ static void dispatch_paged_attention_gqa_decode(
     enc.set_threadgroup_memory_length(shmem, 0);
     bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
                             num_kv_heads, softcap, block_tables, seq_lens,
-                            cu_seqlens_q, sliding_window);
+                            cu_seqlens_q, block_size, sliding_window);
     enc.set_bytes(scale, 9);
     if (use_sinks) {
       enc.set_input_array(*sinks, 18);
@@ -660,7 +660,7 @@ static void dispatch_paged_attention_gqa_decode(
   enc.set_threadgroup_memory_length(shmem, 0);
   bind_paged_attn_buffers(enc, tmp_out, query, key_cache, value_cache,
                           num_kv_heads, softcap, block_tables, seq_lens,
-                          cu_seqlens_q, sliding_window);
+                          cu_seqlens_q, block_size, sliding_window);
   enc.set_bytes(scale, 9);
   enc.set_output_array(exp_sums, 0);
   enc.set_output_array(max_logits, 1);
