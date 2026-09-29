@@ -404,6 +404,53 @@ def test_varlen_batch_keeps_short_rows_inert(decode_path) -> None:
         )
 
 
+def test_mixed_batch_decode_rows_keep_the_per_token_kernel(
+    force_tiled_prefill,
+) -> None:
+    """A mixed batch runs its long decode rows in a decode-only dispatch over
+    the whole query (vllm-project/vllm-metal#851).  The GQA kernel maps query
+    row t to sequence t, which holds only for a pure-decode batch: the rows
+    past the decode prefix belong to the prefill sequence and would index
+    context_lens and the block table past the batch.
+    """
+    decode = _make_case(
+        kv_lens=[4096, 64, 64, 64], dtype=mx.bfloat16, seed=11, **GEMMA_FULL
+    )
+    # The prefill sequence reads its 32 keys from sequence 1's first blocks.
+    prefill_rows = 32
+    tables = np.zeros((5, decode.tables.shape[1]), dtype=np.int32)
+    tables[:4] = decode.tables
+    tables[4, :2] = decode.tables[1, :2]
+    prefill_query = np.random.default_rng(12).standard_normal(
+        (prefill_rows, GEMMA_FULL["heads"], GEMMA_FULL["hd"]), dtype=np.float32
+    )
+    query = mx.concatenate([decode.query, mx.array(prefill_query).astype(mx.bfloat16)])
+    before = _counts()
+    out = mx.array(0)
+    get_ops().paged_attention_primitive(
+        query,
+        decode.key_cache,
+        decode.value_cache,
+        decode.kv_heads,
+        512**-0.5,
+        0.0,
+        mx.array(tables),
+        mx.array(decode.kv_lens + [prefill_rows], dtype=mx.int32),
+        mx.array([0, 1, 2, 3, 4, 4 + prefill_rows], dtype=mx.int32),
+        decode.block,
+        4096,
+        -1,
+        out,
+        num_decode_requests=4,
+        num_decode_tokens=4,
+        max_decode_context_len=4096,
+    )
+    mx.eval(out)
+    assert _counts() == before
+    got = np.array(out[:4].astype(mx.float32))
+    _assert_close(got, _reference(decode, scale=512**-0.5), mx.bfloat16)
+
+
 @pytest.mark.parametrize("window", [None, 1024])
 def test_peaked_attention_pins_single_keys(decode_path, window) -> None:
     """Each head puts logit 40 on one key; a key off by one flips the row."""

@@ -822,9 +822,12 @@ static void dispatch_paged_attention_v2_online(
 
   // GQA-packed decode: pure-decode batches whose (head_size, G) is a measured
   // win (or forced) read each KV head once instead of once per query head.
-  if (!has_prefill && gqa_decode_routes(query, key_cache, num_kv_heads,
-                                        block_size, max_seq_len,
-                                        use_turboquant)) {
+  // The kernel maps query row t to sequence t over the whole query, so the
+  // decode-only dispatch of a mixed batch (decode_only_rows > 0), whose
+  // later rows belong to prefill sequences, keeps the per-token kernel.
+  if (!has_prefill && decode_only_rows == 0
+      && gqa_decode_routes(query, key_cache, num_kv_heads, block_size,
+                           max_seq_len, use_turboquant)) {
     dispatch_paged_attention_gqa_decode(
         out, query, key_cache, value_cache, num_kv_heads, scale, softcap,
         block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
