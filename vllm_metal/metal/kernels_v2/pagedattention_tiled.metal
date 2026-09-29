@@ -804,13 +804,13 @@ template <typename T, typename OUT_T, int HEAD_SIZE, int BLOCK_SIZE,
   if constexpr (PARTITIONED) {
     if (kv_first >= part_end) {
       // Every key of this partition lies left of the window: write the
-      // neutral partial paged_attention writes (max 0, sum 0, zeros), which
-      // the reduce weighs by zero.
+      // neutral partial paged_attention writes (max -FLT_MAX, sum 0, zeros),
+      // which neither carries weight nor pins the reduce's global max.
       for (int r = 0; r < valid_rows; r++) {
         const int stat = (token_idx * num_heads + head_base + r)
                          * max_num_partitions + partition_idx;
         if (thread_idx == 0) {
-          max_logits[stat] = 0.f;
+          max_logits[stat] = -FLT_MAX;
           exp_sums[stat] = 0.f;
         }
         device OUT_T *o = out + int64_t(stat) * HEAD_SIZE;
