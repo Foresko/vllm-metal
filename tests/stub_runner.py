@@ -163,6 +163,7 @@ def make_stub_runner(
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
         "_execute_model_state": None,
+        "_sample_failure": None,
         "_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,

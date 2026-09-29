@@ -454,6 +454,8 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+        # The exception a sample_tokens call raised; execute_model re-raises it.
+        self._sample_failure: Exception | None = None
 
         # Resolved in load_model by probing the output head; False until then so
         # a partially initialized runner keeps full logits.
@@ -2693,6 +2695,11 @@ class MetalModelRunner:
         asynchronously — sampling and postprocessing are deferred to
         ``sample_tokens`` so the scheduler can run while the GPU computes.
         """
+        if self._sample_failure is not None:
+            raise RuntimeError(
+                "sample_tokens failed on the previous step, so its requests "
+                "never received their sampled tokens; no further step can run"
+            ) from self._sample_failure
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if self._uses_encoder_pooling_backend():
@@ -2815,6 +2822,18 @@ class MetalModelRunner:
         On pipeline-eligible steps the sync itself is deferred one step:
         a lazy greedy sample is submitted and an async output is returned.
         """
+        try:
+            return self._sample_tokens(grammar_output)
+        except Exception as exc:
+            # Under async scheduling the engine dispatches the next
+            # execute_model before it reads this failure; that step raises it
+            # instead of running on request state the sample never updated.
+            self._sample_failure = exc
+            raise
+
+    def _sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
             # Pipeline parallelism: only the last stage holds logits and samples.

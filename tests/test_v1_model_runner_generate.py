@@ -1555,6 +1555,37 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.sampled_token_ids == []
         assert runner._execute_model_state is None
 
+    def test_step_after_a_failed_sample_raises_the_sample_error(
+        self, monkeypatch
+    ) -> None:
+        """Under async scheduling the engine dispatches the next
+        ``execute_model`` before it reads the failed ``sample_tokens`` future.
+        The failed step's requests never received their sampled tokens (a
+        finished prefill still has ``generated_tokens == 0``), so running on
+        that state builds an empty prefill segment and the engine dies with an
+        unrelated attention error.  The next step must raise the sampling
+        failure instead.
+        """
+        runner = self._make_runner()
+        runner._execute_model_state = object()
+        cause = RuntimeError("logprobs kernel failed to compile")
+
+        def fail(grammar_output):
+            raise cause
+
+        monkeypatch.setattr(runner, "_sample_paged_batch", fail)
+        with pytest.raises(RuntimeError, match="failed to compile"):
+            runner.sample_tokens(None)
+
+        monkeypatch.setattr(
+            runner,
+            "_start_paged_forward",
+            lambda *args, **kwargs: pytest.fail("the next step must not run"),
+        )
+        with pytest.raises(RuntimeError, match="sample_tokens") as info:
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
+        assert info.value.__cause__ is cause
+
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
         runner._paged_attention_runtime = SDPAPagedAttentionRuntime(
