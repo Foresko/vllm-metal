@@ -13,7 +13,7 @@ from unittest.mock import Mock
 import mlx.core as mx
 import pytest
 
-from tests.test_draft_model_proposer import _StubDraftModel
+from tests.stub_draft_model import StubDraftModel
 from vllm_metal.attention.context import get_context
 from vllm_metal.v1 import draft_model_proposer as dmp
 from vllm_metal.v1.draft_model_proposer import (
@@ -206,7 +206,7 @@ def test_build_logs_the_ingest_layout(
     monkeypatch.setattr(
         dmp,
         "_load_draft_model",
-        lambda *_: (_StubDraftModel(), dmp.DraftDims(1, 1, head_dim)),
+        lambda *_: (StubDraftModel(), dmp.DraftDims(1, 1, head_dim)),
     )
     monkeypatch.setattr(dmp, "SDPAPagedAttentionRuntime", Mock())
     info = Mock()

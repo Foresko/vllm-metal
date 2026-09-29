@@ -90,6 +90,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The ingest's head-bound reason, built once: it is read on every propose.
+_INGEST_HEAD_MISMATCH = (
+    f"the draft head size exceeds the window mode's {PA_WINDOW_MAX_HEAD_SIZE}"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DraftDims:
@@ -292,10 +297,7 @@ class DraftModelProposer:
         if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
         if not self._merge_ingest_windows:
-            return (
-                "the draft head size exceeds the window mode's "
-                f"{PA_WINDOW_MAX_HEAD_SIZE}"
-            )
+            return _INGEST_HEAD_MISMATCH
         return None
 
     def adopt_scheduler_group(

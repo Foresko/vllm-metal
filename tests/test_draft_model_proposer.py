@@ -20,6 +20,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.utils.math_utils import cdiv
 
+from tests.stub_draft_model import VOCAB_SIZE, StubDraftModel
 from vllm_metal.attention.context import OffsetCache, get_context
 from vllm_metal.v1 import draft_model_proposer
 from vllm_metal.v1.draft_model_proposer import DraftModelProposer
@@ -29,7 +30,6 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 BLOCK_SIZE = 16
 SCHEDULER_GROUP_INDEX = 0
-VOCAB_SIZE = 64
 PROMPT_LEN = 20
 
 
@@ -50,22 +50,7 @@ def test_draft_load_preserves_revision(monkeypatch, revision):
     load.assert_called_once_with("org/draft", revision=revision)
 
 
-class _StubDraftModel:
-    """mlx_lm-shaped draft model: logits per input token, recorded block tables."""
-
-    def __init__(self) -> None:
-        self.block_tables: list[list[list[int]]] = []
-        self.input_lens: list[int] = []
-
-    def __call__(self, input_ids: mx.array, *, cache: list[OffsetCache]) -> mx.array:
-        ctx = get_context()
-        assert ctx is not None
-        self.block_tables.append([list(block_ids) for block_ids in ctx.block_tables])
-        self.input_lens.append(int(input_ids.shape[1]))
-        return mx.zeros((1, int(input_ids.shape[1]), VOCAB_SIZE), dtype=mx.float32)
-
-
-class _PositionEncodingDraftModel(_StubDraftModel):
+class _PositionEncodingDraftModel(StubDraftModel):
     """Logits keyed on each row's true KV position, read from the paged
     context (per-segment RoPE offsets + cu_seqlens) -- the same position
     signal the real attention gets -- so chunk boundaries and cross-plan
@@ -118,7 +103,7 @@ class _SelectiveLogitsAdapter:
 
 
 def _proposer(
-    model: _StubDraftModel,
+    model: StubDraftModel,
     *,
     max_model_len: int = 4096,
     min_speculative_tokens: int = 1,
@@ -236,7 +221,7 @@ def _prefills_context(
 
 
 def test_propose_before_adopt_scheduler_group_raises() -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
@@ -253,7 +238,7 @@ def test_propose_before_adopt_scheduler_group_raises() -> None:
 def test_blocks_come_from_scheduler_assignment() -> None:
     """The block table is exactly what the
     scheduler assigned on RequestState.block_ids, not a proposer-owned pool."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(scheduler_block_ids=[1, 0])  # order matters
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
@@ -265,7 +250,7 @@ def test_blocks_come_from_scheduler_assignment() -> None:
 
 @pytest.mark.parametrize("k", [1, 3, 0])
 def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     # The sampled token is already in state.token_ids; K=3 writes through
     # position 31, so a third block would exceed the scheduler's reservation.
@@ -278,7 +263,7 @@ def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
 
 
 def test_missing_scheduler_lookahead_fails_before_forward() -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(scheduler_block_ids=[7], token_ids=list(range(16)))
     with pytest.raises(RuntimeError, match="scheduler supplied 1"):
@@ -293,7 +278,7 @@ def test_missing_scheduler_lookahead_fails_before_forward() -> None:
 def test_context_limit_suppresses_drafts_but_ingests_valid_prefix(
     target_end, expected_drafts, prefill
 ) -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model, max_model_len=32)
     if prefill:
         ctx = _prefills_context(
@@ -316,7 +301,7 @@ def test_context_limit_suppresses_drafts_but_ingests_valid_prefix(
 def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
     """A resubmitted/shared prefix reported via num_computed_tokens must not
     be re-ingested -- this is #482's core fix."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(
         scheduler_block_ids=[0, 1], num_computed_tokens=PROMPT_LEN - 1
@@ -328,7 +313,7 @@ def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
 
 
 def test_no_cache_hit_ingests_the_whole_committed_range() -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(scheduler_block_ids=[0, 1], num_computed_tokens=0)
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
@@ -341,7 +326,7 @@ def test_non_greedy_request_ingests_but_never_drafts() -> None:
     """Non-greedy requests must still keep the draft cache's committed KV in sync
     (the scheduler advances num_computed_tokens for them regardless), but
     must never receive draft tokens."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(
         scheduler_block_ids=[0, 1], sampling_params=SamplingParams(temperature=1.0)
@@ -356,7 +341,7 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
     """An intermediate (not-yet-final) prefill chunk must ingest its
     scheduled slice so the draft cache's committed KV stays in sync, but must not
     produce draft tokens (mirrors non-greedy: keep pace, never draft)."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     prefill = PrefillRequest(
         req_id="r1",
@@ -391,7 +376,7 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
 
 def test_eager_zero_k_still_ingests() -> None:
     """Prefix-cache mode must materialize scheduler-publishable draft KV."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     drafts = proposer.propose(
@@ -440,7 +425,7 @@ def test_lazy_zero_to_positive_k_catches_up_before_drafting() -> None:
 
 def test_lazy_positive_to_zero_k_preserves_boundary() -> None:
     """Keep the physical boundary when traced decode progress reports zero."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model, allow_deferred_zero_k_ingest=True)
 
     initial_state = _request_state(
@@ -482,7 +467,7 @@ def test_lazy_positive_to_zero_k_preserves_boundary() -> None:
 
 
 def _draft_two_rounds(
-    model: _StubDraftModel,
+    model: StubDraftModel,
     proposer: DraftModelProposer,
     *,
     second_round_tokens: list[int],
@@ -540,7 +525,7 @@ def test_full_acceptance_skips_reingest_of_drafted_kv() -> None:
     """On full acceptance the K-1 drafts whose KV the previous round's
     lookahead steps already wrote are not re-ingested: the steady-state
     K+1-token ingest shrinks to 2 rows (#482 direction 2)."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     ingest = _draft_two_rounds(
@@ -558,7 +543,7 @@ def test_rejected_draft_reingests_the_full_committed_range() -> None:
     """A rejected first draft means the committed token at that position
     differs from what the speculative KV was written with -- nothing may be
     skipped."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     ingest = _draft_two_rounds(
@@ -572,7 +557,7 @@ def test_rejected_draft_reingests_the_full_committed_range() -> None:
 
 
 def test_accepted_lookahead_kv_is_reused_across_block_boundary() -> None:
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
     ingest = _draft_two_rounds(
         model,
@@ -589,7 +574,7 @@ def test_reallocated_block_spec_kv_is_not_reused() -> None:
     """A scheduler re-allocation that swaps the committed block table's
     physical blocks (tokens still matching) must stop the walk: the
     speculative KV is not where the new table looks."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     ingest = _draft_two_rounds(
@@ -607,7 +592,7 @@ def test_partial_acceptance_never_produces_an_empty_ingest() -> None:
     """The skip is capped one short of committed_len: the last committed
     token's row must always run because its logits predict this round's
     first draft token."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     ingest = _draft_two_rounds(
@@ -623,7 +608,7 @@ def test_partial_acceptance_never_produces_an_empty_ingest() -> None:
 def test_spec_kv_ledger_cleared_on_release() -> None:
     """After release_requests, a request reusing the id cannot skip off a
     stale ledger -- its KV was never written."""
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model)
 
     state1 = _request_state(scheduler_block_ids=[0, 1])
@@ -893,7 +878,7 @@ def test_full_attention_draft_accepted() -> None:
 def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
     from vllm_metal.v1.cache_policy import ModelCachePolicy
 
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model, max_model_len=4096)
     runner = SimpleNamespace(
         _drafter=proposer,

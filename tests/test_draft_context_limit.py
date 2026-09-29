@@ -10,13 +10,13 @@ import mlx.core as mx
 import pytest
 from vllm import SamplingParams
 
+from tests.stub_draft_model import StubDraftModel
 from tests.stub_runner import make_stub_runner
 from tests.test_draft_model_proposer import (
     _context,
     _prefills_context,
     _proposer,
     _request_state,
-    _StubDraftModel,
 )
 from vllm_metal.v1 import draft_model_proposer as dmp
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -32,7 +32,7 @@ def info(monkeypatch):
 
 @pytest.mark.parametrize("prefill", [False, True])
 def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model, max_model_len=4096, min_speculative_tokens=3)
     runner = SimpleNamespace(
         _drafter=proposer,
@@ -79,7 +79,7 @@ def test_smaller_final_target_limit_logs_once_and_bounds_ingest(prefill, info):
 @pytest.mark.parametrize("deferred", [False, True])
 def test_dynamic_width_can_resume_after_temporary_context_skip(deferred, info):
     proposer = _proposer(
-        _StubDraftModel(),
+        StubDraftModel(),
         max_model_len=32,
         min_speculative_tokens=1,
         allow_deferred_zero_k_ingest=deferred,
@@ -108,7 +108,7 @@ def test_dynamic_width_can_resume_after_temporary_context_skip(deferred, info):
 
 
 def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(info):
-    model = _StubDraftModel()
+    model = StubDraftModel()
     proposer = _proposer(model, max_model_len=32, min_speculative_tokens=3)
     proposer.adopt_scheduler_group(0, 4096)
     ctx = _prefills_context(
@@ -132,7 +132,7 @@ def test_initial_prefill_fallback_is_per_request_and_keeps_other_rows_drafting(i
 
 @pytest.mark.parametrize("mode", ["non_greedy", "no_sample", "intermediate"])
 def test_other_eligibility_gates_do_not_log_context_fallback(mode, info):
-    proposer = _proposer(_StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
+    proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
     if mode == "non_greedy":
@@ -152,7 +152,7 @@ def test_other_eligibility_gates_do_not_log_context_fallback(mode, info):
 
 @pytest.mark.parametrize("finish", ["explicit", "pruned"])
 def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
-    proposer = _proposer(_StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
+    proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     state = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     ctx = _context("r", state, {"r": state}, num_speculative_tokens=3)
     assert proposer.propose(ctx) is None
@@ -185,7 +185,7 @@ def test_log_survives_recompute_but_not_request_id_reuse(finish, info):
 
 @pytest.mark.parametrize("keep_old_state", [False, True])
 def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info):
-    proposer = _proposer(_StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
+    proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     old = _request_state(scheduler_block_ids=[0, 1], token_ids=list(range(31)))
     assert (
         proposer.propose(_context("r", old, {"r": old}, num_speculative_tokens=3))
@@ -222,7 +222,7 @@ def test_request_id_reuse_after_cleanup_without_a_proposal(keep_old_state, info)
 def test_build_uses_reachable_scheduler_widths(
     schedule, max_num_seqs, k, logs, monkeypatch, info
 ):
-    model = _StubDraftModel()
+    model = StubDraftModel()
     monkeypatch.setattr(
         dmp, "_load_draft_model", lambda *_: (model, dmp.DraftDims(1, 1, 64))
     )
