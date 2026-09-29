@@ -8,6 +8,7 @@ diagnosable.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator, Mapping
@@ -1012,8 +1013,8 @@ _REPLAY_TAIL_PATCHED_ATTR = "_vllm_metal_replay_tail_patched"
 def _patch_vllm_sliding_window_replay_tail() -> None:
     """Retain one extra alignment block below every reachable boundary.
 
-    With ``prefix_cache_retention_interval`` 0 or positive (vLLM 0.29 defaults
-    to 0), a sliding-window group keeps only the window-sized run of blocks
+    With ``prefix_cache_retention_interval`` 0 or positive (the vLLM default
+    is 0), a sliding-window group keeps only the window-sized run of blocks
     that ends at a prompt's replay boundary, aligned down to the hybrid
     alignment (32 tokens for Gemma 4: full-attention blocks of 32, sliding
     blocks of 16).  A later request that diverges inside that last aligned
@@ -1110,30 +1111,25 @@ def _apply_replay_tail_patch(module: Any) -> None:
     if getattr(cls, _REPLAY_TAIL_PATCHED_ATTR, False):
         return
     original = cls.reachable_block_mask.__func__
+    # vLLM passes every argument by keyword and adds new ones between releases
+    # (0.30: dcp_world_size, final_segment_end_block), so the wrapper forwards
+    # them untouched and reads the ones it needs from the bound signature.
+    signature = inspect.signature(original)
 
-    def reachable_block_mask(
-        klass,
-        start_block,
-        end_block,
-        alignment_tokens,
-        kv_cache_spec,
-        use_eagle,
-        retention_interval=None,
-        reachable_boundaries=(),
-    ):
-        mask = original(
-            klass,
-            start_block,
-            end_block,
-            alignment_tokens,
-            kv_cache_spec,
-            use_eagle,
-            retention_interval,
-            reachable_boundaries,
-        )
+    def reachable_block_mask(klass, *args, **kwargs):
+        mask = original(klass, *args, **kwargs)
+        bound = signature.bind(klass, *args, **kwargs)
+        bound.apply_defaults()
+        arg = bound.arguments
+        retention_interval = arg["retention_interval"]
+        reachable_boundaries = arg["reachable_boundaries"]
         if mask is None or retention_interval is None or not reachable_boundaries:
             return mask
-        block_size = kv_cache_spec.block_size
+        start_block, end_block = arg["start_block"], arg["end_block"]
+        alignment_tokens = arg["alignment_tokens"]
+        kv_cache_spec, use_eagle = arg["kv_cache_spec"], arg["use_eagle"]
+        # vLLM 0.30 scales the mask's block by the decode-context-parallel size.
+        block_size = kv_cache_spec.block_size * arg.get("dcp_world_size", 1)
         need = klass._contiguous_blocks_for_hit(
             window_size=kv_cache_spec.sliding_window,
             block_size=block_size,
