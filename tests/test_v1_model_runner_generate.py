@@ -2447,12 +2447,12 @@ class TestVerifyLayoutLog:
             (
                 "1",
                 {"model_args": {"kv_lora_rank": 512}},
-                "MLA decode takes one-row segments",
+                "window mode does not support MLA models",
             ),
             (
                 "1",
                 {"is_hybrid": True},
-                "the hybrid decode check takes one-row segments",
+                "window mode does not support hybrid models",
             ),
             (
                 "1",
@@ -2463,7 +2463,7 @@ class TestVerifyLayoutLog:
                         is_hybrid=False,
                     )
                 },
-                "head size 512 exceeds 256",
+                "head size 512 exceeds the window mode's 256",
             ),
         ],
         ids=["off", "mla", "hybrid", "head-size"],

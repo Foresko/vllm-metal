@@ -532,15 +532,18 @@ class MetalModelRunner:
         if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
             return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
         if self.is_mla:
-            return "MLA decode takes one-row segments"
+            return "window mode does not support MLA models"
         if self.is_hybrid:
-            return "the hybrid decode check takes one-row segments"
+            return "window mode does not support hybrid models"
         head_dims = self.head_dim_per_layer
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
         if max_head_dim > PA_WINDOW_MAX_HEAD_SIZE:
-            return f"head size {max_head_dim} exceeds {PA_WINDOW_MAX_HEAD_SIZE}"
+            return (
+                f"head size {max_head_dim} exceeds the window mode's "
+                f"{PA_WINDOW_MAX_HEAD_SIZE}"
+            )
         return None
 
     @property

@@ -62,9 +62,9 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
             if isinstance(attn, MLAPagedAttentionWrapper):
                 # Already patched — refresh cache reference in place.
                 object.__setattr__(attn, "_mla_latent_cache", latent_cache)
-                wrappers.append(attn)
-                return attn
-            wrapper = MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
+                wrapper = attn
+            else:
+                wrapper = MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
             wrappers.append(wrapper)
             return wrapper
 
@@ -77,16 +77,19 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._log_decode_path()
 
     def _log_decode_path(self) -> None:
-        """Say at startup whether decode takes the single-pass kernel."""
+        """Say at startup whether decode-only batches take the single-pass kernel."""
         mismatches = [w.decode_kernel_mismatch() for w in self._wrappers]
         if not mismatches:
             return
         on_sdpa = [m for m in mismatches if m is not None]
         if not on_sdpa:
-            logger.info("Metal: MLA decode uses the single-pass Metal kernel")
+            logger.info(
+                "Metal: MLA decode-only batches take the single-pass Metal kernel"
+            )
             return
         logger.info(
-            "Metal: MLA decode uses the MLX SDPA path on %d of %d layers (%s)",
+            "Metal: MLA decode-only batches take the MLX SDPA path on %d of %d "
+            "layers (%s)",
             len(on_sdpa),
             len(mismatches),
             "; ".join(sorted(set(on_sdpa))),

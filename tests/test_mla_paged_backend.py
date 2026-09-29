@@ -611,6 +611,7 @@ class TestDecodePathLog:
         *,
         kernel_env: bool,
         kv_lora_rank: int = _KERNEL_KV_RANK,
+        patches: int = 1,
     ) -> list[str]:
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", kernel_env)
         inners = [_KernelDimsAbsorbedInner() for _ in range(2)]
@@ -625,7 +626,8 @@ class TestDecodePathLog:
             dtype=mx.float16,
         )
         backend.initialize(4)
-        backend.patch_model(model)
+        for _ in range(patches):
+            backend.patch_model(model)
         info = MagicMock()
         monkeypatch.setattr(mla_runtime.logger, "info", info)
         backend.warm_up()
@@ -634,13 +636,23 @@ class TestDecodePathLog:
     def test_logs_the_kernel(self, monkeypatch) -> None:
         lines = self._warm_up(monkeypatch, kernel_env=True)
 
-        assert "Metal: MLA decode uses the single-pass Metal kernel" in lines
+        assert "Metal: MLA decode-only batches take the single-pass Metal kernel" in (
+            lines
+        )
 
     def test_logs_the_env_switch_when_off(self, monkeypatch) -> None:
         lines = self._warm_up(monkeypatch, kernel_env=False)
 
         assert (
-            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
+            "(VLLM_METAL_MLA_KERNEL is off)"
+        ) in lines
+
+    def test_a_repatch_counts_each_layer_once(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, kernel_env=False, patches=2)
+
+        assert (
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
             "(VLLM_METAL_MLA_KERNEL is off)"
         ) in lines
 
@@ -648,7 +660,7 @@ class TestDecodePathLog:
         lines = self._warm_up(monkeypatch, kernel_env=True, kv_lora_rank=256)
 
         assert (
-            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
             "(kv_lora_rank 256, the kernel takes 512)"
         ) in lines
 
