@@ -8,7 +8,6 @@ import re
 import pytest
 
 import vllm_metal.envs as envs
-from vllm_metal.config import VALID_MULTIMODAL_MODES
 
 
 @pytest.mark.parametrize(
@@ -29,6 +28,18 @@ from vllm_metal.config import VALID_MULTIMODAL_MODES
             "VLLM_METAL_RING_BASE_PORT",
             "port",
             "VLLM_METAL_RING_BASE_PORT must be an integer, got 'port'",
+        ),
+        (
+            "VLLM_METAL_RING_BASE_PORT",
+            "1023",
+            "VLLM_METAL_RING_BASE_PORT must be in [1024, 65535] "
+            "(the user-port range), got 1023",
+        ),
+        (
+            "VLLM_METAL_RING_BASE_PORT",
+            "65536",
+            "VLLM_METAL_RING_BASE_PORT must be in [1024, 65535] "
+            "(the user-port range), got 65536",
         ),
         (
             "VLLM_METAL_MM_PREFIX_PATH",
@@ -63,6 +74,8 @@ def test_a_bad_value_names_the_variable_and_the_value(
         ("VLLM_METAL_SPEC_INGEST_CHUNK", "0", 0),
         ("VLLM_METAL_SPEC_INGEST_CHUNK", "16", 16),
         ("VLLM_METAL_RING_BASE_PORT", "40000", 40000),
+        ("VLLM_METAL_RING_BASE_PORT", "1024", 1024),
+        ("VLLM_METAL_RING_BASE_PORT", "65535", 65535),
         ("VLLM_METAL_MM_PREFIX_PATH", "recompute", "recompute"),
         ("VLLM_METAL_MULTIMODAL_MODE", "text-only", "text-only"),
         ("VLLM_MLX_DEVICE", "cpu", "cpu"),
@@ -74,10 +87,6 @@ def test_a_good_value_parses(
     monkeypatch.setenv(name, value)
 
     assert getattr(envs, name) == expected
-
-
-def test_multimodal_modes_match_the_config() -> None:
-    assert set(envs.MULTIMODAL_MODES) == VALID_MULTIMODAL_MODES
 
 
 def test_validate_environment_accepts_the_defaults(

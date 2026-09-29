@@ -12,6 +12,7 @@ real scheduler.
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -729,7 +730,9 @@ def test_bad_ingest_chunk_fails_when_the_proposer_is_built(
     names it.  Only ``0`` means single-forward ingest."""
     monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", value)
 
-    with pytest.raises(ValueError, match=f"VLLM_METAL_SPEC_INGEST_CHUNK {message}"):
+    with pytest.raises(
+        ValueError, match=re.escape(f"VLLM_METAL_SPEC_INGEST_CHUNK {message}")
+    ):
         _proposer(_PositionEncodingDraftModel())
 
 

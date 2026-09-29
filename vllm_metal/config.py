@@ -22,9 +22,7 @@ TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
 )
 
 MultimodalMode = Literal["auto", "multimodal-native", "text-only"]
-VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
-    {"auto", "multimodal-native", "text-only"}
-)
+VALID_MULTIMODAL_MODES: frozenset[str] = frozenset(envs.MULTIMODAL_MODES)
 
 
 @dataclass

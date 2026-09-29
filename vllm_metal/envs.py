@@ -45,7 +45,12 @@ def _choice(
 
 
 def _int(
-    name: str, default: int, *, minimum: int | None = None, note: str = ""
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    note: str = "",
 ) -> Callable[[], int]:
     """An integer variable; a bad value names the variable and the value."""
 
@@ -57,8 +62,16 @@ def _int(
             value = int(raw)
         except ValueError:
             raise ValueError(f"{name} must be an integer, got {raw!r}") from None
-        if minimum is not None and value < minimum:
-            raise ValueError(f"{name} must be at least {minimum}{note}, got {value}")
+        too_low = minimum is not None and value < minimum
+        too_high = maximum is not None and value > maximum
+        if too_low or too_high:
+            if maximum is None:
+                bound = f"at least {minimum}"
+            elif minimum is None:
+                bound = f"at most {maximum}"
+            else:
+                bound = f"in [{minimum}, {maximum}]"
+            raise ValueError(f"{name} must be {bound}{note}, got {value}")
         return value
 
     return parse
@@ -180,18 +193,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage r binds base + r (default 32323/32324 for two stages). Set the same
     # value on every node to move the ring off a busy port. Default matches
     # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
-    "VLLM_METAL_RING_BASE_PORT": _int("VLLM_METAL_RING_BASE_PORT", 32323),
+    "VLLM_METAL_RING_BASE_PORT": _int(
+        "VLLM_METAL_RING_BASE_PORT",
+        32323,
+        minimum=1024,
+        maximum=65535,
+        note=" (the user-port range)",
+    ),
 }
 
 
 def validate_environment() -> None:
     """Parse every variable once and report all bad values together."""
     errors = []
-    for parse in environment_variables.values():
+    for name, parse in environment_variables.items():
         try:
             parse()
         except ValueError as exc:
-            errors.append(str(exc))
+            message = str(exc)
+            errors.append(message if name in message else f"{name}: {message}")
     if errors:
         raise ValueError("Invalid vllm-metal environment: " + "; ".join(errors))
 
