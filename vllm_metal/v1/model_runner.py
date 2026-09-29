@@ -454,8 +454,9 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
-        # The exception a sample_tokens call raised; execute_model re-raises it.
-        self._sample_failure: Exception | None = None
+        # What a failed sample_tokens call raised (type and message); the next
+        # execute_model raises on it.
+        self._sample_failure: str | None = None
 
         # Resolved in load_model by probing the output head; False until then so
         # a partially initialized runner keeps full logits.
@@ -2709,9 +2710,10 @@ class MetalModelRunner:
         """
         if self._sample_failure is not None:
             raise RuntimeError(
-                "sample_tokens failed on the previous step, so its requests "
-                "never received their sampled tokens; no further step can run"
-            ) from self._sample_failure
+                f"sample_tokens failed on the previous step ({self._sample_failure}), "
+                "so its requests never received their sampled tokens; no further "
+                "step can run"
+            )
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if self._uses_encoder_pooling_backend():
@@ -2840,7 +2842,11 @@ class MetalModelRunner:
             # Under async scheduling the engine dispatches the next
             # execute_model before it reads this failure; that step raises it
             # instead of running on request state the sample never updated.
-            self._sample_failure = exc
+            # Keep what failed, not the exception: its traceback holds the
+            # failed step's frames, and stripping it (``with_traceback(None)``)
+            # would also strip the traceback of the exception re-raised below,
+            # which is the one the engine reports.
+            self._sample_failure = f"{type(exc).__name__}: {exc}"
             raise
 
     def _sample_tokens(
