@@ -342,6 +342,68 @@ def test_window_mode_row_with_fully_masked_partition_stays_neutral(
     np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.parametrize("magnitude", [1.5, 2.0, 4.0])
+def test_window_mode_row_with_fully_masked_block_stays_neutral(
+    magnitude,
+) -> None:
+    """One level below the fully masked partition: window mode reads blocks
+    from the window start of the threadgroup's first row, so a block can be
+    scanned for an earlier row while lying wholly left of a later row's
+    window, inside a partition that still holds real keys for it.  That
+    block's -FLT_MAX max must not clamp the row's running max to 0: every
+    later in-window key would then be weighted by exp2(score) instead of
+    exp2(score - max), collapsing rows whose real scores are far below 0
+    (#875).
+
+    seq_len 1506 puts row 0's window start on the last token of a block
+    (window start mod BLOCK == BLOCK - 1), so that block is read for row 0
+    and fully masked for row 1.  Scores as in
+    test_partitioned_window_with_strongly_negative_scores."""
+    heads, kv_heads, hd = 4, 2, 64
+    window, q_len = 96, 2 * PA_WINDOW_ROWS
+    seq_len = 1506
+    ops = get_ops()
+    # The kernel masks token_idx < row_context_len - window with
+    # row_context_len = (seq_len - q_len + 1) + r, so row 0's window starts
+    # at 1503 - 96 = 1407, the last token of a 16-token block: that block is
+    # scanned for row 0 and fully masked for row 1.
+    row0_win_start = (seq_len - q_len + 1) - window
+    assert row0_win_start % BLOCK == BLOCK - 1
+    assert PA_WINDOW_ROWS >= 2
+    assert heads * q_len < ops.min_decode_grid()
+    assert seq_len > ops.PARTITION_SIZE
+    key_cache, value_cache, table, rows = _cache(
+        1, seq_lens=[seq_len], kv_heads=kv_heads, hd=hd
+    )
+    mx.random.seed(3)
+    query = (mx.ones((q_len, heads, hd)) * magnitude).astype(DTYPE)
+    key_cache = (
+        -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
+    ).astype(DTYPE)
+    mx.eval(query, key_cache)
+    got = _kernel(
+        query,
+        key_cache,
+        value_cache,
+        table,
+        kv_heads=kv_heads,
+        kv_lens=[seq_len],
+        cu_seqlens_q=[0, q_len],
+        window=window,
+        window_seqlen_q=q_len,
+    )
+    ref = _reference(
+        query,
+        key_cache,
+        value_cache,
+        rows[0],
+        q_lo=seq_len - q_len,
+        seq_len=seq_len,
+        window=window,
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+
+
 def _zero_window_output(query, key_cache, value_cache, table, **common):
     """Decode with sliding_window == 0, which masks every key: the neutral
     result is a zero output.  A full-attention call of the same shape runs

@@ -241,7 +241,7 @@ class DraftModelProposer:
                 schedule, max_num_seqs, speculative_config.num_speculative_tokens
             )
             min_speculative_tokens = min((k for k in widths[1:] if k > 0), default=0)
-        return cls(
+        proposer = cls(
             model=model,
             block_size=block_size,
             max_model_len=max_model_len,
@@ -260,6 +260,33 @@ class DraftModelProposer:
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
             allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
         )
+        mismatch = proposer._ingest_window_mismatch()
+        if mismatch is None:
+            logger.info(
+                "Metal: draft-model committed-token ingest uses the window layout"
+            )
+        else:
+            logger.info(
+                "Metal: draft-model committed-token ingest uses the expanded "
+                "per-token layout (%s)",
+                mismatch,
+            )
+        return proposer
+
+    def _ingest_window_mismatch(self) -> str | None:
+        """Why committed-token ingest stays expanded, or ``None`` when it merges.
+
+        The same switch as the target's verify windows, read per call; the
+        structural half is the head bound resolved in ``build``.
+        """
+        if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
+            return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
+        if not self._merge_ingest_windows:
+            return (
+                "the draft head size exceeds the window mode's "
+                f"{PA_WINDOW_MAX_HEAD_SIZE}"
+            )
+        return None
 
     def adopt_scheduler_group(
         self, group_index: int, target_max_model_len: int
@@ -684,8 +711,7 @@ class DraftModelProposer:
                 decode_specs,
                 [],
                 self._block_size,
-                merge_verify_windows=self._merge_ingest_windows
-                and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
+                merge_verify_windows=self._ingest_window_mismatch() is None,
             )
             try:
                 last = self._project_ingest_rows(

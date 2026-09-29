@@ -2,8 +2,8 @@
 """Sampling-step microbench for the torch path and native MLX graph.
 
 Times one non-greedy sampling step over a Qwen-sized vocabulary. The torch arm
-includes MLX evaluation, torch bridging, min-p, top-k/top-p, and categorical
-sampling. The native arm times the equivalent ``SamplingBatch`` graph.
+includes MLX evaluation, torch bridging, temperature, min-p, top-k/top-p, and
+categorical sampling. The native arm times the equivalent ``SamplingBatch`` graph.
 
 Usage:
 
@@ -24,6 +24,7 @@ from vllm_metal.v1.logits_processors import BatchMinPLogitsProcessor
 from vllm_metal.v1.sampling_batch import SamplingBatch
 
 VOCAB_SIZE = 151936
+TEMPERATURE = 0.7
 TOP_K = 20
 TOP_P = 0.95
 MIN_P = 0.05
@@ -38,6 +39,7 @@ def _time_torch(logits_mx: mx.array, batch: int) -> float:
         logits_f32 = logits_mx.astype(mx.float32)
         mx.eval(logits_f32)
         logits = mlx_to_torch(logits_f32, device="cpu").clone()
+        logits.div_(TEMPERATURE)
         filtered = apply_top_k_top_p(
             min_p_proc.apply(logits),
             torch.full((batch,), TOP_K),
@@ -75,7 +77,7 @@ def _time_native(logits: mx.array, params: list[SamplingParams]) -> float:
 
 def main() -> None:
     sampling_params = SamplingParams(
-        temperature=0.7, top_k=TOP_K, top_p=TOP_P, min_p=MIN_P
+        temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P, min_p=MIN_P
     )
     for batch in (1, 8):
         logits_mx = mx.random.normal((batch, VOCAB_SIZE), key=mx.random.key(0))

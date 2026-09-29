@@ -7,6 +7,7 @@ import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import pytest
 import torch
 
@@ -24,6 +25,7 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
 
 from tests.stub_runner import make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
@@ -277,6 +279,80 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize("length,sequences", [(512, 1), (4096, 4), (131072, 1)])
+    def test_tq_auto_reservation_covers_history_and_stays_fixed(
+        self, monkeypatch, length, sequences
+    ) -> None:
+        from vllm_metal.attention.caches.turboquant import prefill_workspace_bytes
+
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", "1")
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(mlx_device="gpu", turboquant=True),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=sequences, max_num_batched_tokens=sequences * 128
+            ),
+        )
+        # vLLM resolves the model limit before planning even for --max-model-len=-1.
+        runner.model_config.original_max_model_len = -1
+        runner.model_config.max_model_len = length
+        runner.model_config.get_num_attention_heads = lambda _: 8
+        allowance = runner.tq_prefill_workspace_bytes
+        # All independent histories can be read by this step, even though its
+        # new-token budget is far smaller than their combined context length.
+        assert allowance >= sequences * length * 2 * 2 * 128 * 2
+        assert allowance < prefill_workspace_bytes()
+
+        planner = self._make_planner(runner, gpu_memory_utilization=0.5)
+        monkeypatch.setattr(WorkerCachePlanner, "_metal_limit_bytes", lambda _: 10**10)
+        monkeypatch.setattr(WorkerCachePlanner, "get_model_memory_usage", lambda _: 0)
+        # A later auto-fit shrinks the config, not the already reserved workspace.
+        runner.model_config.max_model_len = length // 2
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "0")
+        assert runner.tq_prefill_workspace_bytes == allowance
+        plan = planner._paged_attention_plan(overhead=0)
+        assert plan.overhead == allowance
+        assert plan.kv_budget == 5 * 10**9 - allowance
+
+    @pytest.mark.parametrize(
+        "turboquant,mode,expected_mib",
+        [(True, "1", 64), (True, "0", 0), (False, "1", 0)],
+    )
+    def test_tq_workspace_is_reserved_inside_memory_fraction(
+        self, monkeypatch, turboquant, mode, expected_mib
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
+        monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", "64")
+        monkeypatch.setattr(
+            "vllm_metal.v1.cache_policy.get_config",
+            lambda: MetalConfig(mlx_device="gpu", turboquant=turboquant),
+        )
+        runner = make_stub_runner(
+            num_kv_heads=2,
+            head_dim=128,
+            kv_cache_dtype=mx.bfloat16,
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=4, max_num_batched_tokens=2048
+            ),
+        )
+        runner.model_config.get_num_attention_heads = lambda _: 8
+        planner = self._make_planner(runner, gpu_memory_utilization=0.5)
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 2_000_000_000
+        )
+        plan = planner._paged_attention_plan(overhead=100_000_000)
+        assert plan.kv_budget == 2_900_000_000 - expected_mib * 2**20
+        assert plan.overhead == 100_000_000 + expected_mib * 2**20
+
     def _make_planner(
         self,
         model_runner: object,
@@ -365,3 +441,29 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.build_paged_attention_runtime(block_size=16)
+
+    def test_capacity_path_refuses_a_runtime_it_cannot_initialize(
+        self, monkeypatch
+    ) -> None:
+        # Hybrid models always take the layout-budget path; a hybrid runtime on
+        # the capacity path is a routing bug and must say so, not raise an
+        # AttributeError for the missing ``initialize``.
+        hybrid = HybridPagedAttentionRuntime.__new__(HybridPagedAttentionRuntime)
+        runner = SimpleNamespace(
+            validate_paged_attention_support=lambda: None,
+            build_paged_attention_runtime=lambda *, block_size: hybrid,
+        )
+        planner = WorkerCachePlanner(_make_worker(runner))
+        plan = SimpleNamespace(
+            block_size=16,
+            num_blocks=64,
+            per_block_bytes=1,
+            format_breakdown=lambda: "stub",
+        )
+        monkeypatch.setattr(planner, "_paged_attention_plan", lambda **_: plan)
+        monkeypatch.setattr(
+            planner, "_validate_paged_attention_plan", lambda *a, **k: None
+        )
+
+        with pytest.raises(RuntimeError, match="HybridPagedAttentionRuntime"):
+            planner.setup_paged_attention(overhead=0)

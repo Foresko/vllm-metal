@@ -3,8 +3,21 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import mlx.core as mx
 import numpy as np
+
+
+def package_versions(*names: str) -> dict[str, str | None]:
+    """Record versions without requiring every distribution to be installed."""
+    versions: dict[str, str | None] = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
 
 
 def ref_paged_attn(

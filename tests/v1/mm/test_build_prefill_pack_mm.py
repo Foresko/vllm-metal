@@ -107,6 +107,9 @@ class TestBuildPrefillPackMmFullPrompt:
         assert pack[0].full_prompt_token_ids is None
 
     def test_mm_start_pos_zero_uses_state_token_ids(self) -> None:
+        # A resumed request re-prefills prompt and generated tokens alike, so
+        # the pack carries the whole sequence and consumers split it at
+        # prompt_len.
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner.encoder_cache.add_request("req-0", [_feature("img-0")])
         runner._request_states["req-0"] = RequestState(
@@ -121,7 +124,26 @@ class TestBuildPrefillPackMmFullPrompt:
 
         pack = runner._build_prefill_pack(batch)
 
-        assert pack[0].full_prompt_token_ids == [1, 99, 99, 2]
+        assert pack[0].full_prompt_token_ids == [1, 99, 99, 2, 3, 4]
+
+    def test_resumed_text_request_keeps_generated_tokens(self) -> None:
+        runner = make_stub_runner(encoder_cache=EncoderCache())
+        runner._request_states["req-0"] = RequestState(
+            token_ids=[1, 2, 3, 9, 8],  # 3 prompt + 2 generated
+            prompt_len=3,
+            sampling_params=SamplingParams(frequency_penalty=1.0),
+        )
+        entry = _make_prefill_entry(
+            "req-0", token_ids=[3, 9, 8], prompt_len=3, start_pos=2
+        )
+        batch = self._make_batch([entry], [])
+
+        pack = runner._build_prefill_pack(batch)
+
+        full = pack[0].full_prompt_token_ids
+        assert full == [1, 2, 3, 9, 8]
+        assert full[: pack[0].prompt_len] == [1, 2, 3]
+        assert full[pack[0].prompt_len :] == [9, 8]
 
     def test_mm_start_pos_zero_falls_back_to_new_req(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
@@ -154,8 +176,7 @@ class TestBuildPrefillPackMmFullPrompt:
         with pytest.raises(RuntimeError, match="scheduler contract bug"):
             runner._build_prefill_pack(batch)
 
-    def test_text_only_continuation_chunk_still_uses_full_prompt(self) -> None:
-        # Regression guard: ``start_pos > 0`` text path unchanged.
+    def test_text_only_continuation_chunk_carries_the_whole_sequence(self) -> None:
         runner = make_stub_runner(encoder_cache=EncoderCache())
         runner._request_states["req-0"] = RequestState(
             token_ids=[1, 2, 3, 4, 5, 6, 7],
@@ -169,4 +190,4 @@ class TestBuildPrefillPackMmFullPrompt:
 
         pack = runner._build_prefill_pack(batch)
 
-        assert pack[0].full_prompt_token_ids == [1, 2, 3, 4, 5]
+        assert pack[0].full_prompt_token_ids == [1, 2, 3, 4, 5, 6, 7]

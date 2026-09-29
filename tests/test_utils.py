@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for shared Metal utilities."""
 
+import importlib.metadata
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -8,7 +9,22 @@ from unittest.mock import Mock
 import mlx.core as mx
 import pytest
 
+from tools.attention_bench_utils import package_versions
 from vllm_metal.utils import get_model_download_path, set_wired_limit
+
+
+def test_benchmark_versions_allow_missing_distributions(monkeypatch):
+    def version(name):
+        if name == "optional":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return "1.0"
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    assert package_versions("installed", "optional", "another") == {
+        "installed": "1.0",
+        "optional": None,
+        "another": "1.0",
+    }
 
 
 @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])

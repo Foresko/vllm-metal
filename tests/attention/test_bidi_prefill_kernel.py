@@ -506,3 +506,50 @@ def test_two_segments_with_blocks_are_spliced_independently() -> None:
     assert ctx.bidi_logged is True
     assert len(records) == 1
     assert "2 segment(s), 2 block(s), 110 row(s)" in records[0].getMessage()
+
+
+@pytest.mark.parametrize("magnitude", [1.5, 2.0, 4.0])
+def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
+    magnitude,
+) -> None:
+    """The KV tile loop starts at the tile holding the window of the
+    threadgroup's first row, so a row far enough behind it sees that whole
+    first tile masked.  Its -INFINITY row max must not clamp the running
+    max to 0: later in-window keys would be weighted by exp2(score) instead
+    of exp2(score - max), collapsing rows whose real scores are far below 0
+    (#876).
+
+    64 rows span two BQ-row threadgroups (BQ == TILE_KV at HD == 64).
+    seq_len 216 puts row 0's window start at key 57 == 25 mod TILE_KV, so
+    the last 25 rows of each threadgroup see the first scanned tile fully
+    masked.  q = a*ones and k = -a*ones + noise put every in-window scaled
+    score near -8*a*a.
+    """
+    n, seq_len, window = 64, 216, 96
+    cfg = get_ops().tile_config(HD)
+    assert cfg is not None
+    bq, tile_kv = cfg
+    assert n == 2 * bq
+    row0_win_start = (seq_len - n) + 1 - window
+    assert row0_win_start % tile_kv == 25
+    key_cache, value_cache, _, table = _setup(0, n=n, seq_len=seq_len)
+    mx.random.seed(3)
+    query = (mx.ones((n, HEADS, HD)) * magnitude).astype(DTYPE)
+    key_cache = (
+        -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
+    ).astype(DTYPE)
+    mx.eval(query, key_cache)
+    got = _kernel(
+        query, key_cache, value_cache, table, n=n, seq_len=seq_len, window=window
+    )
+    table_row = list(range(1, (seq_len + BLOCK - 1) // BLOCK + 1))
+    qi = np.arange(seq_len - n, seq_len)[:, None]
+    ki = np.arange(seq_len)[None, :]
+    mask = (ki <= qi) & (qi - ki < window)
+    ref = _ref_attention(
+        np.array(query.astype(mx.float32)),
+        _rows(key_cache, table_row, 0, seq_len),
+        _rows(value_cache, table_row, 0, seq_len),
+        mask,
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)

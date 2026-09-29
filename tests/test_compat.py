@@ -168,6 +168,39 @@ class TestByteLevelTokenizerCompatPatch:
         assert tokenizer.max_chars_per_token >= len("\u0120Hello")
         assert compat._loaded_tokenizer_decoder_uses_bytelevel(tokenizer)
 
+    def test_patch_reaches_modules_that_imported_the_registry_names(self) -> None:
+        import types
+
+        import vllm.tokenizers as tokenizers_pkg
+        import vllm.tokenizers.registry as tokenizer_registry
+
+        original_get_tokenizer = tokenizer_registry.get_tokenizer
+        caller = types.ModuleType("vllm.fake_tokenizer_caller")
+        caller.get_tokenizer = tokenizer_registry.get_tokenizer
+        caller.cached_get_tokenizer = tokenizer_registry.cached_get_tokenizer
+        caller.renamed = tokenizer_registry.get_tokenizer
+        outsider = types.ModuleType("vllm_other.fake_tokenizer_caller")
+        outsider.get_tokenizer = tokenizer_registry.get_tokenizer
+        sys.modules[caller.__name__] = caller
+        sys.modules[outsider.__name__] = outsider
+        try:
+            compat.ensure_vllm_bytelevel_tokenizer_patch()
+
+            assert tokenizers_pkg.get_tokenizer is tokenizer_registry.get_tokenizer
+            assert (
+                tokenizers_pkg.cached_get_tokenizer
+                is tokenizer_registry.cached_get_tokenizer
+            )
+            assert caller.get_tokenizer is tokenizer_registry.get_tokenizer
+            assert (
+                caller.cached_get_tokenizer is tokenizer_registry.cached_get_tokenizer
+            )
+            assert caller.renamed is tokenizer_registry.get_tokenizer
+            assert outsider.get_tokenizer is original_get_tokenizer
+        finally:
+            del sys.modules[caller.__name__]
+            del sys.modules[outsider.__name__]
+
     def test_keeps_loaded_tokenizer_when_decoder_is_already_bytelevel(
         self, tmp_path
     ) -> None:

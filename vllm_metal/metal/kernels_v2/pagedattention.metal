@@ -1181,11 +1181,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
       float other_m = merge_m[w];
       float other_l = merge_l[w];
 
-      // Skip warps that processed no blocks (m == -FLT_MAX).
+      // Skip warps that processed no blocks (m == -FLT_MAX).  That is also
+      // the only way new_m could stay -FLT_MAX, so no further clamp is
+      // needed.
       if (other_m == -FLT_MAX && other_l == 0.f) continue;
 
       float new_m = max(warp_m, other_m);
-      if (new_m == -FLT_MAX) new_m = 0.f;
 
       float my_corr = (warp_m == -FLT_MAX) ? 0.f : exp2(warp_m - new_m);
       float other_corr = (other_m == -FLT_MAX) ? 0.f : exp2(other_m - new_m);
@@ -1531,11 +1532,17 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
 
       // Compute correction factor to rescale previous state.
       float new_m = max(warp_m[r], block_max);
-      // NaN-safe: if new_m is still -inf (all masked), clamp to 0.
-      if (new_m == -FLT_MAX) new_m = 0.f;
+      // A row with no unmasked key yet (this block lies wholly left of its
+      // window, and so did every earlier one) keeps the -FLT_MAX sentinel:
+      // clamping it to 0 would pin the running max at 0, so later in-window
+      // keys would be weighted by exp2(score) instead of exp2(score - max)
+      // (#875). warp_l[r] and v_accs[r] are still all zero, so skipping the
+      // rescale is a no-op; the weight loop below emits w == 0 while
+      // warp_m[r] == -FLT_MAX.
+      if (new_m == -FLT_MAX) continue;
 
       float old_correction = exp2(warp_m[r] - new_m);
-      // If warp_m was -FLT_MAX (first iteration), correction = 0, which
+      // If warp_m was -FLT_MAX (first unmasked key), correction = 0, which
       // correctly zeroes out the (already zero) previous O and l.
       if (warp_m[r] == -FLT_MAX) old_correction = 0.f;
 
@@ -1574,7 +1581,11 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
           continue;
         }
         const float score = warp_scores[r * BLOCK_SIZE + tok];
-        w[r] = exp2(score - warp_m[r]);
+        // warp_m[r] == -FLT_MAX means step 2 skipped this row (block wholly
+        // left of its window): every score here is masked, emit 0 rather
+        // than exp2(-FLT_MAX - -FLT_MAX) = 1 (and keep w == 0 so the V
+        // accumulate below never touches a ±inf cache element).
+        w[r] = (warp_m[r] == -FLT_MAX) ? 0.f : exp2(score - warp_m[r]);
         warp_l[r] += w[r];
       }
 
@@ -1694,11 +1705,12 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
         float other_m = merge_m[w];
         float other_l = merge_l[w];
 
-        // Skip warps that processed no blocks (m == -FLT_MAX).
+        // Skip warps that processed no blocks (m == -FLT_MAX).  That is
+        // also the only way new_m could stay -FLT_MAX, so no further clamp
+        // is needed.
         if (other_m == -FLT_MAX && other_l == 0.f) continue;
 
         float new_m = max(warp_m[r], other_m);
-        if (new_m == -FLT_MAX) new_m = 0.f;
 
         float my_corr = (warp_m[r] == -FLT_MAX) ? 0.f : exp2(warp_m[r] - new_m);
         float other_corr = (other_m == -FLT_MAX) ? 0.f : exp2(other_m - new_m);
@@ -1743,11 +1755,10 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             head_idx * max_num_partitions + partition_idx;
         // The block range starts at the window of the threadgroup's first
         // row, so a later row can read a partition that lies wholly left of
-        // its own window.  Such a row sees no unmasked key: its sum stays 0
-        // while its running max was clamped to 0 above.  Store -FLT_MAX, as
-        // the skipped-partition early return does, so the partial does not
-        // pin the reduce's global max (#837).
-        *max_logits_ptr = warp_l[r] > 0.f ? warp_m[r] : -FLT_MAX;
+        // its own window.  Such a row sees no unmasked key and keeps the
+        // -FLT_MAX sentinel (#875), matching the skipped-partition early
+        // return, so the partial never pins the reduce's global max (#837).
+        *max_logits_ptr = warp_m[r];
         device float *exp_sums_ptr = exp_sums +
                                      out_row * num_heads * max_num_partitions +
                                      head_idx * max_num_partitions + partition_idx;

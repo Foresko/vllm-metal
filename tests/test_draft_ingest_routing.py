@@ -7,15 +7,21 @@ segment, routing the forward to the tiled prefill kernel, which reads the
 whole context regardless of query size (~70 ms vs ~11 ms per pass at 8k).
 """
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import mlx.core as mx
 import pytest
 
+from tests.test_draft_model_proposer import _StubDraftModel
 from vllm_metal.attention.context import get_context
+from vllm_metal.v1 import draft_model_proposer as dmp
 from vllm_metal.v1.draft_model_proposer import (
     DraftModelProposer,
     _DraftPlan,
 )
 from vllm_metal.v1.proposer import _DECODE_INGEST_MAX_TOKENS
+from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 BLOCK_SIZE = 16
 VOCAB = 32
@@ -173,3 +179,63 @@ def test_ingest_window_mixed_lengths(monkeypatch) -> None:
     assert ctx.verify_window_q == 4
     assert ctx.offsets == [8192, 4096]
     assert ctx.context_lens == [8196, 4098]
+
+
+@pytest.mark.parametrize(
+    ("window_env", "head_dim", "layout"),
+    [
+        ("1", 64, "the window layout"),
+        (
+            "0",
+            64,
+            "the expanded per-token layout (VLLM_METAL_SPEC_VERIFY_WINDOW is off)",
+        ),
+        (
+            "1",
+            512,
+            "the expanded per-token layout "
+            "(the draft head size exceeds the window mode's 256)",
+        ),
+    ],
+    ids=["window", "off", "head-size"],
+)
+def test_build_logs_the_ingest_layout(
+    monkeypatch, window_env, head_dim, layout
+) -> None:
+    monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+    monkeypatch.setattr(
+        dmp,
+        "_load_draft_model",
+        lambda *_: (_StubDraftModel(), dmp.DraftDims(1, 1, head_dim)),
+    )
+    monkeypatch.setattr(dmp, "SDPAPagedAttentionRuntime", Mock())
+    info = Mock()
+    monkeypatch.setattr(dmp.logger, "info", info)
+
+    dmp.DraftModelProposer.build(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(model="draft"),
+            num_speculative_tokens=3,
+            num_speculative_tokens_per_batch_size=None,
+        ),
+        parallel_config=None,
+        controller=SpeculativeDecodeController(),
+        model_adapter=SimpleNamespace(
+            supports_selective_logits=lambda model: False,
+            extract_logits=lambda value: value,
+        ),
+        num_blocks=3,
+        max_model_len=4096,
+        max_num_seqs=4,
+        block_size=16,
+        dtype=mx.float32,
+        allow_deferred_zero_k_ingest=False,
+    )
+
+    # The model-load line formats mocked runtime counts; read only this one.
+    lines = [
+        call.args[0] % call.args[1:]
+        for call in info.call_args_list
+        if call.args[0].startswith("Metal: draft-model")
+    ]
+    assert lines == [f"Metal: draft-model committed-token ingest uses {layout}"]

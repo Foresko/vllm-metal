@@ -17,7 +17,7 @@ from vllm_metal.attention.context import (
     prepare_unified,
 )
 from vllm_metal.attention.impls.sdpa import (
-    _KERNEL_BLOCK_SIZES,
+    KERNEL_BLOCK_SIZES,
     _build_block_tables,
     _kernel_metadata,
     _pick_kernel_block_size,
@@ -28,7 +28,7 @@ class TestPickKernelBlockSize:
     """Tests for _pick_kernel_block_size."""
 
     def test_returns_exact_match(self):
-        for bs in _KERNEL_BLOCK_SIZES:
+        for bs in KERNEL_BLOCK_SIZES:
             assert _pick_kernel_block_size(bs) == bs
 
     def test_picks_largest_divisor(self):

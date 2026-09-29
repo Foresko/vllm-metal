@@ -514,6 +514,8 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
     is partially initialized, so ``apply_compat_patches`` defers import failure
     and ``MetalPlatform.check_and_update_config`` retries after vLLM imports.
     """
+    import sys
+
     import vllm.tokenizers.registry as tokenizer_registry
     from vllm.tokenizers.protocol import TokenizerLike
 
@@ -522,6 +524,7 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
         return
 
     original_get_tokenizer = tokenizer_registry.get_tokenizer
+    original_cached_get_tokenizer = tokenizer_registry.cached_get_tokenizer
 
     def _patched_get_tokenizer(
         tokenizer_name,
@@ -567,7 +570,26 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
 
     tokenizer_registry.get_tokenizer = _patched_get_tokenizer
     tokenizer_registry.cached_get_tokenizer = lru_cache(_patched_get_tokenizer)
+    _rebind_tokenizer_aliases(
+        sys.modules,
+        {
+            original_get_tokenizer: tokenizer_registry.get_tokenizer,
+            original_cached_get_tokenizer: tokenizer_registry.cached_get_tokenizer,
+        },
+    )
     setattr(tokenizer_registry, sentinel, True)
+
+
+def _rebind_tokenizer_aliases(modules, replacements) -> None:
+    """Point every imported alias of the originals at the patched callables."""
+    for module in list(modules.values()):
+        name = getattr(module, "__name__", "")
+        if module is None or not (name == "vllm" or name.startswith("vllm.")):
+            continue
+        for attr, value in list(getattr(module, "__dict__", {}).items()):
+            for original, patched in replacements.items():
+                if value is original:
+                    setattr(module, attr, patched)
 
 
 def _ceildiv(value: int, divisor: int) -> int:

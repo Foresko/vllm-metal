@@ -200,6 +200,30 @@ class TestV1MetalModelRunnerGenerate:
         with pytest.raises(NotImplementedError, match="custom logits processors"):
             mr.MetalModelRunner(vllm_config)
 
+    @pytest.mark.parametrize(
+        "logprobs_mode",
+        ["raw_logprobs", "raw_logits", "processed_logprobs", "processed_logits"],
+    )
+    def test_init_passes_logprobs_mode_to_sampler(
+        self, monkeypatch: pytest.MonkeyPatch, logprobs_mode: str
+    ) -> None:
+        # --logprobs-mode must reach the sample-logprobs path, not only prompt logprobs.
+        monkeypatch.setattr(mr, "entry_points", lambda **_: (), raising=False)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                logits_processors=None,
+                runner_type="generate",
+                logprobs_mode=logprobs_mode,
+            ),
+            cache_config=SimpleNamespace(),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=None,
+        )
+
+        runner = mr.MetalModelRunner(vllm_config)
+
+        assert runner._sampler.logprobs_mode == logprobs_mode
+
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
         runner._dummy_forward_outputs = Mock(
@@ -496,7 +520,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             captured["decode_info"] = decode_info
             captured["prefill_info"] = prefill_info
@@ -563,7 +587,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del prefill_info, block_sizes, merge_verify_windows
             captured["decode_info"] = decode_info
@@ -611,7 +635,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -759,7 +783,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -815,7 +839,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -880,7 +904,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         captured: dict[str, object] = {}
 
         def capture_prepare_grouped(
-            decode_info, prefill_info, block_sizes, *, merge_verify_windows
+            decode_info, prefill_info, block_sizes, *, merge_verify_windows, **_kwargs
         ):
             del merge_verify_windows
             captured["decode_info"] = decode_info
@@ -1530,6 +1554,37 @@ class TestV1MetalModelRunnerExecuteModel:
         assert out.req_id_to_index == {}
         assert out.sampled_token_ids == []
         assert runner._execute_model_state is None
+
+    def test_step_after_a_failed_sample_raises_the_sample_error(
+        self, monkeypatch
+    ) -> None:
+        """Under async scheduling the engine dispatches the next
+        ``execute_model`` before it reads the failed ``sample_tokens`` future.
+        The failed step's requests never received their sampled tokens (a
+        finished prefill still has ``generated_tokens == 0``), so running on
+        that state builds an empty prefill segment and the engine dies with an
+        unrelated attention error.  The next step must raise the sampling
+        failure instead.
+        """
+        runner = self._make_runner()
+        runner._execute_model_state = object()
+        cause = RuntimeError("logprobs kernel failed to compile")
+
+        def fail(grammar_output):
+            raise cause
+
+        monkeypatch.setattr(runner, "_sample_paged_batch", fail)
+        with pytest.raises(RuntimeError, match="failed to compile"):
+            runner.sample_tokens(None)
+
+        monkeypatch.setattr(
+            runner,
+            "_start_paged_forward",
+            lambda *args, **kwargs: pytest.fail("the next step must not run"),
+        )
+        with pytest.raises(RuntimeError, match="sample_tokens") as info:
+            runner.execute_model(self._make_scheduler_output(["req-0"]))
+        assert info.value.__cause__ is cause
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
@@ -2392,6 +2447,74 @@ class TestMergeVerifyWindows:
             )
         )
         assert runner.merge_verify_windows is False
+
+
+class TestVerifyLayoutLog:
+    """With speculative decoding on, warm-up names the verify layout the
+    forward will use (``merge_verify_windows``) and why it stays expanded."""
+
+    def _warm_up(self, monkeypatch, runner, *, speculative: bool = True) -> list[str]:
+        runner.vllm_config.speculative_config = (
+            SimpleNamespace(method="ngram") if speculative else None
+        )
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        runner._paged_attention_runtime = Mock()
+        info = Mock()
+        monkeypatch.setattr(mr.logger, "info", info)
+        runner.warm_up()
+        return [call.args[0] % call.args[1:] for call in info.call_args_list]
+
+    def test_window_layout(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "1")
+
+        lines = self._warm_up(monkeypatch, make_stub_runner())
+
+        assert "Metal: spec-decode verify uses the window layout" in lines
+
+    @pytest.mark.parametrize(
+        ("window_env", "runner_kwargs", "reason"),
+        [
+            ("0", {}, "VLLM_METAL_SPEC_VERIFY_WINDOW is off"),
+            (
+                "1",
+                {"model_args": {"kv_lora_rank": 512}},
+                "window mode does not support MLA models",
+            ),
+            (
+                "1",
+                {"is_hybrid": True},
+                "window mode does not support hybrid models",
+            ),
+            (
+                "1",
+                {
+                    "model_config": SimpleNamespace(
+                        runner_type="generate",
+                        get_head_size=lambda: 512,
+                        is_hybrid=False,
+                    )
+                },
+                "head size 512 exceeds the window mode's 256",
+            ),
+        ],
+        ids=["off", "mla", "hybrid", "head-size"],
+    )
+    def test_expanded_layout_names_the_reason(
+        self, monkeypatch, window_env, runner_kwargs, reason
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_SPEC_VERIFY_WINDOW", window_env)
+
+        lines = self._warm_up(monkeypatch, make_stub_runner(**runner_kwargs))
+
+        assert (
+            f"Metal: spec-decode verify uses the expanded per-token layout ({reason})"
+            in lines
+        )
+
+    def test_no_line_without_speculative_decoding(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, make_stub_runner(), speculative=False)
+
+        assert not any("spec-decode verify" in line for line in lines)
 
 
 class TestLoadModelPipelineSplitOrdering:

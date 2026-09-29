@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
 import mlx.core as mx
@@ -23,10 +24,13 @@ from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
 )
 from vllm_metal.attention.caches.turboquant import (
+    FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
     V_QUANT_PARAMS,
     packed_dim,
+    prefill_workspace_bytes,
 )
+from vllm_metal.attention.impls.turboquant_prefill import workspace_upper_bound
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
@@ -210,6 +214,43 @@ class ModelCachePolicy:
     def __init__(self, runner: MetalModelRunner, model_adapter: ModelAdapter) -> None:
         self._runner = runner
         self._model_adapter = model_adapter
+
+    @cached_property
+    def tq_prefill_workspace_bytes(self) -> int:
+        """Resolve one reservation before KV sizing and reuse it during serving."""
+        if not self._use_turboquant(get_config()):
+            return 0
+        runner = self._runner
+        cap = None
+        # Speculation expands segments/lookahead beyond the ordinary scheduler
+        # bounds. Preserve its allowance until those bounds are accounted for.
+        # vLLM resolves max_model_len before workers start. Its later auto-fit
+        # may shorten the context, but does not reclaim this fixed reservation.
+        if runner.vllm_config.speculative_config is None:
+            if (
+                runner.head_dim not in FWHT_SUPPORTED_HEAD_DIMS
+                or self._require_kv_cache_dtype() not in (mx.float16, mx.bfloat16)
+            ):
+                cap = 0
+                logger.info_once(
+                    "Metal: TurboQuant prefill stays compressed for "
+                    "head_dim=%d, dtype=%s.",
+                    runner.head_dim,
+                    runner.kv_cache_dtype,
+                )
+            else:
+                cap = workspace_upper_bound(
+                    max_model_len=runner.model_config.max_model_len,
+                    max_num_seqs=runner.scheduler_config.max_num_seqs,
+                    max_num_batched_tokens=runner.scheduler_config.max_num_batched_tokens,
+                    num_query_heads=runner.model_config.get_num_attention_heads(
+                        runner.vllm_config.parallel_config
+                    ),
+                    num_kv_heads=runner.num_kv_heads,
+                    head_dim=runner.head_dim,
+                    block_size=runner.cache_config.block_size,
+                )
+        return prefill_workspace_bytes(max_bytes=cap)
 
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
@@ -852,6 +893,17 @@ class WorkerCachePlanner:
         backend = self._worker.model_runner.build_paged_attention_runtime(
             block_size=plan.block_size
         )
+        # Hybrid models always size their cache from vLLM's KV cache config
+        # (``ModelCachePolicy._uses_upstream_storage``), so only the SDPA and
+        # MLA runtimes, which own ``initialize``, reach this path.
+        if not isinstance(
+            backend, (SDPAPagedAttentionRuntime, MLAPagedAttentionRuntime)
+        ):
+            raise RuntimeError(
+                "Paged attention: the capacity path initializes only the SDPA "
+                f"and MLA runtimes; {type(backend).__name__} sizes its cache "
+                "from vLLM's KV cache config"
+            )
         backend.initialize(plan.num_blocks)
         self._worker.model_runner.install_gemma4_mtp_kv_sharing(
             backend,
@@ -957,6 +1009,18 @@ class WorkerCachePlanner:
         metal_limit = self._metal_limit_bytes()
         model_memory = self.get_model_memory_usage()
         per_block_bytes = self._worker.get_cache_block_size_bytes()
+        if get_config().turboquant:
+            # Profiling precedes paged-cache binding, so it cannot observe
+            # materialized TQ histories. Reserve the admission limit once,
+            # inside gpu_memory_utilization, before upstream allocates KV.
+            workspace = self._worker.model_runner.tq_prefill_workspace_bytes
+            overhead += workspace
+            if workspace:
+                logger.info_once(
+                    "TurboQuant prefill: reserving %.2f MiB within the Metal "
+                    "memory budget before KV sizing.",
+                    workspace / 2**20,
+                )
         usable_metal = int(metal_limit * fraction)
         kv_budget = self.base_kv_budget_bytes(
             metal_limit,

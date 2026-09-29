@@ -225,23 +225,48 @@ class MLAPagedAttentionWrapper(nn.Module):
         FA / 2pass / pr_mma land in follow-ups once each has its own
         real-model parity proof, per the alignment with reviewers on
         ``Ship one kernel, prove it wins'')."""
-        if not envs.VLLM_METAL_MLA_KERNEL:
-            return False
-        if not self._is_absorbed:
-            return False
-        if inner.kv_lora_rank != self._KERNEL_KV_LORA_RANK:
-            return False
-        if inner.qk_rope_head_dim != self._KERNEL_QK_ROPE_HEAD_DIM:
-            return False
-        if latent_cache.block_size not in self._KERNEL_BLOCK_SIZES:
-            return False
-        if latent_cache.dtype not in (mx.float16, mx.bfloat16):
+        if self._kernel_mismatch(inner, latent_cache) is not None:
             return False
         cu = ctx.cu_seqlens
         for i in range(len(ctx.context_lens)):
             if cu[i + 1] - cu[i] != 1:
                 return False
         return True
+
+    def _kernel_mismatch(
+        self, inner: nn.Module, latent_cache: MLAPagedLatentCache
+    ) -> str | None:
+        """Why the single-pass kernel cannot serve this layer, or ``None``.
+
+        The static half of ``_can_use_kernel``: the switch, the absorbed
+        layout, the instantiated dims and the cache.  The forward also needs
+        a decode-only batch.
+        """
+        if not envs.VLLM_METAL_MLA_KERNEL:
+            return "VLLM_METAL_MLA_KERNEL is off"
+        if not self._is_absorbed:
+            return "no absorbed embed_q/unembed_out"
+        if inner.kv_lora_rank != self._KERNEL_KV_LORA_RANK:
+            return (
+                f"kv_lora_rank {inner.kv_lora_rank}, "
+                f"the kernel takes {self._KERNEL_KV_LORA_RANK}"
+            )
+        if inner.qk_rope_head_dim != self._KERNEL_QK_ROPE_HEAD_DIM:
+            return (
+                f"qk_rope_head_dim {inner.qk_rope_head_dim}, "
+                f"the kernel takes {self._KERNEL_QK_ROPE_HEAD_DIM}"
+            )
+        if latent_cache.block_size not in self._KERNEL_BLOCK_SIZES:
+            sizes = " or ".join(str(s) for s in sorted(self._KERNEL_BLOCK_SIZES))
+            return f"block size {latent_cache.block_size}, the kernel takes {sizes}"
+        if latent_cache.dtype not in (mx.float16, mx.bfloat16):
+            dtype = str(latent_cache.dtype).rsplit(".", 1)[-1]
+            return f"{dtype} cache, the kernel takes float16 or bfloat16"
+        return None
+
+    def decode_kernel_mismatch(self) -> str | None:
+        """Why decode on this layer skips the single-pass kernel, or ``None``."""
+        return self._kernel_mismatch(self._inner, self._mla_latent_cache)
 
     @staticmethod
     def _pick_heads_per_tg(num_heads: int, batch_size: int) -> int:

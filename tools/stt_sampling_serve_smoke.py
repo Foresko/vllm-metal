@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 import tempfile
@@ -36,13 +37,15 @@ _SAMPLE_RATE = 16000
 _NON_SPEECH_SECONDS = 5
 
 
-def _wait_for_health(base_url: str, timeout_s: int) -> bool:
+def _wait_for_health(base_url: str, timeout_s: int, serve: subprocess.Popen) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if serve.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(f"{base_url}/health", timeout=5) as resp:
                 if resp.status == 200:
-                    return True
+                    return serve.poll() is None
         except (urllib.error.URLError, ConnectionError, OSError):
             pass
         time.sleep(2)
@@ -149,26 +152,47 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", required=True, help="path to a speech clip")
     parser.add_argument("--model", default="openai/whisper-tiny")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Server port (default: choose an available port)",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     args = parser.parse_args()
 
-    base_url = f"http://127.0.0.1:{args.port}"
+    try:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", args.port))
+            port = sock.getsockname()[1]
+    except OSError as exc:
+        print(f"FAIL: cannot bind localhost port {args.port}: {exc}", file=sys.stderr)
+        return 1
+
+    base_url = f"http://127.0.0.1:{port}"
     serve = subprocess.Popen(
         [
             "vllm",
             "serve",
             args.model,
+            "--host",
+            "127.0.0.1",
             "--port",
-            str(args.port),
+            str(port),
             "--gpu-memory-utilization",
             str(args.gpu_memory_utilization),
         ]
     )
     try:
         print(f"Waiting for {base_url}/health ...", flush=True)
-        if not _wait_for_health(base_url, _HEALTH_TIMEOUT_S):
-            print("FAIL: server did not become healthy", file=sys.stderr)
+        if not _wait_for_health(base_url, _HEALTH_TIMEOUT_S, serve):
+            exit_code = serve.poll()
+            message = (
+                f"server exited during startup (exit code {exit_code})"
+                if exit_code is not None
+                else "server did not become healthy"
+            )
+            print(f"FAIL: {message}", file=sys.stderr)
             return 1
         with tempfile.TemporaryDirectory() as workdir:
             silence = Path(workdir) / "silence.wav"
@@ -180,6 +204,7 @@ def main() -> int:
             serve.wait(timeout=30)
         except subprocess.TimeoutExpired:
             serve.kill()
+            serve.wait()
 
 
 if __name__ == "__main__":

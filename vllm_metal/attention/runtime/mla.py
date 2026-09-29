@@ -4,11 +4,14 @@ from __future__ import annotations
 from typing import Any
 
 import mlx.core as mx
+from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
+
+logger = init_logger(__name__)
 
 
 class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
@@ -34,6 +37,7 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._block_size = block_size
         self._dtype = dtype
         self._cache = None
+        self._wrappers: list[MLAPagedAttentionWrapper] = []
 
     def initialize(self, num_blocks: int) -> None:
         # TODO: Bind latent views to KVCacheStorage with writes that preserve
@@ -52,11 +56,41 @@ class MLAPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._patch_model(model, cache)
 
     def _patch_model(self, model: Any, latent_cache: MLAPagedLatentCache) -> int:
+        wrappers: list[MLAPagedAttentionWrapper] = []
+
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
             if isinstance(attn, MLAPagedAttentionWrapper):
                 # Already patched — refresh cache reference in place.
                 object.__setattr__(attn, "_mla_latent_cache", latent_cache)
-                return attn
-            return MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
+                wrapper = attn
+            else:
+                wrapper = MLAPagedAttentionWrapper(attn, layer_idx, latent_cache)
+            wrappers.append(wrapper)
+            return wrapper
 
-        return walk_and_wrap(model, wrap_layer)
+        patched = walk_and_wrap(model, wrap_layer)
+        self._wrappers = wrappers
+        return patched
+
+    def warm_up(self) -> None:
+        super().warm_up()
+        self._log_decode_path()
+
+    def _log_decode_path(self) -> None:
+        """Say at startup whether decode-only batches take the single-pass kernel."""
+        mismatches = [w.decode_kernel_mismatch() for w in self._wrappers]
+        if not mismatches:
+            return
+        on_sdpa = [m for m in mismatches if m is not None]
+        if not on_sdpa:
+            logger.info(
+                "Metal: MLA decode-only batches take the single-pass Metal kernel"
+            )
+            return
+        logger.info(
+            "Metal: MLA decode-only batches take the MLX SDPA path on %d of %d "
+            "layers (%s)",
+            len(on_sdpa),
+            len(mismatches),
+            "; ".join(sorted(set(on_sdpa))),
+        )

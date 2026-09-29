@@ -17,12 +17,13 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
-    _RNG_KEY,
     BLOCK_SIZE,
     FWHT_SUPPORTED_HEAD_DIMS,
     QUANT_PARAMS,
+    TQ_MIN_SCALE,
     V_QUANT_PARAMS,
     fwht,
+    get_fwht_signs,
     get_v_centroids,
     packed_dim,
     turbo_quant_decode,
@@ -128,18 +129,59 @@ def _parse_metal_sign_table(head_size: int) -> np.ndarray:
     return signs
 
 
-def _python_signs(head_size: int) -> np.ndarray:
-    """Reproduce the Python sign vector using the same RNG recipe as ``fwht``."""
-    sign01 = mx.random.randint(0, 2, shape=(head_size,), key=_RNG_KEY)
-    signs = (1 - 2 * sign01).astype(mx.float32)
-    return np.asarray(signs)
+@pytest.mark.parametrize("quant_type", ["q8_0", "uint8", "q4_0", "int2"])
+@pytest.mark.parametrize("value", [0.0, 0.5, -3.0, 40.0])
+def test_constant_block_quantizes_without_nan(quant_type: str, value: float) -> None:
+    """A block of identical values has zero range. The scale must stay a
+    normal float16, so the zero point stays finite and the block dequantizes
+    back to its value instead of NaN."""
+    from vllm_metal.attention.caches.turboquant import dequantize, quantize
+
+    x = mx.full((2, 64), value, dtype=mx.float16)
+    indices, scale, zero_point = quantize(x, quant_type)
+    out = dequantize(indices, scale, zero_point)
+    mx.eval(out, scale, zero_point)
+
+    assert not bool(mx.any(mx.isnan(out)))
+    assert not bool(mx.any(mx.isinf(zero_point)))
+    assert bool(mx.all(scale > 0))
+    np.testing.assert_allclose(
+        np.array(out, dtype=np.float32), np.full((2, 64), value), rtol=2e-3, atol=1e-3
+    )
+
+
+def test_metal_min_scale_matches_python() -> None:
+    match = re.search(
+        r"constant float TQ_MIN_SCALE = (0x[0-9a-fA-F.]+p[+-]?\d+)f;",
+        _METAL_SOURCE.read_text(),
+    )
+    assert match is not None, f"TQ_MIN_SCALE not found in {_METAL_SOURCE}"
+    assert float.fromhex(match.group(1)) == TQ_MIN_SCALE
+
+
+def test_tiny_range_block_quantizes_without_nan() -> None:
+    from vllm_metal.attention.caches.turboquant import dequantize, quantize
+
+    x = (
+        (40.0 + 1e-6 * mx.arange(32, dtype=mx.float32))
+        .reshape(1, 32)
+        .astype(mx.float16)
+    )
+    indices, scale, zero_point = quantize(x, "q8_0")
+    out = dequantize(indices, scale, zero_point)
+    mx.eval(out)
+
+    assert not bool(mx.any(mx.isnan(out)))
+    np.testing.assert_allclose(
+        np.array(out, dtype=np.float32), np.array(x, dtype=np.float32), rtol=2e-3
+    )
 
 
 @pytest.mark.parametrize("head_size", FWHT_SUPPORTED_HEAD_DIMS)
 def test_metal_sign_table_matches_python_rng(head_size: int) -> None:
     """Metal constant table must equal the Python-generated signs element-wise."""
     metal_signs = _parse_metal_sign_table(head_size)
-    python_signs = _python_signs(head_size)
+    python_signs = np.asarray(get_fwht_signs(head_size))
     np.testing.assert_array_equal(
         python_signs,
         metal_signs,
