@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 MLX_DEVICES = ("gpu", "cpu")
 MULTIMODAL_MODES = ("auto", "multimodal-native", "text-only")
 MM_PREFIX_PATHS = ("kernel", "recompute")
+TQ_PREFILL_MODES = ("auto", "0", "1")
 
 
 def _choice(
@@ -77,6 +78,26 @@ def _int(
     return parse
 
 
+def _auto_or_nonnegative_int(name: str, *, unit: str) -> Callable[[], int | str]:
+    """``auto`` (the default) or an integer of at least 0, in ``unit``."""
+
+    def parse() -> int | str:
+        raw = os.getenv(name, "auto")
+        if raw == "auto":
+            return raw
+        try:
+            value: int | None = int(raw)
+        except ValueError:
+            value = None
+        if value is None or value < 0:
+            raise ValueError(
+                f"{name} must be auto or a nonnegative integer in {unit}, got {raw!r}"
+            )
+        return value
+
+    return parse
+
+
 if TYPE_CHECKING:
     VLLM_MLX_DEVICE: str = "gpu"
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
@@ -89,7 +110,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
-    VLLM_METAL_TQ_PREFILL_MAX_MIB: str = "auto"
+    VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -156,12 +177,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
-    "VLLM_METAL_TQ_PREFILL": lambda: os.getenv("VLLM_METAL_TQ_PREFILL", "auto"),
+    "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),
     # Temporary-workspace allowance, deducted before KV sizing. Auto takes
     # 2% of the recommended working set (256 MiB to 2 GiB). A numeric value
     # sets an explicit MiB limit; 0 disables. Set before worker startup.
-    "VLLM_METAL_TQ_PREFILL_MAX_MIB": lambda: os.getenv(
-        "VLLM_METAL_TQ_PREFILL_MAX_MIB", "auto"
+    "VLLM_METAL_TQ_PREFILL_MAX_MIB": _auto_or_nonnegative_int(
+        "VLLM_METAL_TQ_PREFILL_MAX_MIB", unit="MiB"
     ),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
@@ -222,7 +243,7 @@ def validate_environment() -> None:
             parse()
         except ValueError as exc:
             message = str(exc)
-            errors.append(message if name in message else f"{name}: {message}")
+            errors.append(message if message.startswith(name) else f"{name}: {message}")
     if errors:
         raise ValueError("Invalid vllm-metal environment: " + "; ".join(errors))
 

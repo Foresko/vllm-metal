@@ -681,7 +681,9 @@ def test_prefill_plan_rejects_missing_query_lengths():
 @pytest.mark.parametrize("mode", ["", "false", "2", "AUTO"])
 def test_prefill_rejects_invalid_mode(monkeypatch, mode):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
-    with pytest.raises(ValueError, match="VLLM_METAL_TQ_PREFILL must be auto, 0 or 1"):
+    with pytest.raises(
+        ValueError, match="VLLM_METAL_TQ_PREFILL must be one of auto, 0, 1"
+    ):
         prefill_workspace_bytes()
 
 

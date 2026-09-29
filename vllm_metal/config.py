@@ -2,7 +2,7 @@
 """Configuration for vLLM Metal plugin via environment variables."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import vllm_metal.envs as envs
 
@@ -22,7 +22,9 @@ TURBOQUANT_VALID_V_QUANTS: frozenset[str] = frozenset(
 )
 
 MultimodalMode = Literal["auto", "multimodal-native", "text-only"]
-VALID_MULTIMODAL_MODES: frozenset[str] = frozenset(envs.MULTIMODAL_MODES)
+VALID_MULTIMODAL_MODES: frozenset[MultimodalMode] = frozenset(
+    cast("tuple[MultimodalMode, ...]", envs.MULTIMODAL_MODES)
+)
 
 
 @dataclass

@@ -24,22 +24,11 @@ def prefill_workspace_bytes(*, max_bytes: int | None = None) -> int:
     from vllm_metal import envs
     from vllm_metal.metal import get_ops
 
+    # envs validates both: the mode is auto, 0 or 1, and the workspace is auto
+    # or a nonnegative MiB count.
     mode = envs.VLLM_METAL_TQ_PREFILL
-    if mode not in ("auto", "0", "1"):
-        raise ValueError(f"VLLM_METAL_TQ_PREFILL must be auto, 0 or 1; got {mode!r}")
     setting = envs.VLLM_METAL_TQ_PREFILL_MAX_MIB
-    mib = None
-    if setting != "auto":
-        error = (
-            "VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative "
-            f"integer in MiB; got {setting!r}"
-        )
-        try:
-            mib = int(setting)
-        except ValueError as exc:
-            raise ValueError(error) from exc
-        if mib < 0:
-            raise ValueError(error)
+    mib = setting if isinstance(setting, int) else None
     if mode == "0" or mib == 0:
         return 0
     if mode == "auto" and not get_ops().nax_ready():
