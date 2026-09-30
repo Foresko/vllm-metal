@@ -72,7 +72,7 @@ def _int(
                 bound = f"at most {maximum}"
             else:
                 bound = f"in [{minimum}, {maximum}]"
-            raise ValueError(f"{name} must be {bound}{note}, got {value}")
+            raise ValueError(f"{name} must be {bound}{note}, got {raw!r}")
         return value
 
     return parse

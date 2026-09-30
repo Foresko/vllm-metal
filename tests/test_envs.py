@@ -22,7 +22,7 @@ import vllm_metal.envs as envs
             "VLLM_METAL_SPEC_INGEST_CHUNK",
             "-1",
             "VLLM_METAL_SPEC_INGEST_CHUNK must be at least 0 "
-            "(0 means single-forward ingest), got -1",
+            "(0 means single-forward ingest), got '-1'",
         ),
         (
             "VLLM_METAL_RING_BASE_PORT",
@@ -33,13 +33,13 @@ import vllm_metal.envs as envs
             "VLLM_METAL_RING_BASE_PORT",
             "1023",
             "VLLM_METAL_RING_BASE_PORT must be in [1024, 65535] "
-            "(the user-port range), got 1023",
+            "(the user-port range), got '1023'",
         ),
         (
             "VLLM_METAL_RING_BASE_PORT",
             "65536",
             "VLLM_METAL_RING_BASE_PORT must be in [1024, 65535] "
-            "(the user-port range), got 65536",
+            "(the user-port range), got '65536'",
         ),
         (
             "VLLM_METAL_MM_PREFIX_PATH",
