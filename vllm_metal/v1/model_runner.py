@@ -2842,10 +2842,7 @@ class MetalModelRunner:
             # Under async scheduling the engine dispatches the next
             # execute_model before it reads this failure; that step raises it
             # instead of running on request state the sample never updated.
-            # Keep what failed, not the exception: its traceback holds the
-            # failed step's frames, and stripping it (``with_traceback(None)``)
-            # would also strip the traceback of the exception re-raised below,
-            # which is the one the engine reports.
+            # Store diagnostic text without retaining traceback frames.
             self._sample_failure = f"{type(exc).__name__}: {exc}"
             raise
 

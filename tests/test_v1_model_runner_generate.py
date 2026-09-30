@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import gc
-import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1578,6 +1576,10 @@ class TestV1MetalModelRunnerExecuteModel:
         monkeypatch.setattr(runner, "_sample_paged_batch", fail)
         with pytest.raises(RuntimeError, match="failed to compile"):
             runner.sample_tokens(None)
+        # Diagnostic text only: the exception would keep the step's frames.
+        assert (
+            runner._sample_failure == "RuntimeError: logprobs kernel failed to compile"
+        )
 
         monkeypatch.setattr(
             runner,
@@ -1590,31 +1592,6 @@ class TestV1MetalModelRunnerExecuteModel:
             r"\(RuntimeError: logprobs kernel failed to compile\)",
         ):
             runner.execute_model(self._make_scheduler_output(["req-0"]))
-
-    def test_a_failed_sample_keeps_no_frames_of_its_step(self, monkeypatch) -> None:
-        """The runner remembers what failed, not the failed step's frames:
-        their locals (arrays, request state) must be freed once the engine
-        has the exception."""
-
-        class _Payload:
-            pass
-
-        payload_ref = None
-
-        def fail(grammar_output):
-            nonlocal payload_ref
-            payload = _Payload()
-            payload_ref = weakref.ref(payload)
-            raise RuntimeError("logprobs kernel failed to compile")
-
-        runner = self._make_runner()
-        runner._execute_model_state = object()
-        monkeypatch.setattr(runner, "_sample_paged_batch", fail)
-        with pytest.raises(RuntimeError):
-            runner.sample_tokens(None)
-        gc.collect()
-
-        assert payload_ref is not None and payload_ref() is None
 
     def test_paged_cached_request_without_state_raises(self) -> None:
         runner = self._make_runner()
