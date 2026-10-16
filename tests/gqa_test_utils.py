@@ -281,6 +281,7 @@ def _run_primitive(
             max_kv_len,
             test_partition,
             out,
+            **quant_kwargs,
         )
     else:
         get_ops().paged_attention_primitive(

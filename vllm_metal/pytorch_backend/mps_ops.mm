@@ -35,7 +35,7 @@ class PagedAttention {
     if (it != pipelines_.end()) return it->second;
     auto constants = [[MTLFunctionConstantValues alloc] init];
     bool no = false;
-    for (NSUInteger i : {20, 30, 40, 50, 100, 120})
+    for (NSUInteger i : {20, 30, 40, 50, 100, 120, 130})
       [constants setConstantValue:&no type:MTLDataTypeBool atIndex:i];
     [constants setConstantValue:&split type:MTLDataTypeBool atIndex:10];
     int kbits = 8, vbits = 3;

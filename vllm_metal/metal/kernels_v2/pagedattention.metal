@@ -650,6 +650,7 @@ constant int v_bits [[function_constant(70)]];  // V quantization bit width (def
 // 120 is the first index free in this translation unit (10..70 above,
 // 80/81/90 in turboquant.metal, 100 in reshape_and_cache.metal, 110 below).
 constant bool use_mm_prefix [[function_constant(120)]];
+constant bool use_compact_scratch [[function_constant(130)]];
 // Window mode: 0 = per-token (grid.y is a query token; today's decode path).
 // > 0 = the number of PA_WINDOW_ROWS-row sub-windows per segment: grid.y is
 // a (segment, sub-window) pair and the threadgroup owns up to
@@ -1839,6 +1840,14 @@ inline int64_t paged_attention_reduce_offset(
       partitions * head_size;
 }
 
+inline int64_t paged_attention_compact_offset(
+    int sequence, int head, int num_heads,
+    const device int64_t *partition_offsets) {
+  const int64_t start = partition_offsets[sequence];
+  const int64_t count = partition_offsets[sequence + 1] - start;
+  return start * num_heads + head * count;
+}
+
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention_v2_reduce(
@@ -1851,6 +1860,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     [[buffer(6), function_constant(use_sinks)]], // [num_heads]
     device const int32_t *cu_seqlens_q [[buffer(7)]],  // [num_seqs + 1]
     const constant int &num_seqs [[buffer(8)]],
+    const device int64_t *partition_offsets
+    [[buffer(9), function_constant(use_compact_scratch)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1871,8 +1882,10 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int num_partitions = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
   const int64_t out_offset = paged_attention_reduce_offset(
       q_token_idx, head_idx, num_heads, 1, HEAD_SIZE);
-  const int64_t stats_offset = paged_attention_reduce_offset(
-      q_token_idx, head_idx, num_heads, max_num_partitions, 1);
+  const int64_t stats_offset = use_compact_scratch
+      ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
+      : paged_attention_reduce_offset(
+          q_token_idx, head_idx, num_heads, max_num_partitions, 1);
   const int64_t partial_offset = stats_offset * HEAD_SIZE;
 
   // ========================================================================
@@ -2110,6 +2123,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    const device int64_t *partition_offsets
+    [[buffer(18), function_constant(use_compact_scratch)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tg_per_grid [[threadgroups_per_grid]],
     uint3 tptg [[threads_per_threadgroup]],
@@ -2244,10 +2259,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     }
   }
 
-  const int64_t pidx =
-      (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
-          max_num_partitions +
-      partition_idx;
+  const int64_t pidx = (use_compact_scratch
+      ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
+      : (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+          max_num_partitions) + partition_idx;
   if (lane == 0) {
     max_logits[pidx] = m;
     exp_sums[pidx] = l;
@@ -2338,6 +2353,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
       const device float *sinks [[buffer(6), function_constant(use_sinks)]],   \
       device const int32_t *cu_seqlens_q [[buffer(7)]],                        \
       const constant int &num_seqs [[buffer(8)]],                              \
+      const device int64_t *partition_offsets                                 \
+      [[buffer(9), function_constant(use_compact_scratch)]],                   \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -2481,6 +2498,8 @@ instantiate_paged_attention_v2(half, char, uchar, 32);
       const constant int &q_stride [[buffer(15)]],                           \
       const constant int &kv_block_stride [[buffer(16)]],                    \
       const constant int &kv_head_stride [[buffer(17)]],                     \
+      const device int64_t *partition_offsets                               \
+      [[buffer(18), function_constant(use_compact_scratch)]],                 \
       uint3 tg_pos [[threadgroup_position_in_grid]],                         \
       uint3 tg_per_grid [[threadgroups_per_grid]],                           \
       uint3 tptg [[threads_per_threadgroup]],                                \

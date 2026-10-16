@@ -317,21 +317,26 @@ def test_batch_planner_rejects_unshipped_geometry(geometry):
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition, dtype):
     # Disjoint shuffled pages and different tail widths expose row/stride errors.
-    out, ref = _run_primitive(
-        [1, partition - 1, partition + 1, 3 * partition + 3],
-        dtype,
-        interleaved=True,
-        seed=1004,
-        num_query_heads=q,
-        num_kv_heads=kv,
-        head_size=head,
-        block_size=block,
-        test_partition=partition,
-    )
+    lengths = [1, partition - 1, partition + 1, 3 * partition + 3]
+    kwargs = {
+        "interleaved": True,
+        "seed": 1004,
+        "num_query_heads": q,
+        "num_kv_heads": kv,
+        "head_size": head,
+        "block_size": block,
+        "test_partition": partition,
+    }
+    rectangular, _ = _run_primitive(lengths, dtype, **kwargs)
+    out, ref = _run_primitive(lengths, dtype, gqa_context_lens=lengths, **kwargs)
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
     assert get_ops().last_gqa_num_requests() == 4
     _assert_close(out, ref, dtype)
+    np.testing.assert_array_equal(
+        np.array(out.astype(mx.float32)),
+        np.array(rectangular.astype(mx.float32)),
+    )
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
@@ -610,14 +615,19 @@ def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
+def test_compact_scratch_admits_ragged_batch_within_budget(dtype):
     ops = get_ops()
     batch, q, kv, head, block = 256, 24, 4, 256, 16
     lengths = [131072] + [1] * (batch - 1)
     padded_bytes = batch * q * 256 * (2 * head + 8)
     assert padded_bytes == 780 * 1024**2
     assert ops._gqa_decode_config_for_test()["max_scratch_bytes"] == 512 * 1024**2
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 0
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, lengths, 40) == 512
+    # A uniform batch still exceeds the budget: compaction cannot save its slots.
+    assert ops.gqa_decode_batch_partition_size(q, kv, head, [131072] * batch, 40) == 0
+    assert (
+        ops.gqa_decode_batch_partition_size(q, kv, head, [1] + [131072] * 255, 40) == 0
+    )
     query = mx.zeros((batch, q, head), dtype)
     keys = mx.zeros((1, block, kv, head), dtype)
     values = mx.full(keys.shape, 2, dtype)
@@ -638,9 +648,9 @@ def test_ragged_scratch_budget_falls_back_before_allocation(dtype):
         lengths,
     )
     mx.eval(out)
-    assert ops.last_paged_dispatch() == "per_token_ps0"
-    assert ops.last_gqa_partition_size() == 0
-    assert mx.get_peak_memory() - before < 64 * 1024**2
+    assert ops.last_paged_dispatch() == "gqa_decode"
+    assert ops.last_gqa_partition_size() == 512
+    assert mx.get_peak_memory() - before < 16 * 1024**2
     np.testing.assert_allclose(np.array(out.astype(mx.float32)), 2, atol=2e-3)
 
 

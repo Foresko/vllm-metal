@@ -135,11 +135,14 @@ Every eligible call additionally requires:
   `gqa_length_plan` describing exactly its rows.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
-- At most **512 MiB total GQA scratch per attention call**, including all
-  rectangular padding: `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)`
-  bytes for the FP16/BF16 partial output and two FP32 statistics. Larger calls
-  fall back before allocation. This ceiling covers the measured serving
-  windows; it is not a reservation or a bound on total process memory.
+- At most **512 MiB total GQA scratch per attention call**. With multi-request
+  length metadata, padded rows use compact scratch:
+  `Q * sum(ceil(length_i / P)) * (2 * head_dim + 8) + 8 * (B + 1)` bytes for
+  the FP16/BF16 partial output, two FP32 statistics and INT64 partition offsets.
+  Calls with no padding or no multi-request metadata retain the rectangular layout:
+  `B * Q * ceil(max_seq_len / P) * (2 * head_dim + 8)` bytes.
+  Larger calls fall back before allocation. This ceiling covers the measured
+  serving windows; it is not a reservation or a bound on total process memory.
 - A kernel page size allowed above and sufficient reducer shared memory:
   aligned dynamic statistics plus the compiled pipeline's static allocation.
   This is checked before allocating GQA scratch or encoding the producer;
@@ -188,10 +191,15 @@ The primitive captures its own copy and includes it in lazy-node equivalence.
 Direct callers must supply lengths consistent with `seq_lens`; shape and
 positive-length bounds are checked eagerly, without reading GPU array data.
 
-All requests use the same chosen partition. Scratch uses the maximum number
-of partitions as its row stride. Each producer skips partitions beyond its
-own KV length, and each reducer reads only that request's valid partials.
-Neither padding nor stale scratch from a shorter row contributes to its result.
+All requests use the same chosen partition. The CPU length plan also captures
+per-request partition offsets for P256/P512, shared immutably across layers.
+When rows would need padding, the producer and reducer address tightly packed
+per-request partials using these offsets. Rows that all fill the dispatch stride
+retain their existing layout without an offset buffer. The producer grid and
+reducer shared memory remain sized by the maximum partition count; each producer still skips
+partitions beyond its own KV length, and each reducer reads only that request's
+valid partials in the same order. Compact scratch saves allocation space without
+changing partition selection or removing empty producer workgroups.
 
 Mixed batches use an explicit decode sub-batch. When the native split
 separates the leading ordinary decode rows from the prefill kernel (#851 for
