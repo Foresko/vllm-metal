@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 import mlx.core as mx
 import numpy as np
 import torch
-from vllm.config import VllmConfig
+from vllm.config import LoRAConfig, VllmConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -100,7 +100,7 @@ from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
 )
-from vllm_metal.v1.lora import MetalLoRARuntime
+from vllm_metal.v1.lora import EncoderLoRATarget, MetalLoRARuntime
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import (
     DefaultModelAdapter,
@@ -719,14 +719,19 @@ class MetalModelRunner:
         if callable(text_config):
             cfg = text_config()
             max_position_embeddings = getattr(cfg, "max_position_embeddings", None)
+        lora_config = self.vllm_config.lora_config
         self._lora.setup(
             model=self._forward_model,
-            lora_config=self.vllm_config.lora_config,
+            lora_config=lora_config,
             is_stt=False,
             speculative_decode_enabled=self.vllm_config.speculative_config is not None,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_position_embeddings=max_position_embeddings,
+            encoder=self._lora_encoder_target(lora_config),
+            weights_mapper=getattr(
+                self._multimodal_adapter, "lora_weights_mapper", None
+            ),
         )
         # Probed here because it runs a cacheless one-token forward, which is
         # only safe before a paged context is installed. PP takes another
@@ -765,6 +770,49 @@ class MetalModelRunner:
                     not self.vllm_config.cache_config.enable_prefix_caching
                 ),
             )
+
+    def _lora_encoder_target(
+        self, lora_config: LoRAConfig | None
+    ) -> EncoderLoRATarget | None:
+        """Resolve the encoder for tower/connector LoRA, as upstream's
+        ``LoRAModelManager._maybe_init_mm`` gates it."""
+        if lora_config is None:
+            return None
+        adapter = self._multimodal_adapter
+        if adapter is None:
+            # Metal serves this model without its vision encoder: a text
+            # model, a VLM forced text-only (``multimodal_config`` cleared, so
+            # ``is_multimodal_model`` is false) or a language-model-only load.
+            if lora_config.enable_tower_connector_lora:
+                logger.warning(
+                    "`enable_tower_connector_lora` has no effect: %s is served "
+                    "without a vision encoder on Metal, so LoRA applies to the "
+                    "language model only.",
+                    self.model_config.model,
+                )
+            return None
+        target = getattr(adapter, "lora_encoder_target", None)
+        if not lora_config.enable_tower_connector_lora:
+            if target is not None:
+                logger.info(
+                    "%s supports adding LoRA to the tower modules. If needed, "
+                    "please set `enable_tower_connector_lora=True`.",
+                    self.model_config.model,
+                )
+            return None
+        if target is None:
+            logger.warning(
+                "LoRA with tower connector is enabled, but the model %s "
+                "does not support it on Metal. This will be ignored.",
+                self.model_config.model,
+            )
+            return None
+        logger.warning(
+            "LoRA for the tower and connector of multimodal models is "
+            "experimental and may contain bugs. Please report any related issues on "
+            "GitHub if you encounter them."
+        )
+        return target()
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
@@ -2232,6 +2280,7 @@ class MetalModelRunner:
             return
         self.encoder_cache.remove_request(req_id)
         self.encoder_cache.add_request(req_id, new_req.mm_features)
+        self.encoder_cache.set_lora_request(req_id, new_req.lora_request)
 
     def _pre_register_new_request_mm_features(
         self, new_reqs: list[NewRequestData]
@@ -2344,6 +2393,7 @@ class MetalModelRunner:
             return
 
         features_to_encode: list[MultiModalFeatureSpec] = []
+        feature_req_ids: list[str] = []
         identifiers_to_encode: set[str] = set()
         for req_id, feature_indices in scheduled_encoder_inputs.items():
             mm_features = cache.mm_features.get(req_id)
@@ -2365,19 +2415,50 @@ class MetalModelRunner:
                 ):
                     continue
                 features_to_encode.append(feature)
+                feature_req_ids.append(req_id)
                 identifiers_to_encode.add(feature.identifier)
 
         if not features_to_encode:
             return
 
-        outputs = adapter.encode_multimodal(features_to_encode)
-        if len(outputs) != len(features_to_encode):
+        if not self._lora.encoder_enabled:
+            self._encode_features(features_to_encode)
+            return
+
+        # Each request's features run through its own adapter's tower and
+        # connector weights; the scheduler already keys their identifiers by
+        # LoRA name, so cached outputs never cross adapters.
+        groups: dict[int, tuple[LoRARequest | None, list[MultiModalFeatureSpec]]] = {}
+        for feature, req_id in zip(features_to_encode, feature_req_ids, strict=True):
+            lora_request = cache.lora_requests[req_id]
+            lora_id = 0 if lora_request is None else lora_request.lora_int_id
+            groups.setdefault(lora_id, (lora_request, []))[1].append(feature)
+        for lora_request, features in groups.values():
+            with self._lora.encoder_adapter(lora_request):
+                # Evaluate before the slot changes: the outputs are lazy.
+                self._encode_features(features, evaluate=True)
+
+    def _encode_features(
+        self, features: list[MultiModalFeatureSpec], *, evaluate: bool = False
+    ) -> None:
+        adapter = self._multimodal_adapter
+        cache = self.encoder_cache
+        assert adapter is not None and cache is not None
+        outputs = adapter.encode_multimodal(features)
+        if len(outputs) != len(features):
             raise RuntimeError(
                 f"encode_multimodal returned {len(outputs)} outputs for "
-                f"{len(features_to_encode)} features; adapter must return one "
+                f"{len(features)} features; adapter must return one "
                 "result per feature."
             )
-        for feature, output in zip(features_to_encode, outputs, strict=True):
+        if evaluate:
+            mx.eval(
+                [
+                    (output.hidden_states, output.deepstack_visual_embeds or [])
+                    for output in outputs
+                ]
+            )
+        for feature, output in zip(features, outputs, strict=True):
             cache.encoder_outputs[feature.identifier] = output
 
     def _run_mm_paged_forward(

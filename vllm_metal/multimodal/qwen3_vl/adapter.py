@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 import mlx.core as mx
 import torch
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
@@ -20,6 +21,7 @@ from vllm_metal.multimodal.text_backbone import (
     resolve_text_backbone,
 )
 from vllm_metal.tensor_bridge import torch_to_mlx
+from vllm_metal.v1.lora.model_manager import EncoderLoRATarget
 
 
 @dataclass(frozen=True)
@@ -98,9 +100,24 @@ class Qwen3VLMultimodalAdapter:
         self._backbone_embeds_kwarg = backbone_embeds_kwarg
         self._vision_token_ids = vision_token_ids
 
+    # HF checkpoint names -> the module names the runner wraps for LoRA: the
+    # language model's own tree, and the vision tower under ``visual.``.
+    lora_weights_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.visual.": "visual.",
+            "model.language_model.": "model.",
+        }
+    )
+
     def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
         return self._language_model
+
+    def lora_encoder_target(self) -> EncoderLoRATarget:
+        """Expose the vision tower and merger to tower/connector LoRA."""
+        if self._vision_tower is None:
+            raise RuntimeError("vision_tower not loaded; cannot attach LoRA to it.")
+        return EncoderLoRATarget(module=self._vision_tower, prefix="visual.")
 
     @classmethod
     def from_loaded_model(cls, model: Any, hf_config: Any) -> Qwen3VLMultimodalAdapter:

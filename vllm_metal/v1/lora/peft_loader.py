@@ -14,6 +14,7 @@ from vllm.lora.utils import parse_fine_tuned_lora_name
 
 if TYPE_CHECKING:
     from vllm.config.lora import LoRAConfig
+    from vllm.model_executor.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ def load_peft_adapter(
     lora_id: int,
     max_position_embeddings: int | None = None,
     lora_config: LoRAConfig | None = None,
+    weights_mapper: WeightsMapper | None = None,
 ) -> LoadedLoRA:
     adapter_path = Path(adapter_path)
     if not adapter_path.is_dir():
@@ -64,7 +66,7 @@ def load_peft_adapter(
     pairs: dict[str, dict[str, mx.array]] = {}
     for name, tensor in raw.items():
         try:
-            module, is_a = parse_fine_tuned_lora_name(name)
+            module, is_a = parse_fine_tuned_lora_name(name, weights_mapper)
         except ValueError:
             logger.debug("Skipping unrecognized LoRA tensor: %s", name)
             continue

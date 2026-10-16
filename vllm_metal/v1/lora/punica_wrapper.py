@@ -133,3 +133,49 @@ class PunicaWrapperMLX:
                 delta = delta.astype(y.dtype)
             output = output.at[token_indices].add(delta)
         return output
+
+
+class EncoderPunicaWrapperMLX:
+    """Route every row of an encoder call through one adapter slot.
+
+    The runner encodes one request's features per call, so each row of a
+    tower or connector projection belongs to the same adapter.
+    """
+
+    def __init__(self) -> None:
+        self._slot: int | None = None
+
+    @property
+    def no_lora(self) -> bool:
+        return self._slot is None
+
+    @property
+    def slot(self) -> int | None:
+        return self._slot
+
+    def set_slot(self, slot: int | None) -> None:
+        self._slot = slot
+
+    def add_lora_linear(
+        self,
+        y: mx.array,
+        x: mx.array,
+        lora_a_stacked: mx.array,
+        lora_b_stacked: mx.array,
+        scale: float,
+        lora_ranks: list[int] | None = None,
+    ) -> mx.array:
+        slot = self._slot
+        if slot is None:
+            return y
+        rank = int(lora_a_stacked.shape[1]) if lora_ranks is None else lora_ranks[slot]
+        if rank == 0:
+            return y
+        lora_a = lora_a_stacked[slot, :rank]
+        lora_b = lora_b_stacked[slot, :, :rank]
+        delta = mx.matmul(mx.matmul(x, lora_a.T), lora_b.T)
+        if scale != 1.0:
+            delta = delta * scale
+        if delta.dtype != y.dtype:
+            delta = delta.astype(y.dtype)
+        return y + delta

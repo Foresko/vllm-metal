@@ -9,13 +9,14 @@ import mlx.core as mx
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_adapter_absolute_path
 
-from .model_manager import MLXLoRAModelManager
+from .model_manager import EncoderLoRATarget, MLXLoRAModelManager
 from .peft_loader import LoadedLoRA, load_peft_adapter
 
 if TYPE_CHECKING:
     import mlx.nn as nn
     from vllm.config.lora import LoRAConfig
     from vllm.lora.request import LoRARequest
+    from vllm.model_executor.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,19 @@ class MetalWorkerLoRAManager:
         max_num_batched_tokens: int,
         dtype: mx.Dtype,
         max_position_embeddings: int | None = None,
+        encoder: EncoderLoRATarget | None = None,
+        weights_mapper: WeightsMapper | None = None,
     ):
         self.lora_config = lora_config
         self.max_position_embeddings = max_position_embeddings
+        self.weights_mapper = weights_mapper
         self._mm = MLXLoRAModelManager(
-            model, lora_config, max_num_seqs, max_num_batched_tokens, dtype
+            model,
+            lora_config,
+            max_num_seqs,
+            max_num_batched_tokens,
+            dtype,
+            encoder=encoder,
         )
 
     def add_adapter(self, lora_request: LoRARequest) -> bool:
@@ -47,6 +56,7 @@ class MetalWorkerLoRAManager:
             lora_id=lora_id,
             max_position_embeddings=self.max_position_embeddings,
             lora_config=self.lora_config,
+            weights_mapper=self.weights_mapper,
         )
         if already_loaded:
             self._mm.replace_adapter(adapter)
@@ -71,6 +81,11 @@ class MetalWorkerLoRAManager:
 
     def list_adapters(self) -> set[int]:
         return self._mm.list_adapters()
+
+    def set_encoder_adapter(self, lora_id: int | None) -> None:
+        if lora_id is not None:
+            self._mm.activate_adapter(lora_id)
+        self._mm.set_encoder_adapter(lora_id)
 
     def set_active_adapters(
         self, lora_requests: set[LoRARequest], mapping: LoRAMapping | None

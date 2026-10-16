@@ -180,6 +180,12 @@ class MultimodalRuntimeAdapter(Protocol):
       encoder profiling): one feature of the largest encoder input, which
       ``MetalModelRunner.profile_run`` encodes so the measured allocator
       overhead covers the vision tower.
+    - ``lora_weights_mapper: WeightsMapper`` (default ``None``): rewrites PEFT
+      adapter module names from the HF checkpoint layout to the names of the
+      wrapped MLX modules.
+    - ``lora_encoder_target() -> EncoderLoRATarget`` (default absent): the
+      vision tower and connector that ``--enable-tower-connector-lora``
+      adapts.  Without it the flag is rejected.
     - ``bidirectional_layer_kinds: frozenset[str]`` (default empty): the layer
       kinds (``"sliding"``, ``"full"``) on which the rows of an image block
       attend to the whole block, not only causally.  Gemma 4 sets

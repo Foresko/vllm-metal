@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 
 if TYPE_CHECKING:
+    from vllm.lora.request import LoRARequest
+
     from vllm_metal.v1.model_adapter import MultimodalEncodeResult
 
 
@@ -24,14 +26,21 @@ class EncoderCache:
     def __init__(self) -> None:
         self.mm_features: dict[str, list[MultiModalFeatureSpec]] = {}
         self.encoder_outputs: dict[str, MultimodalEncodeResult] = {}
+        # The adapter each request's features are encoded under, for
+        # --enable-tower-connector-lora.
+        self.lora_requests: dict[str, LoRARequest | None] = {}
 
     def add_request(
         self, req_id: str, mm_features: list[MultiModalFeatureSpec]
     ) -> None:
         self.mm_features[req_id] = mm_features
 
+    def set_lora_request(self, req_id: str, lora_request: LoRARequest | None) -> None:
+        self.lora_requests[req_id] = lora_request
+
     def remove_request(self, req_id: str) -> None:
         self.mm_features.pop(req_id, None)
+        self.lora_requests.pop(req_id, None)
 
     def reset_mm_cache(self) -> None:
         """Mirror upstream's profiling-cache reset hook."""
