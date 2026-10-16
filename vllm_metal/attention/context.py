@@ -152,6 +152,9 @@ class PagedAttentionContext:
     paged_native_capabilities: dict[str, bool] | None = None
     # Immutable native length statistics, shared by all KV groups/layers.
     gqa_length_plan: Any = None
+    # NAX tile counts keyed by (sliding window, first sequence), so whole
+    # batches and prefill subsets are shared only by matching layers.
+    nax_tile_work: Any = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

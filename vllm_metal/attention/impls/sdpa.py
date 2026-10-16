@@ -63,6 +63,7 @@ from vllm_metal.attention.impls.turboquant_prefill import (
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
+from vllm_metal.attention.nax_split import nax_split_kwargs, nax_tile_work
 from vllm_metal.metal import get_ops, paged_attention_capabilities
 
 logger = init_logger(__name__)
@@ -922,6 +923,8 @@ def sdpa_forward(
             )
             batch = plan.prefill
             query = q_3d if batch.query_indices is None else q_3d[batch.query_indices]
+            if ctx.paged_native_capabilities is None:
+                ctx.paged_native_capabilities = paged_attention_capabilities(ops)
             ops.paged_attention_primitive(
                 query,
                 k16.reshape(-1, kernel_block_size, cache_kv_heads, q_3d.shape[2]),
@@ -937,6 +940,10 @@ def sdpa_forward(
                 layer_sliding_window,
                 out,
                 window_seqlen_q=ctx.verify_window_q,
+                # The dequantized lane only admits full-attention layers.
+                **nax_split_kwargs(
+                    ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
+                ),
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -1004,6 +1011,42 @@ def sdpa_forward(
                     ctx.context_lens[:num_decode]
                 )
             paged_kwargs["gqa_length_plan"] = ctx.gqa_length_plan
+        if capabilities["nax_split_hint"] and q_3d.shape[0] > len(ctx.context_lens):
+            # Prefill batch: pick the NAX pipeline from per-sequence lengths
+            # the kernel dispatcher could only read back from the GPU.
+            # Native alone decides whether to split off ordinary decode rows.
+            work = prefill_work = None
+            if (
+                ctx.cu_seqlens is not None
+                and len(ctx.cu_seqlens) == len(ctx.context_lens) + 1
+                and ctx.cu_seqlens[-1] == q_3d.shape[0]
+            ):
+                if ctx.nax_tile_work is None:
+                    ctx.nax_tile_work = {}
+
+                def tile_work(first_seq: int):
+                    key = (layer_sliding_window, first_seq)
+                    if key not in ctx.nax_tile_work:
+                        ctx.nax_tile_work[key] = nax_tile_work(
+                            ctx.cu_seqlens[first_seq:],
+                            ctx.context_lens[first_seq:],
+                            layer_sliding_window,
+                        )
+                    return ctx.nax_tile_work[key]
+
+                work = tile_work(0)
+                if (
+                    capabilities["nax_prefill_split_hint"]
+                    and 0 < num_decode < len(ctx.context_lens)
+                    and num_decode == ctx.num_decode_tokens
+                    and ctx.verify_window_q == 1
+                ):
+                    prefill_work = tile_work(num_decode)
+            paged_kwargs.update(
+                nax_split_kwargs(
+                    capabilities, work, q_3d.shape[2], prefill_work=prefill_work
+                )
+            )
         ops.paged_attention_primitive(
             q_3d,
             kernel_k_cache,

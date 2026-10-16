@@ -15,6 +15,7 @@ from vllm_metal.attention.caches.turboquant import (
     prefill_bytes_per_token,
 )
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.nax_split import NaxTileWork, nax_tile_work
 from vllm_metal.metal.constants import KERNEL_BLOCK_SIZES
 
 if TYPE_CHECKING:
@@ -170,6 +171,8 @@ class _AttentionBatch:
     seq_lens: mx.array
     cu_seqlens_q: mx.array
     max_seq_len: int
+    # KV-tile counts for the NAX pipeline choice (dequantized prefill only).
+    nax_work: NaxTileWork | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -326,19 +329,26 @@ def _turboquant_prefill_plan(
         if not fallback_ids:
             # The whole batch keeps its original query order and metadata.
             return _AttentionBatch(
-                None, tables, meta.seq_lens, meta.cu_seqlens_q, meta.max_seq_len
+                None,
+                tables,
+                meta.seq_lens,
+                meta.cu_seqlens_q,
+                meta.max_seq_len,
+                nax_tile_work(cu_seqlens, ctx.context_lens),
             )
         indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
         query_order.extend(indices)
         cu = [0]
         for i in ids:
             cu.append(cu[-1] + lengths[i])
+        kv_lens = [ctx.context_lens[i] for i in ids]
         return _AttentionBatch(
             mx.array(indices, dtype=mx.int32),
             tables,
-            mx.array([ctx.context_lens[i] for i in ids], dtype=mx.int32),
+            mx.array(kv_lens, dtype=mx.int32),
             mx.array(cu, dtype=mx.int32),
-            max(ctx.context_lens[i] for i in ids),
+            max(kv_lens),
+            nax_tile_work(cu, kv_lens),
         )
 
     tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)

@@ -38,6 +38,8 @@ def test_native_reports_public_routing_capabilities():
         "gqa_batch_context_lens": True,
         "gqa_length_plan": True,
         "gqa_mixed_decode_plan": True,
+        "nax_split_hint": True,
+        "nax_prefill_split_hint": True,
     }
 
 

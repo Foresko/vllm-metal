@@ -26,10 +26,17 @@ Head sizes 64/96 (TD=4/6) skip the mid-loop scheduling barrier. Head sizes
 128/256/512 (TD=8/16/32) split the PV loop at its midpoint; their output
 accumulators hold 64/128/256 fp32 values per thread, respectively.
 
-Every case is checked for *engagement*, not just agreement. NAX accumulates
-through the tensor unit with ``relaxed_precision``, so a bitwise-identical
-result means the batch never reached NAX -- eligibility rejected it and the
-comparison was vacuous.
+Additional boundary cases poison unused cache slots with NaNs and independently
+exercise small sliding windows, softcap and sinks. Dispatch diagnostics verify
+that both kernels ran; zero- and one-token windows can legitimately produce
+identical outputs.
+
+Without a hint these batches take the original loop. A subset -- every
+boundary case (NaN padding, windows, softcap, sinks), including one each at
+head sizes 64/96, and block size 16 at head sizes 128/256/512 -- also runs
+with ``nax_split_hint`` forced to 0 and 1 and checks the pipeline that actually
+ran. Forced-hint cases exercise both pipelines except at head_size 512, where
+both hints use the original loop; the final counts distinguish these fallbacks.
 """
 
 from __future__ import annotations
@@ -44,7 +51,20 @@ from vllm_metal.metal import get_ops
 
 # (query tokens, context tokens) per sequence. One-token rows exercise decode
 # passengers in a mixed prefill batch.
-SEQS = [(129, 130), (1, 999), (64, 0), (1, 333)]
+SEQS = ((129, 130), (1, 999), (64, 0), (1, 333))
+# Full/partial 16-row Q tiles and KV lengths around 32-token boundaries.
+BOUNDARY_SEQS = (
+    (16, 15),  # 31 KV tokens
+    (17, 15),  # 32
+    (32, 1),  # 33
+    (33, 31),  # 64
+    (48, 17),  # 65
+    (63, 0),
+    (64, 0),
+    (64, 1),
+    (16, 32),
+    (17, 33),
+)
 Q_HEADS = 32
 KV_HEADS = 8
 
@@ -72,19 +92,12 @@ class Case:
     dtype: mx.Dtype
     head_size: int
     block_size: int
-    regime: str  # "fast" (tile_no_mask + _sk0) | "masked" (mask arm + _sk1)
-
-    @property
-    def softcap(self) -> float:
-        return 0.0 if self.regime == "fast" else SOFTCAP
-
-    @property
-    def sliding_window(self) -> int:
-        return -1 if self.regime == "fast" else SLIDING_WINDOW
-
-    @property
-    def use_sinks(self) -> bool:
-        return self.regime == "masked"
+    regime: str
+    softcap: float = 0.0
+    sliding_window: int = -1
+    use_sinks: bool = False
+    seqs: tuple[tuple[int, int], ...] = SEQS
+    poison_padding: bool = False
 
     def __str__(self) -> str:
         return (
@@ -98,7 +111,15 @@ def _cases() -> list[Case]:
     {half, bfloat16_t} x hs{64, 96, 128, 256, 512} x bs{8, 16, 32}, and the
     dispatcher picks a separate pipeline per sinks constant."""
     return [
-        Case(dtype, head_size, block_size, regime)
+        Case(
+            dtype,
+            head_size,
+            block_size,
+            regime,
+            softcap=SOFTCAP if regime == "masked" else 0.0,
+            sliding_window=SLIDING_WINDOW if regime == "masked" else -1,
+            use_sinks=regime == "masked",
+        )
         for dtype in (mx.float16, mx.bfloat16)
         for head_size in (64, 96, 128, 256, 512)
         for block_size in (8, 16, 32)
@@ -106,10 +127,59 @@ def _cases() -> list[Case]:
     ]
 
 
+def _boundary_cases() -> list[Case]:
+    cases = []
+    for dtype, head_size in ((mx.float16, 128), (mx.bfloat16, 256)):
+        for block_size in (8, 16, 32):
+            cases.append(
+                Case(
+                    dtype,
+                    head_size,
+                    block_size,
+                    "boundary-fast",
+                    seqs=BOUNDARY_SEQS,
+                    poison_padding=True,
+                )
+            )
+        # Keep masking independent without multiplying the full shape matrix.
+        for name, window, softcap, sinks in [
+            *[(f"window-{w}", w, 0.0, False) for w in (0, 1, 31, 32, 33, 63, 64, 65)],
+            ("softcap", -1, SOFTCAP, False),
+            ("sinks", -1, 0.0, True),
+        ]:
+            cases.append(
+                Case(
+                    dtype,
+                    head_size,
+                    16,
+                    f"boundary-{name}",
+                    softcap=softcap,
+                    sliding_window=window,
+                    use_sinks=sinks,
+                    seqs=BOUNDARY_SEQS,
+                    poison_padding=True,
+                )
+            )
+    # Cover the TD=4/6 specializations on both pipelines without expanding
+    # the dtype/block-size/masking matrix.
+    cases.extend(
+        Case(
+            dtype,
+            head_size,
+            16,
+            "boundary-fast",
+            seqs=BOUNDARY_SEQS,
+            poison_padding=True,
+        )
+        for dtype, head_size in ((mx.float16, 64), (mx.bfloat16, 96))
+    )
+    return cases
+
+
 def _build_case(case: Case):
     mx.random.seed(3)
     block_size, head_size = case.block_size, case.head_size
-    totals = [q + c for q, c in SEQS]
+    totals = [q + c for q, c in case.seqs]
     blocks_per = [(t + block_size - 1) // block_size for t in totals]
     num_blocks = sum(blocks_per) + 1  # block 0 is padding
 
@@ -117,7 +187,7 @@ def _build_case(case: Case):
     key_cache = mx.random.normal(shape).astype(case.dtype)
     value_cache = mx.random.normal(shape).astype(case.dtype)
     query = (
-        mx.random.normal((sum(q for q, _ in SEQS), Q_HEADS, head_size)) * 0.5
+        mx.random.normal((sum(q for q, _ in case.seqs), Q_HEADS, head_size)) * 0.5
     ).astype(case.dtype)
 
     # Non-contiguous physical pages exercise the block-table gather.
@@ -126,13 +196,25 @@ def _build_case(case: Case):
     for count in blocks_per:
         rows.append(block_ids[offset : offset + count])
         offset += count
+    if case.poison_padding:
+        valid_lens = [0] * num_blocks
+        for total, row in zip(totals, rows, strict=True):
+            for logical_block, physical_block in enumerate(row):
+                valid_lens[physical_block] = min(
+                    block_size, total - logical_block * block_size
+                )
+        valid = mx.arange(block_size)[None, :] < mx.array(valid_lens)[:, None]
+        valid = valid[:, :, None, None]
+        padding = mx.array(float("nan"), dtype=case.dtype)
+        key_cache = mx.where(valid, key_cache, padding)
+        value_cache = mx.where(valid, value_cache, padding)
     max_blocks = max(blocks_per)
     block_tables = mx.array(
         [row + [0] * (max_blocks - len(row)) for row in rows], dtype=mx.int32
     )
     seq_lens = mx.array(totals, dtype=mx.int32)
     cu_seqlens = mx.array(
-        [0, *mx.cumsum(mx.array([q for q, _ in SEQS], dtype=mx.int32)).tolist()],
+        [0, *mx.cumsum(mx.array([q for q, _ in case.seqs], dtype=mx.int32)).tolist()],
         dtype=mx.int32,
     )
     sinks = (
@@ -146,7 +228,9 @@ def _build_case(case: Case):
     return key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks
 
 
-def _run(ops, case: Case, built, *, enabled: bool) -> mx.array:
+def _run(
+    ops, case: Case, built, *, enabled: bool, split_hint: int | None = None
+) -> tuple[mx.array, str, int]:
     key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens, sinks = built
     ops.set_nax_enabled(enabled)
     out = mx.array(0)
@@ -165,33 +249,59 @@ def _run(ops, case: Case, built, *, enabled: bool) -> mx.array:
         case.sliding_window,
         out,
         sinks=sinks,
+        **({} if split_hint is None else {"nax_split_hint": split_hint}),
     )
     mx.eval(out)
-    return out.astype(mx.float32)
+    return (
+        out.astype(mx.float32),
+        ops.last_paged_dispatch(),
+        ops.last_nax_split_pipeline(),
+    )
 
 
-def _check(ops, case: Case) -> tuple[bool, str]:
-    built = _build_case(case)
-    nax = _run(ops, case, built, enabled=True)
-    tiled = _run(ops, case, built, enabled=False)
-    mx.eval(nax, tiled)
-
+def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
     delta = mx.abs(nax - tiled)
     abs_err = delta.max().item()
     ulp = _DTYPE_EPS[case.dtype] * max(mx.abs(tiled).max().item(), 1.0)
     max_ulp = abs_err / ulp
     mean_ulp = delta.mean().item() / ulp
 
-    if abs_err == 0.0:
-        # Both runs took the same kernel: nax_eligible() or the batch-shape
-        # guard rejected this case, so nothing about NAX was tested.
-        return False, "NAX DID NOT RUN (identical output; check eligibility)"
     if not math.isfinite(abs_err):
         return False, f"non-finite output (abs={abs_err})"
     detail = f"max={max_ulp:.2f}ulp mean={mean_ulp:.4f}ulp"
     if max_ulp > MAX_ULP or mean_ulp > MEAN_ULP:
         return False, f"{detail} exceeds bound"
     return True, detail
+
+
+def _forced_hints(case: Case) -> bool:
+    return case.regime.startswith("boundary") or (
+        case.block_size == 16 and case.head_size >= 128
+    )
+
+
+def _check(ops, case: Case) -> tuple[bool, str]:
+    built = _build_case(case)
+    tiled, tiled_dispatch, _ = _run(ops, case, built, enabled=False)
+    if tiled_dispatch != "tiled_prefill":
+        return False, f"unexpected dispatch: tiled={tiled_dispatch}"
+    details = []
+    for hint in (0, 1) if _forced_hints(case) else (None,):
+        nax, nax_dispatch, pipeline = _run(
+            ops, case, built, enabled=True, split_hint=hint
+        )
+        if nax_dispatch != "nax_prefill":
+            return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
+        if hint is not None:
+            expected = hint if case.head_size < 512 else 0
+            if pipeline != expected:
+                return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
+        mx.eval(nax, tiled)
+        ok, detail = _compare(case, nax, tiled)
+        details.append(f"{'split' if pipeline == 1 else 'loop'}: {detail}")
+        if not ok:
+            return False, "; ".join(details)
+    return True, "; ".join(details)
 
 
 def main() -> int:
@@ -203,15 +313,18 @@ def main() -> int:
         )
         return 2
 
+    cases = _cases() + _boundary_cases()
     failures = []
+    previous_diagnostics = ops._set_paged_dispatch_diagnostics(True)
     try:
-        for case in _cases():
+        for case in cases:
             ok, detail = _check(ops, case)
             print(f"{'ok  ' if ok else 'FAIL'} {case}  {detail}")
             if not ok:
                 failures.append(f"{case}: {detail}")
     finally:
         ops.set_nax_enabled(True)
+        ops._set_paged_dispatch_diagnostics(previous_diagnostics)
 
     if failures:
         print(
@@ -222,7 +335,13 @@ def main() -> int:
         for failure in failures:
             print(f"  {failure}", file=sys.stderr)
         return 1
-    print(f"\nPARITY PASS ({len(_cases())} cases)")
+    forced = sum(_forced_hints(case) for case in cases)
+    fallback = sum(_forced_hints(case) and case.head_size == 512 for case in cases)
+    print(
+        f"\nPARITY PASS ({len(cases)} cases, {forced} forced-hint cases: "
+        f"{forced - fallback} on both NAX pipelines, "
+        f"{fallback} D512 unsplit fallback cases)"
+    )
     return 0
 
 

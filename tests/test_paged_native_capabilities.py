@@ -25,6 +25,8 @@ def test_structured_capabilities_are_normalized():
         "gqa_batch_context_lens": False,
         "gqa_length_plan": False,
         "gqa_mixed_decode_plan": False,
+        "nax_split_hint": False,
+        "nax_prefill_split_hint": False,
     }
     query.assert_called_once_with()
 
