@@ -42,6 +42,96 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Fingerprint native build toolchain
+      id: native-toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        source scripts/lib.sh
+        # Same probe/download test.sh runs; idempotent, so `xcrun metal` is
+        # guaranteed usable here before we read its version.
+        ensure_metal_toolchain
+        ensure_uv
+        py=$(uv python find 3.12)
+        {
+          # InstalledDir is a per-boot cryptex mount path; drop it.
+          xcrun -sdk macosx metal --version | grep -v '^InstalledDir:'
+          clang --version
+          xcrun -sdk macosx --show-sdk-version
+          "$py" -c 'import sys; print(sys.version)'
+          echo "DEVELOPER_DIR=${DEVELOPER_DIR:-}"
+          echo "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-}"
+          # Only the pins that select compiled-against headers/ABIs.
+          grep -E '"(mlx|nanobind)==' pyproject.toml
+        } | tee /dev/stderr | shasum -a 256 | cut -c1-16 > "$RUNNER_TEMP/tc"
+        echo "hash=$(cat "$RUNNER_TEMP/tc")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached native build artifacts
+      id: native-cache
+      uses: actions/cache/restore@v4
+      with:
+        # Artifacts travel with their .sha256 stamps (digests of build
+        # inputs, not checksums of the artifacts); the build recompiles
+        # anything whose stamp no longer matches the current sources.
+        # Compiler/SDK compatibility relies on two layers: the toolchain
+        # fingerprint in this key (metal/clang/SDK/Python versions, Xcode
+        # pin, deployment target, mlx/nanobind pins) and, for metallibs
+        # only, the build-side .toolchain record. The .so stamps record no
+        # compiler version, so for those the key is the only guard. The key
+        # also hashes what the stamps digest (Metal/C++ sources, shader
+        # assembly, build.py/constants.py, the MPS launcher) and the vLLM
+        # release tag (which pins torch).
+        # Only pushes to main save (see the save step): a PR's cache is
+        # invisible to main and other PRs, so saving there only spends quota.
+        # On an exact-key miss, restore-keys falls back to the newest entry
+        # with the same toolchain fingerprint; the stamps (which digest the
+        # mlx/nanobind/torch versions too) then rebuild only the artifacts
+        # whose inputs changed and keep the rest.
+        path: |
+          vllm_metal/metal/*.metallib
+          vllm_metal/metal/*.metallib.sha256
+          vllm_metal/metal/*.metallib.toolchain
+          vllm_metal/metal/_paged_ops*.so
+          vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so
+          vllm_metal/pytorch_backend/_mps_ops*.so.sha256
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+        key: >-
+          native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-${{ hashFiles(
+          'vllm_metal/metal/build.py',
+          'vllm_metal/metal/constants.py',
+          'vllm_metal/metal/__init__.py',
+          'vllm_metal/metal/*.cpp',
+          'vllm_metal/metal/*.h',
+          'vllm_metal/metal/kernels_v2/**',
+          'vllm_metal/pytorch_backend/mps_ops.mm',
+          '.github/vllm-release-tag.commit'
+          ) }}
+        restore-keys: |
+          native-${{ matrix.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.hash }}-
+
     - name: Test
       run: |
         scripts/test.sh
+
+    # Save only after a fully successful Test step: a build that failed midway
+    # would leave an artifact missing, and an exact-key hit never re-saves, so
+    # that incomplete entry would force the same rebuild on every later run.
+    - name: Save native build artifacts
+      if: >-
+        success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        && steps.native-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          vllm_metal/metal/*.metallib
+          vllm_metal/metal/*.metallib.sha256
+          vllm_metal/metal/*.metallib.toolchain
+          vllm_metal/metal/_paged_ops*.so
+          vllm_metal/metal/_paged_ops*.so.sha256
+          vllm_metal/metal/_paged_ops.mlx-version
+          vllm_metal/pytorch_backend/_mps_ops*.so
+          vllm_metal/pytorch_backend/_mps_ops*.so.sha256
+          vllm_metal/pytorch_backend/_mps_ops.torch-version
+        key: ${{ steps.native-cache.outputs.cache-primary-key }}

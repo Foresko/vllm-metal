@@ -148,6 +148,7 @@ Thumbs.db
 # the wheel as package data; never committed). *.so is covered above.
 vllm_metal/metal/*.metallib
 vllm_metal/metal/*.sha256
+vllm_metal/metal/*.toolchain
 vllm_metal/metal/*.mlx-version
 vllm_metal/pytorch_backend/*.torch-version
 vllm_metal/pytorch_backend/*.sha256
