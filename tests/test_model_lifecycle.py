@@ -1468,6 +1468,24 @@ class TestResolveModelDims:
         assert runner.num_kv_heads == 8
         assert runner.head_dim == 128
 
+    def test_null_mla_fields_resolve_as_standard_attention(self) -> None:
+        # Mistral-Small-3.1 text config as mlx-vlm's mistral3 TextConfig gives it.
+        runner = self._resolve(
+            {
+                "num_hidden_layers": 40,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "hidden_size": 5120,
+                "head_dim": 128,
+                "kv_lora_rank": None,
+                "qk_rope_head_dim": None,
+            }
+        )
+
+        assert runner.is_mla is False
+        assert runner.num_kv_heads == 8
+        assert runner.head_dim == 128
+
     @pytest.mark.parametrize(
         ("args", "expected_head_dim"),
         [

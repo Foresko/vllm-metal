@@ -536,7 +536,8 @@ class MetalModelRunner:
         cannot use the standard Metal kernel. Worker uses this to select the
         appropriate paged attention backend for PR2.
         """
-        return "kv_lora_rank" in self.model_args
+        # mlx-vlm's mistral3 config declares kv_lora_rank=None for non-MLA text.
+        return self.model_args.get("kv_lora_rank") is not None
 
     @property
     def is_hybrid(self) -> bool:

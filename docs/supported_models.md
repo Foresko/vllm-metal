@@ -122,6 +122,12 @@ Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
+Mistral Small 3.1 (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit`) is
+a vision-language model. By default vllm-metal serves its text backbone through
+mlx_lm and rejects image input. Ministral 3 and Devstral Small 2 take the same
+path but fail at load on `attn_scale`
+([#1130](https://github.com/vllm-project/vllm-metal/issues/1130)).
+
 Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
 checkpoints converted from it. Direct loading of the official serialized
 block-FP8 checkpoint is not supported.

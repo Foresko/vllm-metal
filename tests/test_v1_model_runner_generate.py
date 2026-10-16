@@ -2228,6 +2228,10 @@ class TestRunnerMlaProperties:
         runner = self._make_runner({"kv_lora_rank": 512})
         assert runner.is_mla is True
 
+    def test_is_mla_false_when_kv_lora_rank_is_none(self) -> None:
+        runner = self._make_runner({"kv_lora_rank": None})
+        assert runner.is_mla is False
+
     def test_is_mla_false_for_standard_attention(self) -> None:
         runner = self._make_runner(
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
