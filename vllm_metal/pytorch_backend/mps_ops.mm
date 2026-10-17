@@ -190,10 +190,10 @@ class PagedAttention {
         if (prefill) {
           grid_y = tokens / (nax ? kernels::kNaxBQ : cfg.BQ) + seqs;
           threads = nax ? kernels::kNaxThreads : cfg.NUM_THREADS;
+          scalar<int>(enc, 30, 0);  // q_block_offset: this launch covers every block.
           if (!nax) {
             [enc setThreadgroupMemoryLength:
                 kernels::tiled_shared_bytes(cfg, head_size, q.element_size()) atIndex:0];
-            scalar<int>(enc, 30, 0);  // q_block_offset: this launch covers every block.
           }
         } else {
           [enc setThreadgroupMemoryLength:kernels::paged_threadgroup_bytes(

@@ -42,14 +42,19 @@ assert sys.modules["_paged_ops"] is None
     assert result.stderr.count("GPU core count is unknown") == 1
 
 
-def test_mps_tiled_prefill_binds_every_kernel_argument():
+@pytest.mark.parametrize("nax", [False, True], ids=["tiled", "nax"])
+def test_mps_prefill_binds_every_kernel_argument(nax):
     # Metal API validation logs each kernel argument a dispatch leaves unbound.
-    metallib = (
-        Path(__file__).resolve().parents[1]
-        / "vllm_metal"
-        / "metal"
-        / "paged_attention_v2_kern.metallib"
-    )
+    metal_dir = Path(__file__).resolve().parents[1] / "vllm_metal" / "metal"
+    metallib = metal_dir / "paged_attention_v2_kern.metallib"
+    nax_metallib = ""
+    if nax:
+        from vllm_metal.metal.build import NAX_METALLIB_NAME
+        from vllm_metal.pytorch_backend.mps_ops import _load_mps_module
+
+        nax_metallib = metal_dir / f"{NAX_METALLIB_NAME}.metallib"
+        if not _load_mps_module().nax_supported() or not nax_metallib.exists():
+            pytest.skip("Requires NAX hardware and the NAX metallib")
     result = subprocess.run(
         [
             sys.executable,
@@ -58,7 +63,8 @@ def test_mps_tiled_prefill_binds_every_kernel_argument():
 import sys
 import torch
 from vllm_metal.pytorch_backend.mps_ops import get_mps_ops
-ops = type(get_mps_ops())(sys.argv[1], "", 20)  # No NAX library: tiled prefill.
+# argv[2]: "" -> tiled prefill; NAX metallib path -> NAX prefill.
+ops = type(get_mps_ops())(sys.argv[1], sys.argv[2], 20)
 q = torch.randn(40, 16, 128, dtype=torch.bfloat16, device="mps")
 k, v = torch.randn(2, 40, 8, 128, dtype=torch.bfloat16, device="mps")
 cache = torch.zeros(4, 16, 8, 256, dtype=torch.bfloat16, device="mps")
@@ -73,6 +79,7 @@ ops.forward(
 torch.mps.synchronize()
 """,
             str(metallib),
+            str(nax_metallib),
         ],
         check=True,
         capture_output=True,
@@ -84,6 +91,7 @@ torch.mps.synchronize()
         },
     )
     assert "Metal API Validation Enabled" in result.stderr
+    assert "Cannot load NAX metallib" not in result.stderr
     assert "Compute Function(paged_attention" not in result.stderr
 
 
