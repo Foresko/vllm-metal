@@ -207,7 +207,6 @@ def test_native_prefill_hint_only_applies_after_decode_separation(
             inputs["block_size"],
             decode_kv,
             [decode_kv],
-            preplanned=False,
             gqa_disabled=True,
         )
         mx.eval(decode)

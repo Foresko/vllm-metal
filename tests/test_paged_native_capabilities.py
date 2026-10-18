@@ -22,7 +22,6 @@ def test_structured_capabilities_are_normalized():
         "gqa_decode": False,
         "gqa_disable": False,
         "decode_routing_metadata": True,
-        "gqa_batch_context_lens": False,
         "gqa_length_plan": False,
         "gqa_mixed_decode_plan": False,
         "nax_split_hint": False,

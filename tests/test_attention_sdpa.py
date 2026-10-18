@@ -681,7 +681,6 @@ class _PagedRoutingOpsSpy:
             "gqa_decode": True,
             "gqa_disable": True,
             "decode_routing_metadata": True,
-            "gqa_batch_context_lens": True,
             "gqa_length_plan": True,
         }
 
@@ -728,7 +727,6 @@ class _PagedRoutingOpsSpy:
         num_decode_tokens: int = 0,
         max_decode_context_len: int = 0,
         gqa_disabled: bool = False,
-        gqa_context_lens: list[int] | None = None,
         gqa_length_plan: object = None,
         nax_split_hint: int = -1,
         nax_prefill_split_hint: int = -1,
@@ -741,7 +739,6 @@ class _PagedRoutingOpsSpy:
         self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
-        self.calls[-1].gqa_context_lens = gqa_context_lens
         self.calls[-1].gqa_length_plan = gqa_length_plan
         self.calls[-1].nax_split_hint = nax_split_hint
         self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint

@@ -190,7 +190,6 @@ NB_MODULE(_paged_ops, m) {
     caps["gqa_decode"] = true;
     caps["gqa_disable"] = true;
     caps["decode_routing_metadata"] = true;
-    caps["gqa_batch_context_lens"] = true;
     caps["gqa_length_plan"] = true;
     caps["gqa_mixed_decode_plan"] = true;
     caps["nax_split_hint"] = true;
@@ -386,7 +385,8 @@ NB_MODULE(_paged_ops, m) {
         [](nb::handle query_h, nb::handle key_h, nb::handle value_h,
            float scale, nb::handle tables_h, nb::handle lengths_h,
            int block_size, int max_seq_len, int partition_size,
-           nb::handle out_h, const std::vector<int>& context_lens) {
+           nb::handle out_h,
+           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
           const auto& q = *nb::inst_ptr<array>(query_h);
           const auto& k = *nb::inst_ptr<array>(key_h);
           const auto& v = *nb::inst_ptr<array>(value_h);
@@ -425,12 +425,12 @@ NB_MODULE(_paged_ops, m) {
               block_size, max_seq_len, -1, false, "", nullptr, nullptr,
               nullptr, nullptr, 3, 1, nullptr, nullptr, q.shape(0), q.shape(0),
               max_seq_len, false,
-              partition_size, context_lens);
+              partition_size, gqa_length_plan);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
         nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
         nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
-        nb::arg("out"), nb::arg("gqa_context_lens") = std::vector<int>{},
+        nb::arg("out"), nb::arg("gqa_length_plan") = nb::none(),
         "Private test-only one-token-per-request GQA dispatch with an explicit partition. "
         "Page IDs and sequence lengths must describe valid cache contents. "
         "Does not change the default selector or require GPU core detection.");
@@ -459,7 +459,6 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_requests,
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
-           const std::vector<int>& gqa_context_lens,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
            int nax_split_hint, int nax_prefill_split_hint) {
           const array* sk = sinks_h.is_none()
@@ -486,7 +485,7 @@ NB_MODULE(_paged_ops, m) {
               use_turboquant, quant_type, ks, vs, kz, vc, v_bits,
               window_seqlen_q, sk, mp, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
-              0, gqa_context_lens, gqa_length_plan, nax_split_hint,
+              0, gqa_length_plan, nax_split_hint,
               nax_prefill_split_hint);
           nb::inst_ptr<array>(out_h)->overwrite_descriptor(result);
         },
@@ -512,7 +511,6 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("num_decode_tokens") = 0,
         nb::arg("max_decode_context_len") = 0,
         nb::arg("gqa_disabled") = false,
-        nb::arg("gqa_context_lens") = std::vector<int>{},
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
@@ -535,11 +533,9 @@ NB_MODULE(_paged_ops, m) {
         "split-KV work by it rather than by max_seq_len.  "
         "gqa_disabled mirrors VLLM_METAL_DISABLE_GQA_DECODE and keeps "
         "eligible batches off the GQA-shared decode kernel. "
-        "gqa_context_lens is the CPU copy of seq_lens for a whole ordinary "
-        "decode batch, used for planning without a GPU readback; the caller "
-        "must keep both consistent. Alternatively pass a gqa_length_plan "
-        "built once per forward; its immutable offsets are shared by the nodes. "
-        "Omit both to retain legacy batch routing. "
+        "gqa_length_plan is per-request KV lengths for ordinary decode rows, "
+        "built once per forward with gqa_decode_length_plan; its immutable "
+        "offsets are shared by the nodes. Omit it to retain legacy batch routing. "
         "nax_split_hint (M5 NAX prefill only) selects the split full-tile "
         "pipeline (1) or the original loop (0); -1 uses the batch-average "
         "rule. nax_prefill_split_hint optionally overrides it only when "

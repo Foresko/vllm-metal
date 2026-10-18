@@ -117,7 +117,6 @@ def test_generic_admission_counts_static_reducer_memory(
             block,
             maximum,
             lengths,
-            preplanned=False,
             gqa_disabled=disabled,
             max_decode_context_len=length,
         )
@@ -328,7 +327,7 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
         "test_partition": partition,
     }
     rectangular, _ = _run_primitive(lengths, dtype, **kwargs)
-    out, ref = _run_primitive(lengths, dtype, gqa_context_lens=lengths, **kwargs)
+    out, ref = _run_primitive(lengths, dtype, gqa_lengths=lengths, **kwargs)
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
     assert get_ops().last_gqa_num_requests() == 4
@@ -356,7 +355,7 @@ def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
         block_size=block,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
@@ -382,7 +381,7 @@ def test_batch_gate_keeps_excluded_routes(kwargs):
     routing = {
         "num_decode_requests": 2,
         "num_decode_tokens": 2,
-        "gqa_context_lens": lengths,
+        "gqa_lengths": lengths,
     }
     routing.update(kwargs)
     out, ref = _run_primitive(
@@ -405,7 +404,7 @@ def test_batch_uses_known_core_budget_without_unsplit_grid_veto(
         seed=1007,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     if expected_partition:
         assert _dispatch_family() == "gqa_decode"
@@ -429,7 +428,7 @@ def test_production_dispatch_above_legacy_split_budget(dtype):
         head_size=128,
         num_decode_requests=len(lengths),
         num_decode_tokens=len(lengths),
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == 512
@@ -439,7 +438,7 @@ def test_production_dispatch_above_legacy_split_budget(dtype):
 
 @pytest.mark.parametrize("lengths", [[1], [0, 1024], [-1, 1024], [1024, 1025]])
 def test_invalid_host_lengths_fail_before_dispatch(lengths):
-    with pytest.raises(ValueError, match="gqa_context_lens"):
+    with pytest.raises(ValueError, match="gqa_length_plan"):
         _run_primitive(
             [1024, 1024],
             mx.float16,
@@ -447,12 +446,11 @@ def test_invalid_host_lengths_fail_before_dispatch(lengths):
             seed=1008,
             num_decode_requests=2,
             num_decode_tokens=2,
-            gqa_context_lens=lengths,
+            gqa_lengths=lengths,
         )
 
 
-@pytest.mark.parametrize("preplanned", [False, True])
-def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
+def test_host_lengths_are_captured_by_each_lazy_primitive():
     ops = get_ops()
     q = mx.ones((2, 32, 128), mx.float16)
     k = mx.ones((1344, 16, 8, 128), mx.float16)
@@ -461,11 +459,7 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
     lengths = mx.array([10752, 10752], mx.int32)
     cu = mx.array([0, 1, 2], mx.int32)
     host_lengths = [10752, 10752]
-    routing = (
-        {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
-        if preplanned
-        else {"gqa_context_lens": host_lengths}
-    )
+    routing = {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
     selected, fallback = mx.array(0), mx.array(0)
     ops.paged_attention_primitive(
         q,
@@ -504,7 +498,6 @@ def test_host_lengths_are_captured_by_each_lazy_primitive(preplanned):
         fallback,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=host_lengths,
     )
     mx.eval(fallback)
     _assert_fallback()
@@ -610,7 +603,7 @@ def test_unsupported_batch_cache_retains_fallback(dtype, turboquant):
         seed=1011,
         num_decode_requests=2,
         num_decode_tokens=2,
-        gqa_context_lens=lengths,
+        gqa_lengths=lengths,
         turboquant=turboquant,
     )
     _assert_fallback()

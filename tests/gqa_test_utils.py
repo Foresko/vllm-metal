@@ -22,18 +22,13 @@ def _primitive(
     maximum,
     host_lengths,
     *,
-    preplanned=True,
     gqa_disabled=False,
     max_decode_context_len=None,
 ):
     """Build an ordinary decode node without evaluating its lazy output."""
     ops = get_ops()
     batch, _, head = query.shape
-    routing = (
-        {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
-        if preplanned
-        else {"gqa_context_lens": host_lengths}
-    )
+    routing = {"gqa_length_plan": ops.gqa_decode_length_plan(host_lengths)}
     out = mx.array(0)
     ops.paged_attention_primitive(
         query,
@@ -196,7 +191,7 @@ def _run_primitive(
     turboquant: bool = False,
     native_reference: bool = False,
     test_partition: int | None = None,
-    gqa_context_lens: list[int] | None = None,
+    gqa_lengths: list[int] | None = None,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
     num_seqs = len(kv_lens)
@@ -237,8 +232,8 @@ def _run_primitive(
 
     key_ref, value_ref = key_cache, value_cache
     quant_kwargs = {}
-    if gqa_context_lens is not None:
-        quant_kwargs["gqa_context_lens"] = gqa_context_lens
+    if gqa_lengths is not None:
+        quant_kwargs["gqa_length_plan"] = get_ops().gqa_decode_length_plan(gqa_lengths)
     if turboquant:
         from vllm_metal.attention.caches.turboquant import (
             get_v_centroids,

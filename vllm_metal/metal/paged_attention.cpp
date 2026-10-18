@@ -1372,18 +1372,15 @@ array paged_attention_primitive_fn(
     int num_decode_tokens,
     int max_decode_context_len, bool gqa_disabled,
     int gqa_test_partition,
-    const std::vector<int>& gqa_context_lens,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
     int nax_split_hint, int nax_prefill_split_hint) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
     throw std::invalid_argument("nax_prefill_split_hint must be -1, 0 or 1");
-  if (gqa_length_plan && !gqa_context_lens.empty())
-    throw std::invalid_argument("pass only one of gqa_length_plan and gqa_context_lens");
-  const auto lengths = gqa_length_plan
-      ? *gqa_length_plan : gqa_decode_length_plan(gqa_context_lens);
-  if (gqa_length_plan || !gqa_context_lens.empty()) {
+  const auto lengths =
+      gqa_length_plan ? *gqa_length_plan : GqaDecodeLengthPlan{};
+  if (gqa_length_plan) {
     const bool shaped = query.ndim() == 3 && seq_lens.ndim() == 1 &&
         cu_seqlens_q.ndim() == 1 && lengths.num_requests > 0 &&
         lengths.max_length <= max_seq_len &&
@@ -1399,7 +1396,7 @@ array paged_attention_primitive_fn(
         lengths.max_length <= max_decode_context_len;
     if (!whole_decode && !decode_prefix) {
       throw std::invalid_argument(
-          "gqa_context_lens or gqa_length_plan requires one positive length per "
+          "gqa_length_plan requires one positive length per "
           "decode row (every row of a decode batch, or the leading ordinary "
           "decode rows of a mixed batch), bounded by max_seq_len and "
           "max_decode_context_len");

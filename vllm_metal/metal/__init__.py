@@ -63,7 +63,6 @@ def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
             "gqa_decode",
             "gqa_disable",
             "decode_routing_metadata",
-            "gqa_batch_context_lens",
             "gqa_length_plan",
             "gqa_mixed_decode_plan",
             "nax_split_hint",

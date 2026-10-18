@@ -35,7 +35,6 @@ def test_native_reports_public_routing_capabilities():
         "gqa_decode": True,
         "gqa_disable": True,
         "decode_routing_metadata": True,
-        "gqa_batch_context_lens": True,
         "gqa_length_plan": True,
         "gqa_mixed_decode_plan": True,
         "nax_split_hint": True,

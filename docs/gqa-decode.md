@@ -104,8 +104,7 @@ Its optional `gpu_arch` is a read-only simulation input; it cannot change
 actual dispatch. `max_seq_len` optionally supplies an allocation upper bound.
 These queries check geometry, work and the scratch budget, not all dispatch
 conditions. Direct primitive callers can pass `gqa_length_plan` from
-`gqa_decode_length_plan(context_lens)`, or the original `gqa_context_lens` list;
-the two inputs are mutually exclusive and must agree with GPU `seq_lens`.
+`gqa_decode_length_plan(context_lens)`; it must agree with GPU `seq_lens`.
 
 Kernel block size is the view after hybrid-cache translation. The largest
 supported size that evenly divides the scheduler page is selected: an 800- or
@@ -132,9 +131,8 @@ Every eligible call additionally requires:
   separates from a mixed batch (see below). One request in a pure-decode
   batch retains the existing `num_decode_requests=1` or omitted-count
   convention. Multiple requests require matching `num_decode_requests` and
-  `num_decode_tokens`, plus their CPU `gqa_context_lens` or
-  `gqa_length_plan` metadata; a mixed-batch decode prefix always requires a
-  `gqa_length_plan` describing exactly its rows.
+  `num_decode_tokens`, plus their CPU `gqa_length_plan` metadata. A mixed-batch
+  decode prefix requires a plan describing exactly its rows.
 - A verification window of at most 1.
 - Matching FP16/BF16 query, key-cache and value-cache types.
 - At most **512 MiB total GQA scratch per attention call**. With multi-request
