@@ -574,7 +574,13 @@ class MLAPagedAttentionWrapper(nn.Module):
             all_latent = latent_cache.latent_caches[layer_idx][
                 kernel.block_tables[cidx][:, :n_blocks]
             ].reshape(n_c, -1, latent_cache.latent_dim)[:, :max_ctx_c]
-            all_kv_norm = all_latent[..., :kv_lora_rank]
+            cols = mx.arange(max_ctx_c).reshape(1, -1)
+            valid_rows = cols < kernel.context_lens[cidx].astype(mx.int32).reshape(
+                -1, 1
+            )
+            all_kv_norm = mx.where(
+                valid_rows[..., None], all_latent[..., :kv_lora_rank], 0
+            )
             all_k_pe = all_latent[..., kv_lora_rank:]
 
             # cu_seqlens_q is already on-device from _kernel_inputs; gather the
@@ -585,10 +591,7 @@ class MLAPagedAttentionWrapper(nn.Module):
             ]
             rq_pe = mx.take(q_pe[0], starts, axis=1).transpose(1, 0, 2)[:, :, None, :]
 
-            cols = mx.arange(max_ctx_c).reshape(1, -1)
-            valid = (
-                cols < kernel.context_lens[cidx].astype(mx.int32).reshape(-1, 1)
-            ).reshape(n_c, 1, 1, max_ctx_c)
+            valid = valid_rows.reshape(n_c, 1, 1, max_ctx_c)
             outs.append(
                 self._apply_mla_attention(
                     rq_nope=rq_nope,

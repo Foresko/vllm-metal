@@ -107,7 +107,8 @@ the *capacity* the engine may reach rather than the resident footprint it pays
 for immediately: a 16 GB Mac can give the cache a multi-GB budget while a short
 request only occupies the blocks it writes. A slot a request never writes never
 reaches an output — the attention kernels mask every position past the sequence
-length — so the missing zero fill does not change results.
+length — so the missing zero fill does not change results. MLA's batched decode
+also zeroes padded latent rows before attention.
 
 Unified memory means the pool is not a reservation either way. Nothing pins it:
 `mx.set_wired_limit()` covers MLX-allocated buffers, not this torch allocation
