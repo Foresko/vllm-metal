@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import psutil
 import pytest
-from vllm.v1.kv_offload.base import ReqContext
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.tiering.base import TransferJob
 
@@ -149,6 +149,24 @@ def test_failed_release_keeps_the_pool(caplog) -> None:
         region.cleanup()
 
 
+def test_failed_reuse_raises() -> None:
+    """Wake must not go on: the kernel can drop writes to pages not taken back."""
+    region = make_region(make_storage())
+
+    def refuse(advice):
+        raise OSError("madvise refused")
+
+    assert region._state is not None
+    mapping = region._state.mapping
+    region._state.mapping = SimpleNamespace(madvise=refuse)
+    try:
+        with pytest.raises(OSError):
+            region.reuse_pages()
+    finally:
+        region._state.mapping = mapping
+        region.cleanup()
+
+
 def test_released_pool_round_trips_after_reuse() -> None:
     """After wake the same views store and load, and the scheduler side
     reads the stored bytes, so the disk tier still sees them."""
@@ -274,6 +292,24 @@ def test_tiering_spec_builds_manager_through_upstream(tmp_path) -> None:
     assert manager is not None
     (tier,) = manager.secondary_tiers
     assert isinstance(tier, MetalFileSystemTierManager)
+
+
+def test_reset_empties_the_host_pool_index() -> None:
+    """Sleep frees the pool's pages. That is only safe because the reset
+    vLLM runs first leaves no hit that would read them."""
+    manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
+    try:
+        ctx = ReqContext(req_id="r-sleep")
+        manager.on_new_request(ctx)
+        key = make_offload_key(hashlib.sha256(b"slept").digest(), 0)
+        assert manager.prepare_store([key], ctx) is not None
+        manager.complete_store([key], ctx)
+        assert manager.lookup(key, ctx) is LookupResult.HIT
+
+        manager.reset_cache()
+        assert manager.lookup(key, ctx) is LookupResult.MISS
+    finally:
+        manager.shutdown()
 
 
 def test_events_reach_the_manager_from_the_disk_tier(tmp_path) -> None:
