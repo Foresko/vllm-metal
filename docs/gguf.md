@@ -5,19 +5,6 @@ GGUF file carries weights only, so it needs a Hugging Face config and tokenizer
 source. That source can be a quantized checkpoint, such as an mlx-community
 4-bit, FP8, or AWQ repository; vllm-metal reads only its config and tokenizer.
 
-## Installation
-
-GGUF support needs an optional dependency. Install it inside the environment
-created by [Installation](installation.md):
-
-```bash
-source ~/.venv-vllm-metal/bin/activate
-pip install 'vllm-metal[gguf]'
-```
-
-Without it, the engine fails at model load with `ModuleNotFoundError: No module
-named 'gguf'`.
-
 ## Local weights
 
 Use a local `.gguf` file and point `--tokenizer` at the matching config and
