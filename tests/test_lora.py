@@ -1677,6 +1677,72 @@ def test_peft_loader_maps_hf_vlm_names_to_wrapped_modules(tmp_path: Path) -> Non
     }
 
 
+_TINY_QWEN3_5_TEXT_CONFIG = {
+    "model_type": "qwen3_5",
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 8,
+    "vocab_size": 64,
+    "linear_num_value_heads": 2,
+    "linear_num_key_heads": 1,
+    "linear_key_head_dim": 8,
+    "linear_value_head_dim": 8,
+    "linear_conv_kernel_dim": 4,
+    "full_attention_interval": 4,
+    "tie_word_embeddings": True,
+}
+
+
+@pytest.mark.parametrize("wrap_text_submodel", [False, True])
+def test_hf_vlm_adapter_loads_on_text_backbone(
+    tmp_path: Path, wrap_text_submodel: bool
+) -> None:
+    """A standard HF Qwen3.5/Gemma 4 adapter names text modules
+    ``model.language_model.*``. On the mlx_lm text backbone there is no
+    multimodal adapter to supply a mapper, so the manager must land those
+    names on the wrapper (``language_model.model.*``) or on the text sub-model
+    (``model.*``) by itself."""
+    from mlx_lm.models import qwen3_5
+    from safetensors.torch import save_file
+
+    config = {
+        "peft_type": "LORA",
+        "r": 2,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+    key = "base_model.model.model.language_model.layers.3.self_attn.q_proj"
+    save_file(
+        {
+            f"{key}.lora_A.weight": torch.ones(2, 16),
+            f"{key}.lora_B.weight": torch.ones(32, 2),  # q_proj emits q and gate
+        },
+        str(tmp_path / "adapter_model.safetensors"),
+    )
+    model = qwen3_5.Model(
+        qwen3_5.ModelArgs(model_type="qwen3_5", text_config=_TINY_QWEN3_5_TEXT_CONFIG)
+    )
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=model.language_model if wrap_text_submodel else model,
+        lora_config=_lora_config_stub(
+            max_loras=1, max_lora_rank=2, target_modules=["q_proj"]
+        ),
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+
+    request = SimpleNamespace(
+        lora_int_id=1, lora_path=str(tmp_path), load_inplace=False
+    )
+    assert manager.add_adapter(request) is True
+    assert manager.list_adapters() == {1}
+
+
 def _make_encoder_manager() -> tuple[
     model_manager_mod.MLXLoRAModelManager, _TwoLinearModel, _TwoLinearModel
 ]:

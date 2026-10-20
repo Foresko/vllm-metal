@@ -182,7 +182,8 @@ class MultimodalRuntimeAdapter(Protocol):
       overhead covers the vision tower.
     - ``lora_weights_mapper: WeightsMapper`` (default ``None``): rewrites PEFT
       adapter module names from the HF checkpoint layout to the names of the
-      wrapped MLX modules.
+      wrapped MLX modules. Without it the LoRA manager maps the HF text-model
+      prefix onto the wrapped tree (``peft_loader.default_weights_mapper``).
     - ``lora_encoder_target() -> EncoderLoRATarget`` (default absent): the
       vision tower and connector that ``--enable-tower-connector-lora``
       adapts.  Without it the flag is rejected.

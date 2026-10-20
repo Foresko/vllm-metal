@@ -10,7 +10,7 @@ from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_adapter_absolute_path
 
 from .model_manager import EncoderLoRATarget, MLXLoRAModelManager
-from .peft_loader import LoadedLoRA, load_peft_adapter
+from .peft_loader import LoadedLoRA, default_weights_mapper, load_peft_adapter
 
 if TYPE_CHECKING:
     import mlx.nn as nn
@@ -35,7 +35,9 @@ class MetalWorkerLoRAManager:
     ):
         self.lora_config = lora_config
         self.max_position_embeddings = max_position_embeddings
-        self.weights_mapper = weights_mapper
+        self.weights_mapper = (
+            default_weights_mapper(model) if weights_mapper is None else weights_mapper
+        )
         self._mm = MLXLoRAModelManager(
             model,
             lora_config,
