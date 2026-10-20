@@ -17,6 +17,7 @@ pytest.importorskip("vllm", reason="vllm not installed")
 import vllm.v1.worker.worker_base as worker_base  # noqa: E402
 from vllm.config import CacheConfig, VllmConfig  # noqa: E402
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout  # noqa: E402
+from vllm.v1.executor.abstract import UniProcExecutor  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
     KVCacheConfig,
@@ -343,6 +344,42 @@ class TestSleepMode:
             MetalWorker.discard(worker, ("weights",))
 
         assert calls == []
+
+    def test_wake_after_a_failed_release_does_not_restore(self, monkeypatch) -> None:
+        def release() -> None:
+            raise NotImplementedError("unsupported KV cache")
+
+        restores: list[str] = []
+        worker = _make_worker(
+            SimpleNamespace(
+                release_kv_cache_memory=release,
+                restore_kv_cache_memory=lambda: restores.append("restore"),
+            )
+        )
+        executor = UniProcExecutor.__new__(UniProcExecutor)
+        executor.sleeping_tags = set()
+
+        def collective_rpc(
+            method: str,
+            timeout: float | None = None,
+            args: tuple[object, ...] = (),
+            kwargs: dict[str, object] | None = None,
+            non_block: bool = False,
+        ) -> list[object]:
+            assert timeout is None
+            assert not non_block
+            return [getattr(worker, method)(*args, **(kwargs or {}))]
+
+        monkeypatch.setattr(executor, "collective_rpc", collective_rpc)
+
+        with pytest.raises(NotImplementedError, match="unsupported KV cache"):
+            executor.discard(("kv_cache",))
+        assert executor.sleeping_tags == {"kv_cache"}
+
+        executor.wake_up(tags=["kv_cache"])
+
+        assert executor.sleeping_tags == set()
+        assert restores == []
 
 
 class TestSleepReleasesHostPool:

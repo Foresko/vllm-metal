@@ -85,6 +85,7 @@ class MetalWorker(WorkerBase):
     # because its worker-facing method set is a superset of STTModelRunner's;
     # STT models are assigned an STTModelRunner at runtime (see init_device).
     model_runner: MetalModelRunner  # type: ignore[assignment]
+    _kv_cache_released = False
 
     def __init__(
         self,
@@ -397,8 +398,11 @@ class MetalWorker(WorkerBase):
         self.discard(("kv_cache",))
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        if tags is None or "kv_cache" in tags:
+        # vLLM marks the KV cache as sleeping even when discard() raised, so
+        # restore only what was actually released.
+        if self._kv_cache_released and (tags is None or "kv_cache" in tags):
             self.model_runner.restore_kv_cache_memory()
+            self._kv_cache_released = False
 
     def discard(self, tags: tuple[str, ...]) -> None:
         if set(tags) != {"kv_cache"}:
@@ -411,6 +415,7 @@ class MetalWorker(WorkerBase):
             )
         before = mx.get_active_memory()
         self.model_runner.release_kv_cache_memory()
+        self._kv_cache_released = True
         gc.collect()
         mx.clear_cache()
         logger.info(
