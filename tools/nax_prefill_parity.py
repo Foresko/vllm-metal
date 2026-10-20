@@ -24,7 +24,9 @@ Block size matters beyond the kernel name: at 8 the four half-row bases of a
 32-token KV tile land on four different pages, at 32 they collapse onto one.
 Head sizes 64/96 (TD=4/6) skip the mid-loop scheduling barrier. Head sizes
 128/256/512 (TD=8/16/32) split the PV loop at its midpoint; their output
-accumulators hold 64/128/256 fp32 values per thread, respectively.
+accumulators hold 64/128/256 fp32 values per thread, respectively. D512's
+split pipeline assigns 256 output columns to each of two threadgroups,
+reducing its per-thread output accumulators to 128 fp32 values.
 
 Additional boundary cases poison unused cache slots with NaNs and independently
 exercise small sliding windows, softcap and sinks. Dispatch diagnostics verify
@@ -33,10 +35,11 @@ identical outputs.
 
 Without a hint these batches take the original loop. A subset -- every
 boundary case (NaN padding, windows, softcap, sinks), including one each at
-head sizes 64/96, and block size 16 at head sizes 128/256/512 -- also runs
+head sizes 64/96/512, all D512 page sizes, and block size 16 at head sizes
+128/256 -- also runs
 with ``nax_split_hint`` forced to 0 and 1 and checks the pipeline that actually
-ran. Forced-hint cases exercise both pipelines except at head_size 512, where
-both hints use the original loop; the final counts distinguish these fallbacks.
+ran. All forced-hint cases exercise both pipelines; D512 hint 1 selects the
+two-slice ``_v256`` kernel.
 """
 
 from __future__ import annotations
@@ -160,8 +163,7 @@ def _boundary_cases() -> list[Case]:
                     poison_padding=True,
                 )
             )
-    # Cover the TD=4/6 specializations on both pipelines without expanding
-    # the dtype/block-size/masking matrix.
+    # Cover TD=4/6 and D512 output slices without expanding the matrix.
     cases.extend(
         Case(
             dtype,
@@ -171,7 +173,11 @@ def _boundary_cases() -> list[Case]:
             seqs=BOUNDARY_SEQS,
             poison_padding=True,
         )
-        for dtype, head_size in ((mx.float16, 64), (mx.bfloat16, 96))
+        for dtype, head_size in (
+            (mx.float16, 64),
+            (mx.bfloat16, 96),
+            (mx.bfloat16, 512),
+        )
     )
     return cases
 
@@ -273,8 +279,10 @@ def _compare(case: Case, nax: mx.array, tiled: mx.array) -> tuple[bool, str]:
 
 
 def _forced_hints(case: Case) -> bool:
-    return case.regime.startswith("boundary") or (
-        case.block_size == 16 and case.head_size >= 128
+    return (
+        case.regime.startswith("boundary")
+        or case.head_size == 512
+        or (case.block_size == 16 and case.head_size >= 128)
     )
 
 
@@ -291,7 +299,7 @@ def _check(ops, case: Case) -> tuple[bool, str]:
         if nax_dispatch != "nax_prefill":
             return False, f"hint={hint}: unexpected dispatch NAX={nax_dispatch}"
         if hint is not None:
-            expected = hint if case.head_size < 512 else 0
+            expected = hint
             if pipeline != expected:
                 return False, f"hint={hint}: ran pipeline {pipeline}, want {expected}"
         mx.eval(nax, tiled)
@@ -334,11 +342,9 @@ def main() -> int:
             print(f"  {failure}", file=sys.stderr)
         return 1
     forced = sum(_forced_hints(case) for case in cases)
-    fallback = sum(_forced_hints(case) and case.head_size == 512 for case in cases)
     print(
         f"\nPARITY PASS ({len(cases)} cases, {forced} forced-hint cases: "
-        f"{forced - fallback} on both NAX pipelines, "
-        f"{fallback} D512 unsplit fallback cases)"
+        f"{forced} on both NAX pipelines)"
     )
     return 0
 

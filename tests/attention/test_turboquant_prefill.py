@@ -166,7 +166,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
-    assert kwargs["nax_split_hint"] == int(head_dim < 512)
+    assert kwargs["nax_split_hint"] == 1
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.

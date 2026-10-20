@@ -107,7 +107,7 @@ METAL_FUNC void nax_row_reduce(const thread nax_frag8<float>& f,
 // general path, used for the boundary tile and for partial Q blocks.  On the
 // tiles GUARDED=false sees, every guard of the general path is true, so both
 // paths compute identical values.
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE, bool GUARDED>
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, bool GUARDED, int VALUE_SIZE>
 METAL_FUNC void nax_kv_tile(
     const int tile_start,
     const thread metal::array<const device T *, 2> &q_row,
@@ -134,6 +134,7 @@ METAL_FUNC void nax_kv_tile(
     thread float *sum_score) {
   constexpr int TILE_KV = 32;
   constexpr int TD = HEAD_SIZE / 16;
+  constexpr int VD = VALUE_SIZE / 16;
   using T4 = metal::vec<T, 4>;
 
   // Resolve the tile's 4 half-bases (one block lookup each) and fold in
@@ -266,7 +267,7 @@ METAL_FUNC void nax_kv_tile(
     sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
   }
 #pragma clang loop unroll(full)
-  for (short d = 0; d < TD; d++) {
+  for (short d = 0; d < VD; d++) {
 #pragma clang loop unroll(full)
     for (short i = 0; i < 2; i++) {
 #pragma clang loop unroll(full)
@@ -285,10 +286,9 @@ METAL_FUNC void nax_kv_tile(
   // That divergence is what tools/nax_prefill_parity.py bounds.
   // V is re-read per d-pair like MLX; the bases are already resolved.
 #pragma clang loop unroll(full)
-  for (short id = 0; id < TD; id += 2) {
-    if (TD >= 8 && id == TD / 2) {
-      // At TD=8 this is the MLX hd=128 scheduling barrier verbatim. The
-      // vLLM hd=256/512 extensions use the same midpoint split at TD=16/32.
+  for (short id = 0; id < VD; id += 2) {
+    if (VD >= 8 && id == VD / 2) {
+      // Keep the scheduling barrier at the midpoint of the output slice.
       threadgroup_barrier(mem_flags::mem_none);
     }
 #pragma clang loop unroll(full)
@@ -319,7 +319,7 @@ METAL_FUNC void nax_kv_tile(
   }
 }
 
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int VALUE_SIZE = HEAD_SIZE>
 [[kernel, max_total_threads_per_threadgroup(128)]] void paged_attention_nax(
     device T *out [[buffer(2)]],
     device const T *q [[buffer(3)]],
@@ -347,7 +347,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   constexpr int BQ = 64;       // 16 rows per simdgroup x 4 simdgroups
   constexpr int TILE_KV = 32;  // 2 K fragments of 16 tokens
   constexpr int TD = HEAD_SIZE / 16;
+  constexpr int VD = VALUE_SIZE / 16;
   static_assert(HEAD_SIZE % 16 == 0, "HEAD_SIZE must be a multiple of 16");
+  static_assert(VALUE_SIZE % 32 == 0 && HEAD_SIZE % VALUE_SIZE == 0,
+                "value slices must partition the head into 32-column tiles");
   static_assert(BLOCK_SIZE % 8 == 0,
                 "an 8-token fragment half must never cross a block boundary");
 
@@ -392,6 +395,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   // guards preserve those wide loads at partial-tile boundaries.
   using T4 = metal::vec<T, 4>;
 
+  // D512's split pipeline assigns each z-plane 256 output columns. QK and
+  // softmax are repeated, but each lane holds half as many O accumulators.
+  const int value_offset = VALUE_SIZE == HEAD_SIZE ? 0 : int(tgp.z) * VALUE_SIZE;
+  v_cache += value_offset;
+
   const device T *q_base = q
       + long(q_seq_start + q_pos_start + sg * 16) * q_stride
       + head_idx * HEAD_SIZE;
@@ -415,9 +423,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     max_score[0] = NAX_FINITE_MIN; max_score[1] = NAX_FINITE_MIN;
   }
 
-  nax_frag8<float> Otile[TD];
+  nax_frag8<float> Otile[VD];
 #pragma clang loop unroll(full)
-  for (short d = 0; d < TD; d++) Otile[d] = nax_frag8<float>(0.0f);
+  for (short d = 0; d < VD; d++) Otile[d] = nax_frag8<float>(0.0f);
 
   const float scale_log2 = scale * M_LOG2E_F;
   const int min_q_abs_sg = context_len + q_pos_start + sg * 16;
@@ -443,14 +451,14 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     const int q_abs_sg = context_len + q_pos_start + sg * 16;
 
     for (int kb = kb_start; kb < kb_full_end; kb++) {
-      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, false>(
+      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, false, VALUE_SIZE>(
           kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
           kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
           seq_len, fm, fn, row_lim, q_abs_sg, min_q_abs_sg, scale_log2,
           softcapping, sliding_window, Otile, max_score, sum_score);
     }
     for (int kb = kb_full_end; kb < kb_end; kb++) {
-      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, true>(
+      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, true, VALUE_SIZE>(
           kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
           kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
           seq_len, fm, fn, row_lim, q_abs_sg, min_q_abs_sg, scale_log2,
@@ -589,7 +597,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
         sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
       }
 #pragma clang loop unroll(full)
-      for (short d = 0; d < TD; d++) {
+      for (short d = 0; d < VD; d++) {
 #pragma clang loop unroll(full)
         for (short i = 0; i < 2; i++) {
 #pragma clang loop unroll(full)
@@ -608,10 +616,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       // That divergence is what tools/nax_prefill_parity.py bounds.
       // V is re-read per d-pair like MLX; the bases are already resolved.
 #pragma clang loop unroll(full)
-      for (short id = 0; id < TD; id += 2) {
-        if (TD >= 8 && id == TD / 2) {
-          // At TD=8 this is the MLX hd=128 scheduling barrier verbatim. The
-          // vLLM hd=256/512 extensions use the same midpoint split at TD=16/32.
+      for (short id = 0; id < VD; id += 2) {
+        if (VD >= 8 && id == VD / 2) {
+          // Keep the scheduling barrier at the midpoint of the output slice.
           threadgroup_barrier(mem_flags::mem_none);
         }
 #pragma clang loop unroll(full)
@@ -641,7 +648,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   threadgroup_barrier(mem_flags::mem_none);
   device T *out_base = out
       + long(q_seq_start + q_pos_start + sg * 16) * q_stride
-      + head_idx * HEAD_SIZE;
+      + head_idx * HEAD_SIZE + value_offset;
 #pragma clang loop unroll(full)
   for (short i = 0; i < 2; i++) {
     if (q_ok[i]) {
@@ -649,7 +656,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       const float rcp = 1.0f / (sum_score[i] + 1e-6f);
       device T *out_row = out_base + (fm + i * 8) * q_stride + fn;
 #pragma clang loop unroll(full)
-      for (short d = 0; d < TD; d++) {
+      for (short d = 0; d < VD; d++) {
         T4 ov;
 #pragma clang loop unroll(full)
         for (short j = 0; j < 4; j++) {
@@ -661,10 +668,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   }
 }
 
-#define instantiate_paged_attention_nax(type, head_size, block_size)          \
+#define instantiate_paged_attention_nax_impl(type, head_size, block_size, value_size, suffix)          \
   template [[host_name("paged_attention_nax_" #type                          \
-                       "_hs" #head_size "_bs" #block_size)]]                 \
-  [[kernel]] void paged_attention_nax<type, head_size, block_size>(          \
+                       "_hs" #head_size "_bs" #block_size suffix)]]                 \
+  [[kernel]] void paged_attention_nax<type, head_size, block_size, value_size>(          \
       device type *out [[buffer(2)]],                                        \
       device const type *q [[buffer(3)]],                                    \
       device const type *k_cache [[buffer(4)]],                              \
@@ -688,6 +695,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
 
+#define instantiate_paged_attention_nax(type, head_size, block_size) \
+  instantiate_paged_attention_nax_impl(type, head_size, block_size, head_size, "")
+
 #define instantiate_paged_attention_nax_all(type)                            \
   instantiate_paged_attention_nax(type, 64, 8);                              \
   instantiate_paged_attention_nax(type, 64, 16);                             \
@@ -707,3 +717,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 
 instantiate_paged_attention_nax_all(half);
 instantiate_paged_attention_nax_all(bfloat16_t);
+
+#define instantiate_paged_attention_nax_d512(type) \
+  instantiate_paged_attention_nax_impl(type, 512, 8, 256, "_v256"); \
+  instantiate_paged_attention_nax_impl(type, 512, 16, 256, "_v256"); \
+  instantiate_paged_attention_nax_impl(type, 512, 32, 256, "_v256");
+
+instantiate_paged_attention_nax_d512(half);
+instantiate_paged_attention_nax_d512(bfloat16_t);

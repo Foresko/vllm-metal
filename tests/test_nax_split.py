@@ -41,7 +41,7 @@ def test_pipeline_choice_respects_full_and_partial_work(seqs, d128, d256):
     assert nax_split_hint(work, 128) == d128
     assert nax_split_hint(work, 64) == d128
     assert nax_split_hint(work, 256) == d256
-    assert nax_split_hint(work, 512) == 0
+    assert nax_split_hint(work, 512) == d128
 
 
 def test_tile_counts_follow_the_causal_mask():
@@ -116,15 +116,16 @@ def test_length_mismatch_is_rejected():
         nax_tile_work([0, 4], [4, 5])
 
 
-def test_native_hint_does_not_change_outputs():
+@pytest.mark.parametrize("head_size", [128, 512])
+def test_native_hint_does_not_change_outputs(head_size):
     from vllm_metal.metal import get_ops
 
     ops = get_ops()
     inputs = _mixed_inputs(
-        [1], prefill_kv=257, geometry=(8, 2, 128, 16), dtype=mx.float16
+        [1], prefill_kv=257, geometry=(8, 2, head_size, 16), dtype=mx.float16
     )
     inputs.update(
-        query=mx.random.normal((257, 8, 128)).astype(mx.float16),
+        query=mx.random.normal((257, 8, head_size)).astype(mx.float16),
         cu_seqlens_q=mx.array([0, 1, 257], mx.int32),
     )
     nax = ops.nax_supported() and ops.nax_ready()
@@ -137,8 +138,9 @@ def test_native_hint_does_not_change_outputs():
     finally:
         ops._set_paged_dispatch_diagnostics(previous)
     assert mx.array_equal(outs[0], outs[1]) and mx.array_equal(outs[0], outs[2])
-    # -1 uses the batch average: 257 / 2 exceeds the 128-row threshold.
-    assert pipelines == ([1, 0, 1] if nax else [-1, -1, -1])
+    # Legacy callers retain the D512 fallback without per-sequence metadata.
+    expected = [int(head_size < 512), 0, 1] if nax else [-1, -1, -1]
+    assert pipelines == expected
 
 
 @pytest.mark.parametrize("name", ["nax_split_hint", "nax_prefill_split_hint"])
@@ -151,25 +153,32 @@ def test_native_rejects_invalid_hints_before_evaluation(name):
 
 
 @pytest.mark.parametrize(
-    "decode_kv,decode_rows,metadata,separated",
+    "decode_kv,decode_rows,metadata,separated,head_size",
     [
-        (4096, 1, True, True),
-        (128, 1, True, False),
-        (4096, 1, False, False),
-        (4096, 3, True, False),
+        (4096, 1, True, True, 256),
+        (128, 1, True, False, 256),
+        (4096, 1, False, False, 256),
+        (4096, 3, True, False, 256),
+        (4096, 1, True, True, 512),
     ],
-    ids=["ordinary-split", "short-decode", "missing-metadata", "expanded-verify"],
+    ids=[
+        "ordinary-split",
+        "short-decode",
+        "missing-metadata",
+        "expanded-verify",
+        "d512-output-slices",
+    ],
 )
 def test_native_prefill_hint_only_applies_after_decode_separation(
-    nax_prefill, decode_kv, decode_rows, metadata, separated
+    nax_prefill, decode_kv, decode_rows, metadata, separated, head_size
 ):
     """Conflicting hints expose the native subset choice and preserve row ownership."""
     ops = nax_prefill
     inputs = _mixed_inputs(
-        [decode_kv], prefill_kv=256, geometry=(8, 2, 256, 16), dtype=mx.float16
+        [decode_kv], prefill_kv=256, geometry=(8, 2, head_size, 16), dtype=mx.float16
     )
     inputs.update(
-        query=mx.random.normal((decode_rows + 256, 8, 256)).astype(mx.float16),
+        query=mx.random.normal((decode_rows + 256, 8, head_size)).astype(mx.float16),
         cu_seqlens_q=mx.array([0, decode_rows, decode_rows + 256], mx.int32),
         num_decode_tokens=decode_rows,
         nax_split_hint=0,

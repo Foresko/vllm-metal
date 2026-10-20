@@ -12,8 +12,9 @@ does not fill the GPU enough to hide that.
 The choice needs every sequence's query and KV length, which the kernel
 dispatcher can only read from the GPU.  The attention context holds them on
 the CPU, so the rule is evaluated here once per forward and passed down as
-``nax_split_hint``.  Thresholds were calibrated on an M5 Max (BF16, block
-size 16); head_size 512 is never split (see ``dispatch_paged_attention_nax``).
+``nax_split_hint``. The D64-D256 thresholds were calibrated on an M5 Max
+(BF16, block size 16). D512 uses two output slices to reduce the split kernel's live
+accumulator state; short and partial-dominated launches keep the original loop.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ MIN_FULL_BLOCKS = 4
 # Split only when full-block KV tiles outnumber partial-block KV tiles by
 # this factor.  head_size 256 gains ~45% per full tile, head_size <= 128
 # only ~15%, so the latter needs a much larger share of full-block work.
-_MIN_FULL_TO_PARTIAL = {256: 1}
+_MIN_FULL_TO_PARTIAL = {256: 1, 512: 8}
 _MIN_FULL_TO_PARTIAL_DEFAULT = 8
 
 
@@ -83,7 +84,7 @@ def nax_tile_work(
 
 def nax_split_hint(work: NaxTileWork, head_size: int) -> int:
     """1 to use the split pipeline, 0 for the original loop."""
-    if head_size >= 512 or work.full_blocks < MIN_FULL_BLOCKS:
+    if head_size > 512 or work.full_blocks < MIN_FULL_BLOCKS:
         return 0
     factor = _MIN_FULL_TO_PARTIAL.get(head_size, _MIN_FULL_TO_PARTIAL_DEFAULT)
     return int(work.full_tiles >= factor * work.partial_tiles)

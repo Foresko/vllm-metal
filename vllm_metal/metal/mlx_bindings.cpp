@@ -420,11 +420,13 @@ NB_MODULE(_paged_ops, m) {
         "offsets are shared by the nodes. Omit it to retain legacy batch routing. "
         "nax_split_hint (M5 NAX prefill only) selects the split full-tile "
         "pipeline (1) or the original loop (0); -1 uses the batch-average "
-        "rule. nax_prefill_split_hint optionally overrides it only when "
-        "native dispatch separates the ordinary decode prefix from NAX "
-        "prefill; -1 retains nax_split_hint. The override describes only "
-        "the remaining prefill sequences. Outputs are identical either "
-        "way; head_size 512 ignores both hints.");
+        "rule for head_size below 512. nax_prefill_split_hint optionally "
+        "overrides it only when native dispatch separates the ordinary "
+        "decode prefix from NAX prefill; -1 retains nax_split_hint. The "
+        "override describes only the remaining prefill sequences. "
+        "Outputs are identical either way. For head_size 512, an effective "
+        "hint of 1 selects two 256-column output slices; 0 or -1 keeps the "
+        "original loop.");
 
   m.def(
       "last_nax_split_pipeline",
