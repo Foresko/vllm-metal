@@ -341,6 +341,10 @@ class MetalPlatform(Platform):
             for name, enabled in (
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
+                (
+                    "thinking_token_budget",
+                    getattr(params, "thinking_token_budget", None) is not None,
+                ),
             )
             if enabled
         ]
@@ -363,7 +367,6 @@ class MetalPlatform(Platform):
                     "logprob_token_ids",
                     "prompt_logprobs",
                     "structured_outputs",
-                    "thinking_token_budget",
                 )
                 if getattr(params, name, None) is not None
             ]

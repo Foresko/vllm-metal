@@ -228,8 +228,16 @@ class TestMetalPlatform:
         [
             (SamplingParams(logit_bias={1: 2.0}), "logit_bias"),
             (SamplingParams(min_tokens=2), "min_tokens"),
+            (
+                SamplingParams(thinking_token_budget=64),
+                "thinking_token_budget",
+            ),
+            (
+                SamplingParams(thinking_token_budget=0),
+                "thinking_token_budget",
+            ),
         ],
-        ids=["logit-bias", "min-tokens"],
+        ids=["logit-bias", "min-tokens", "thinking-budget", "thinking-budget-zero"],
     )
     def test_validate_request_rejects_logits_processor_controls(
         self,
