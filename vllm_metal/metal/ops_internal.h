@@ -134,6 +134,9 @@ bool gqa_decode_geometry_supported(int num_heads, int num_kv_heads,
                                    int head_size, int block_size);
 std::string gqa_decode_kernel_name(
     const std::string& dtype, int head_size, int block_size, int partition_size);
+std::string gqa_decode_tq_kernel_name(
+    const std::string& dtype, const std::string& k_cache_dtype, int head_size,
+    int block_size, int partition_size);
 int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,

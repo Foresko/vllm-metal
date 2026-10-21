@@ -336,6 +336,67 @@ NB_MODULE(_paged_ops, m) {
         "Page IDs and sequence lengths must describe valid cache contents. "
         "Does not change the default selector or require GPU core detection.");
 
+  // TurboQuant counterpart of the entry above. Default routing never sends
+  // TurboQuant caches to the GQA producer; this entry is its only caller.
+  m.def("_gqa_turboquant_paged_attention_for_test",
+        [](const array& q, const array& k, const array& v,
+           const array& key_scale_cache, const array& value_scale_cache,
+           const array& key_zero_cache, const array& v_centroids,
+           const std::string& quant_type, int v_bits,
+           float scale, const array& tables, const array& lengths,
+           int block_size, int max_seq_len, int partition_size,
+           const std::optional<GqaDecodeLengthPlan>& gqa_length_plan) {
+          if (std::find(kGqaPartitionSizes.begin(), kGqaPartitionSizes.end(),
+                        partition_size) == kGqaPartitionSizes.end()) {
+            throw std::invalid_argument("GQA test partition must be 256/512");
+          }
+          if (q.ndim() != 3 || q.shape(0) < 1 || k.ndim() != 4 || v.ndim() != 4 ||
+              (q.dtype() != float16 && q.dtype() != bfloat16) ||
+              (k.dtype() != int8 && k.dtype() != uint8) || v.dtype() != uint8 ||
+              k.shape(0) != v.shape(0) || k.shape(1) != v.shape(1) ||
+              k.shape(2) != v.shape(2) ||
+              !gqa_decode_geometry_supported(q.shape(1), k.shape(2),
+                                             q.shape(2), block_size) ||
+              k.shape(1) % block_size != 0 ||
+              key_scale_cache.ndim() != 4 ||
+              key_scale_cache.shape() != value_scale_cache.shape() ||
+              key_scale_cache.shape() != key_zero_cache.shape() ||
+              key_scale_cache.strides() != value_scale_cache.strides() ||
+              key_scale_cache.shape(3) * 32 != q.shape(2) ||
+              tables.ndim() != 2 || tables.shape(0) != q.shape(0) ||
+              tables.dtype() != int32 || lengths.ndim() != 1 ||
+              lengths.shape(0) != q.shape(0) || lengths.dtype() != int32 ||
+              max_seq_len <= 0 ||
+              max_seq_len > static_cast<int64_t>(tables.shape(1)) * block_size) {
+            throw std::invalid_argument(
+                "GQA TurboQuant test entry requires supported one-token decode rows");
+          }
+          const int64_t num_partitions =
+              (static_cast<int64_t>(max_seq_len) + partition_size - 1) /
+              partition_size;
+          if (kernels::paged_reduce_threadgroup_bytes(num_partitions) >
+              metal::device(Device::gpu).mtl_device()->maxThreadgroupMemoryLength()) {
+            throw std::invalid_argument(
+                "GQA test partition exceeds the device threadgroup memory limit");
+          }
+          auto cu = arange(q.shape(0) + 1, int32);
+          return paged_attention_primitive_fn(
+              q, k, v, k.shape(2), scale, 0.f, tables, lengths, cu,
+              block_size, max_seq_len, -1, true, quant_type, &key_scale_cache,
+              &value_scale_cache, &key_zero_cache, &v_centroids, v_bits, 1,
+              nullptr, nullptr, q.shape(0), q.shape(0), max_seq_len, false,
+              partition_size, gqa_length_plan);
+        }, nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("key_scale_cache"), nb::arg("value_scale_cache"),
+        nb::arg("key_zero_cache"), nb::arg("v_centroids"),
+        nb::arg("quant_type"), nb::arg("v_bits"),
+        nb::arg("scale"), nb::arg("block_tables"), nb::arg("seq_lens"),
+        nb::arg("block_size"), nb::arg("max_seq_len"), nb::arg("partition_size"),
+        nb::arg("gqa_length_plan") = nb::none(),
+        "Private test-only TurboQuant GQA dispatch with an explicit partition. "
+        "Same contract as _gqa_paged_attention_for_test, with packed TurboQuant "
+        "K/V and their scale, zero-point and centroid arrays.");
+
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.
   m.def("paged_attention_primitive",

@@ -332,12 +332,17 @@ enablement or performance claims of this two-tier routing policy:
    counterpart) now uses GQA through a decode-prefix length plan (see the
    mixed-batch paragraph above). Its threshold (`kMixedDecodeMinContext`) is still
    the tiled-era 4096 tokens and has not been re-tuned for NAX or GQA.
-3. **TurboQuant decode:** evaluate consuming packed KV/scales in the GQA
-   kernel. This could complement the prefill optimization in
-   [#853](https://github.com/vllm-project/vllm-metal/pull/853), which now handles
-   bounded TurboQuant prefill. Avoid assuming that materializing the whole
-   history on every decode step is cheap; validate format, memory and quality
-   effects.
+3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
+   and their scales in place, dequantizing each lane's slice in registers with
+   no per-step materialization of the history. Its partials stay in the
+   rotated V domain, and the TurboQuant reduce applies the single inverse FWHT,
+   as the split-KV TurboQuant path does. It is reachable only through the
+   private `_gqa_turboquant_paged_attention_for_test` entry; default routing
+   still sends TurboQuant decode to the established kernels. Admitting it
+   needs serving measurements across devices
+   (`tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels). This
+   complements the prefill optimization in
+   [#853](https://github.com/vllm-project/vllm-metal/pull/853).
 4. **Sliding windows:** bound loads and split selection by the actual visible
    KV window. This is relevant to Gemma/Mistral-style attention, but their
    geometries and other features such as sinks or soft-capping must also

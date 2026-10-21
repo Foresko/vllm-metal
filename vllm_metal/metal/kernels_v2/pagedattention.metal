@@ -2275,6 +2275,265 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   }
 }
 
+// Unpack one lane's SLICE consecutive `bits`-wide indices, starting at element
+// d0 of a packed row. When the slice plus its sub-byte offset fits in 32 bits,
+// the covering bytes are read once into a window and split by shifts instead
+// of re-reading 1-2 bytes per element. `bits` is a function constant, so the
+// window width and every shift fold at pipeline creation.
+template <int SLICE>
+inline void gqa_tq_unpack(thread uint *idx, const device uchar *row, int d0,
+                          int bits) {
+  const uint mask = (1u << bits) - 1u;
+  if (SLICE * bits + 7 <= 32) {
+    const int bit0 = d0 * bits;
+    const int shift = bit0 & 7;
+    const device uchar *p = row + (bit0 >> 3);
+    const int bytes = (shift + SLICE * bits + 7) >> 3;
+    uint window = 0;
+#pragma unroll
+    for (int b = 0; b < 4; b++) {
+      if (b < bytes) window |= uint(p[b]) << (8 * b);
+    }
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      idx[i] = (window >> (shift + i * bits)) & mask;
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      idx[i] = unpack_k_bits(row, d0 + i, bits);
+    }
+  }
+}
+
+// One lane's contiguous SLICE of a TurboQuant K row, dequantized and rounded
+// to T exactly as tq_load_k_vec does for the per-token kernel. SLICE divides
+// the 32-element scale group, so the slice reads one scale and zero point.
+// 8-bit rows are head_size bytes, so each lane's slice is SLICE-byte aligned
+// and loads as one vector.
+template <typename T, typename K_CACHE_T, int SLICE>
+inline void gqa_tq_load_k(thread float *k, const device K_CACHE_T *k_row,
+                          int d0, float s, float z) {
+  static_assert(SLICE == 4 || SLICE == 8, "head sizes 128 and 256");
+  if (is_char<K_CACHE_T>() || k_bits >= 8) {
+    using Bytes = typename Vec<K_CACHE_T, SLICE>::Type;
+    const Bytes raw = *reinterpret_cast<const device Bytes *>(k_row + d0);
+    const thread K_CACHE_T *values = reinterpret_cast<const thread K_CACHE_T *>(&raw);
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      k[i] = float(T(tq_dequant_k(values[i], s, z)));
+    }
+  } else {
+    uint idx[SLICE];
+    gqa_tq_unpack<SLICE>(
+        idx, reinterpret_cast<const device uchar *>(k_row), d0, k_bits);
+#pragma unroll
+    for (int i = 0; i < SLICE; i++) {
+      k[i] = float(T(tq_dequant_k_raw(idx[i], s, z)));
+    }
+  }
+}
+
+// One lane's contiguous SLICE of a TurboQuant V row in the rotated domain,
+// matching tq_load_and_accumulate_v: centroid * scale, no inverse FWHT.
+template <int SLICE>
+inline void gqa_tq_load_v(thread float *v, const device uchar *v_row, int d0,
+                          float vs, const device float *centroids) {
+  uint idx[SLICE];
+  gqa_tq_unpack<SLICE>(idx, v_row, d0, v_bits);
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    v[i] = centroids[idx[i]] * vs;
+  }
+}
+
+// TurboQuant twin of paged_attention_gqa_decode: the same grid, page walk and
+// online softmax, reading packed K/V and their per-32-element scales in place
+// of FP16/BF16 rows. Nothing is materialized: each lane dequantizes its slice
+// in registers. V stays in the rotated (FWHT) domain, so the partial written
+// to tmp_out is rotated and the TurboQuant reduce (use_turboquant = true)
+// applies the single inverse FWHT after merging partitions, as it does for
+// the split-KV TurboQuant path. k_bits / v_bits are function constants 60/70.
+template <typename T, typename K_CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
+          int PARTITION_SIZE>
+[[kernel]] void paged_attention_gqa_decode_tq(
+    device float *exp_sums [[buffer(0)]], device float *max_logits [[buffer(1)]],
+    device T *tmp_out [[buffer(2)]], device const T *q [[buffer(3)]],
+    device const K_CACHE_T *k_cache [[buffer(4)]],
+    device const uchar *v_cache [[buffer(5)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const device int64_t *partition_offsets
+    [[buffer(18), function_constant(use_compact_scratch)]],
+    const device half *key_scale_cache [[buffer(22)]],
+    const device half *value_scale_cache [[buffer(23)]],
+    const constant int &v_block_stride [[buffer(24)]],
+    const constant int &v_head_stride [[buffer(25)]],
+    const device half *key_zero_cache [[buffer(26)]],
+    const device float *v_centroids [[buffer(27)]],
+    constant int64_t &scale_block_stride [[buffer(28)]],
+    constant int64_t &scale_head_stride [[buffer(29)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tg_per_grid [[threadgroups_per_grid]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  static_assert(HEAD_SIZE % 32 == 0, "one lane-strided slice per lane");
+  static_assert(PARTITION_SIZE % BLOCK_SIZE == 0,
+                "partition start is page-aligned");
+  constexpr int SLICE = HEAD_SIZE / 32;  // elements per lane
+  constexpr int SCALE_GROUP_SIZE = 32;
+  static_assert(SCALE_GROUP_SIZE % SLICE == 0,
+                "a lane's slice stays inside one scale group");
+  const int partition_idx = tg_pos.x;
+  const int kv_head_idx = tg_pos.y;
+  const int seq_idx = tg_pos.z;
+  const int context_len = static_cast<int>(context_lens[seq_idx]);
+  const int t0 = partition_idx * PARTITION_SIZE;
+  if (t0 >= context_len) {
+    return;
+  }
+  const int t_end = min(t0 + PARTITION_SIZE, context_len);
+
+  const int group = tptg.x / 32;
+  const int head_idx = kv_head_idx * group + static_cast<int>(sg);
+  const int num_heads = num_kv_heads * group;
+  const int max_num_partitions = tg_per_grid.x;
+  const int64_t k_token_stride =
+      static_cast<int64_t>(num_kv_heads) * kv_head_stride;
+  const int64_t v_token_stride =
+      static_cast<int64_t>(num_kv_heads) * v_head_stride;
+  const int64_t s_token_stride = num_kv_heads * scale_head_stride;
+  const int d0 = static_cast<int>(lane) * SLICE;
+  const int scale_group = d0 / SCALE_GROUP_SIZE;
+
+  device const T *q_ptr = q + seq_idx * q_stride + head_idx * HEAD_SIZE + d0;
+  float qv[SLICE];
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    qv[i] = float(q_ptr[i]);
+  }
+
+  device const uint32_t *bt =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+
+  float m = -FLT_MAX;
+  float l = 0.f;
+  float acc[SLICE] = {0.f};
+  const float log2e_scale = scale * M_LOG2E_F;
+  const int page0 = t0 / BLOCK_SIZE;
+  const int page_end = (t_end + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  uint32_t page_id = gqa_broadcast_page_id(bt, page0, lane);
+  uint32_t next_page_id = page_id;
+  if (page0 + 1 < page_end) {
+    next_page_id = gqa_broadcast_page_id(bt, page0 + 1, lane);
+  }
+  for (int page = page0; page < page_end; page++) {
+    const int64_t cur_page = page_id;
+    page_id = next_page_id;
+    if (page + 2 < page_end) {
+      next_page_id = gqa_broadcast_page_id(bt, page + 2, lane);
+    }
+    const int tok0 = page * BLOCK_SIZE;
+    const int tok1 = min(tok0 + BLOCK_SIZE, t_end);
+    device const K_CACHE_T *k_page = k_cache + cur_page * kv_block_stride +
+                                     kv_head_idx * kv_head_stride;
+    device const uchar *v_page = v_cache + cur_page * v_block_stride +
+                                 kv_head_idx * v_head_stride;
+    const int64_t s_page = cur_page * scale_block_stride +
+                           kv_head_idx * scale_head_stride + scale_group;
+    // Four tokens per step, as in paged_attention_gqa_decode: their K/V
+    // loads and QK dots are independent, so they overlap memory latency.
+    int t = tok0;
+    for (; t + 4 <= tok1; t += 4) {
+      float sc[4];
+      float vv[4][SLICE];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int off = t + j - tok0;
+        const int64_t s_idx = s_page + off * s_token_stride;
+        float kv[SLICE];
+        gqa_tq_load_k<T, K_CACHE_T, SLICE>(
+            kv, k_page + off * k_token_stride, d0, key_scale_cache[s_idx],
+            key_zero_cache[s_idx]);
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < SLICE; i++) {
+          dot += qv[i] * kv[i];
+        }
+        sc[j] = dot;
+        gqa_tq_load_v<SLICE>(vv[j], v_page + off * v_token_stride, d0,
+                             value_scale_cache[s_idx], v_centroids);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        sc[j] = simd_sum(sc[j]) * log2e_scale;
+      }
+      const float m_new = max(m, max(max(sc[0], sc[1]), max(sc[2], sc[3])));
+      const float alpha = exp2(m - m_new);
+      float p[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        p[j] = exp2(sc[j] - m_new);
+      }
+      l = l * alpha + p[0] + p[1] + p[2] + p[3];
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p[0] * vv[0][i] + p[1] * vv[1][i] +
+                 p[2] * vv[2][i] + p[3] * vv[3][i];
+      }
+      m = m_new;
+    }
+    for (; t < tok1; t++) {
+      const int off = t - tok0;
+      const int64_t s_idx = s_page + off * s_token_stride;
+      float kv[SLICE];
+      gqa_tq_load_k<T, K_CACHE_T, SLICE>(
+          kv, k_page + off * k_token_stride, d0, key_scale_cache[s_idx],
+          key_zero_cache[s_idx]);
+      float dot = 0.f;
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        dot += qv[i] * kv[i];
+      }
+      const float s = simd_sum(dot) * log2e_scale;
+      const float m_new = max(m, s);
+      const float alpha = exp2(m - m_new);
+      const float p = exp2(s - m_new);
+      l = l * alpha + p;
+      float vv[SLICE];
+      gqa_tq_load_v<SLICE>(vv, v_page + off * v_token_stride, d0,
+                           value_scale_cache[s_idx], v_centroids);
+#pragma unroll
+      for (int i = 0; i < SLICE; i++) {
+        acc[i] = acc[i] * alpha + p * vv[i];
+      }
+      m = m_new;
+    }
+  }
+
+  const int64_t pidx = (use_compact_scratch
+      ? paged_attention_compact_offset(seq_idx, head_idx, num_heads, partition_offsets)
+      : (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+          max_num_partitions) + partition_idx;
+  if (lane == 0) {
+    max_logits[pidx] = m;
+    exp_sums[pidx] = l;
+  }
+  device T *out_ptr = tmp_out + pidx * HEAD_SIZE + d0;
+  const float inv_l = 1.f / (l + kPagedAttentionSoftmaxEpsilon);
+#pragma unroll
+  for (int i = 0; i < SLICE; i++) {
+    out_ptr[i] = T(acc[i] * inv_l);
+  }
+}
+
 // Tiled paged attention kernel (paged_attention_tiled) is in
 // pagedattention_tiled.metal.
 
@@ -2518,6 +2777,60 @@ instantiate_gqa_decode(half, VLLM_METAL_PARTITION_SIZE);
 // Established per-token and split-KV kernels remain at their original size.
 instantiate_gqa_decode(bfloat16_t, 256);
 instantiate_gqa_decode(half, 256);
+
+// TurboQuant producers for the same geometry domain. K is signed int8 (q8_0,
+// int8) or unsigned/packed uint8 (uint8 and sub-8-bit types); V is packed
+// uint8. Bit widths are function constants, so one pipeline serves each type.
+#define instantiate_gqa_decode_tq_inner(type, k_cache_type, head_size,         \
+                                        block_size, partition_size)            \
+  template [[host_name("paged_attention_gqa_decode_tq_" #type                  \
+                       "_cache_" #k_cache_type "_hs" #head_size                \
+                       "_bs" #block_size "_ps" #partition_size)]]              \
+  [[kernel]] void paged_attention_gqa_decode_tq<type, k_cache_type, head_size, \
+                                                block_size, partition_size>(   \
+      device float *exp_sums [[buffer(0)]],                                    \
+      device float *max_logits [[buffer(1)]], device type *tmp_out             \
+      [[buffer(2)]],                                                           \
+      device const type *q [[buffer(3)]],                                      \
+      device const k_cache_type *k_cache [[buffer(4)]],                        \
+      device const uchar *v_cache [[buffer(5)]],                               \
+      const constant int &num_kv_heads [[buffer(8)]],                          \
+      const constant float &scale [[buffer(9)]],                               \
+      device const uint32_t *block_tables [[buffer(11)]],                      \
+      device const uint32_t *context_lens [[buffer(12)]],                      \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],               \
+      const constant int &q_stride [[buffer(15)]],                             \
+      const constant int &kv_block_stride [[buffer(16)]],                      \
+      const constant int &kv_head_stride [[buffer(17)]],                       \
+      const device int64_t *partition_offsets                                 \
+      [[buffer(18), function_constant(use_compact_scratch)]],                   \
+      const device half *key_scale_cache [[buffer(22)]],                       \
+      const device half *value_scale_cache [[buffer(23)]],                     \
+      const constant int &v_block_stride [[buffer(24)]],                       \
+      const constant int &v_head_stride [[buffer(25)]],                        \
+      const device half *key_zero_cache [[buffer(26)]],                        \
+      const device float *v_centroids [[buffer(27)]],                          \
+      constant int64_t &scale_block_stride [[buffer(28)]],                     \
+      constant int64_t &scale_head_stride [[buffer(29)]],                      \
+      uint3 tg_pos [[threadgroup_position_in_grid]],                           \
+      uint3 tg_per_grid [[threadgroups_per_grid]],                             \
+      uint3 tptg [[threads_per_threadgroup]],                                  \
+      uint sg [[simdgroup_index_in_threadgroup]],                              \
+      uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_gqa_decode_tq_cache(type, k_cache_type, partition_size)    \
+  instantiate_gqa_decode_tq_inner(type, k_cache_type, 128, 16, partition_size); \
+  instantiate_gqa_decode_tq_inner(type, k_cache_type, 256, 16, partition_size); \
+  instantiate_gqa_decode_tq_inner(type, k_cache_type, 256, 32, partition_size);
+
+#define instantiate_gqa_decode_tq(type, partition_size)                        \
+  instantiate_gqa_decode_tq_cache(type, char, partition_size);                 \
+  instantiate_gqa_decode_tq_cache(type, uchar, partition_size);
+
+instantiate_gqa_decode_tq(bfloat16_t, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode_tq(half, VLLM_METAL_PARTITION_SIZE);
+instantiate_gqa_decode_tq(bfloat16_t, 256);
+instantiate_gqa_decode_tq(half, 256);
 
 #define instantiate_gqa_small_reduce(type, partition_size)                    \
   instantiate_paged_attention_v2_reduce_inner(type, 128, 256, 32,            \
