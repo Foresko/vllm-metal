@@ -542,6 +542,40 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     return cached[1]
 
 
+def llama4_query_scale(
+    ctx: PagedAttentionContext,
+    beta: float,
+    original_max_position_embeddings: int,
+) -> mx.array | None:
+    """Per-row Llama 4 query scale ``(1, 1, L, 1)`` for the packed batch.
+
+    The scale is ``1 + beta * log(1 + floor(pos / original_max))`` at each
+    row's absolute position, as in mlx_lm's ``ministral3``. It is exactly 1
+    below ``original_max``, so ``None`` is returned when no row reaches it.
+    Computed once per forward and shared by every scaled layer.
+    """
+    key = (beta, original_max_position_embeddings)
+    if key in ctx.llama4_query_scales:
+        return ctx.llama4_query_scales[key]
+    cu_seqlens = ctx.cu_seqlens
+    assert cu_seqlens is not None
+    segments = list(zip(cu_seqlens[:-1], cu_seqlens[1:], ctx.offsets, strict=True))
+    scale = None
+    if any(
+        offset + end - start > original_max_position_embeddings
+        for start, end, offset in segments
+    ):
+        positions = mx.concatenate(
+            [mx.arange(offset, offset + end - start) for start, end, offset in segments]
+        )
+        scale = (
+            1
+            + beta * mx.log(1 + mx.floor(positions / original_max_position_embeddings))
+        )[None, None, :, None]
+    ctx.llama4_query_scales[key] = scale
+    return scale
+
+
 def sdpa_forward(
     inner: nn.Module,
     x: mx.array,
@@ -553,12 +587,16 @@ def sdpa_forward(
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
     attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
+    llama4_scaling: tuple[float, int] | None = None,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Full SDPA forward pass: project → norm/RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
     the broadcast internally.
+
+    ``llama4_scaling`` is ``(beta, original_max_position_embeddings)`` for
+    attention that scales queries by position after RoPE (Ministral 3).
 
     Returns:
         Tuple of (output, kv_pair) where kv_pair is (keys, values)
@@ -621,6 +659,10 @@ def sdpa_forward(
         # StableLM computes the standard scale inline and exposes no scale
         # attribute. Use the projected query width before any cache padding.
         attn_scale = math.sqrt(1 / queries.shape[-1])
+    if llama4_scaling is not None:
+        query_scale = llama4_query_scale(ctx, *llama4_scaling)
+        if query_scale is not None:
+            queries = queries * query_scale.astype(queries.dtype)
 
     # --- Metal kernel dispatch ---
     n_heads = queries.shape[1]

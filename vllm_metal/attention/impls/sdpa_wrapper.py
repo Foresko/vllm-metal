@@ -68,15 +68,21 @@ class SDPAPagedAttentionWrapper(nn.Module):
         block_size: int,
         *,
         cache_idx: int | None = None,
+        llama4_scaling: tuple[float, int] | None = None,
     ) -> None:
         super().__init__()
+        contract = attention_contract_for(inner)
+        if contract.llama4_query_scaling and llama4_scaling is None:
+            raise ValueError(
+                f"{type(inner).__module__}.{type(inner).__name__} scales "
+                "queries by position but no llama4_scaling was given"
+            )
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_mk_layer_idx", layer_idx)
         object.__setattr__(self, "_mk_kv_cache", kv_cache)
         object.__setattr__(self, "_mk_block_size", block_size)
-        object.__setattr__(
-            self, "_mk_attention_contract", attention_contract_for(inner)
-        )
+        object.__setattr__(self, "_mk_attention_contract", contract)
+        object.__setattr__(self, "_mk_llama4_scaling", llama4_scaling)
         # For compact caches (hybrid models), cache_idx maps to the
         # per-type cache array.  Defaults to layer_idx for non-hybrid.
         object.__setattr__(
@@ -134,6 +140,9 @@ class SDPAPagedAttentionWrapper(nn.Module):
         position_ids: mx.array | None = None,
         **kwargs: Any,
     ) -> Any:
+        if self._mk_llama4_scaling is not None:
+            return self._call_llama4_scaled(x, mask, cache, position_ids)
+
         position_embeddings = kwargs.pop("position_embeddings", None)
         if _is_rope_embedding_pair(position_ids):
             # Some attention contracts pass precomputed ``(cos, sin)`` RoPE
@@ -188,10 +197,52 @@ class SDPAPagedAttentionWrapper(nn.Module):
 
         return output
 
+    def _call_llama4_scaled(
+        self,
+        x: mx.array,
+        attn_scale: mx.array,
+        mask: mx.array | None,
+        cache: nn.Module | None,
+    ) -> mx.array:
+        """Ministral 3: the layer passes ``(x, attn_scale, mask, cache)``.
+
+        The model computes ``attn_scale`` from one offset for the whole
+        batch, which is wrong for packed requests, so the paged path derives
+        it per row from the context positions instead.
+        """
+        ctx = get_context()
+        if ctx is None:
+            return self._inner(x, attn_scale, mask, cache)
+        output, _ = sdpa_forward(
+            self._inner,
+            x,
+            ctx,
+            self._mk_kv_cache,
+            self._mk_cache_idx,
+            attention_contract=self._mk_attention_contract,
+            llama4_scaling=self._mk_llama4_scaling,
+        )
+        return output
+
 
 # ---------------------------------------------------------------------------
 # Model patching
 # ---------------------------------------------------------------------------
+
+
+def _llama4_scaling(model: Any) -> tuple[float, int] | None:
+    """Return Ministral 3's ``(beta, original_max_position_embeddings)``.
+
+    mlx_lm keeps them only in the text model's ``rope_parameters``.
+    """
+    root = getattr(model, "language_model", model)
+    rope_parameters = getattr(getattr(root, "args", None), "rope_parameters", None)
+    if not rope_parameters or "llama_4_scaling_beta" not in rope_parameters:
+        return None
+    return (
+        float(rope_parameters["llama_4_scaling_beta"]),
+        int(rope_parameters["original_max_position_embeddings"]),
+    )
 
 
 def patch_sdpa_attention(
@@ -220,6 +271,8 @@ def patch_sdpa_attention(
     Returns the number of patched layers.
     """
 
+    llama4_scaling = _llama4_scaling(model)
+
     def wrap_layer(layer_idx: int, attn: Any) -> Any:
         cache_idx = (
             cache_idx_map[layer_idx]
@@ -231,7 +284,16 @@ def patch_sdpa_attention(
             attn.rebind_cache(kv_cache, block_size, cache_idx=cache_idx)
             return attn
         return SDPAPagedAttentionWrapper(
-            attn, layer_idx, kv_cache, block_size, cache_idx=cache_idx
+            attn,
+            layer_idx,
+            kv_cache,
+            block_size,
+            cache_idx=cache_idx,
+            llama4_scaling=(
+                llama4_scaling
+                if attention_contract_for(attn).llama4_query_scaling
+                else None
+            ),
         )
 
     return walk_and_wrap(model, wrap_layer, only_layers=only_layers)

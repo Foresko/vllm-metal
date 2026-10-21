@@ -20,6 +20,9 @@ class AttentionContract:
     qk_norm_placement: QKNormPlacement = QKNormPlacement.BEFORE_ROPE
     derive_scale_from_query: bool = False
     use_rope: bool = True
+    # Ministral 3: attention is called as ``(x, attn_scale, mask, cache)`` and
+    # scales queries by a position-dependent Llama 4 factor.
+    llama4_query_scaling: bool = False
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
@@ -45,6 +48,7 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.phi": AttentionContract(derive_scale_from_query=True),
     # Nemotron-H attention is position-free: no rotary module, none expected.
     "mlx_lm.models.nemotron_h": AttentionContract(use_rope=False),
+    "mlx_lm.models.ministral3": AttentionContract(llama4_query_scaling=True),
 }
 
 
