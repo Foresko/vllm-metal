@@ -75,8 +75,34 @@ class _EmbedVision:
         return mx.concatenate([features, features], axis=-1) * 3.0  # (1, rows, HIDDEN)
 
 
+MEL_BINS = 128
+AUDIO_STRIDE = 4  # two stride-2 convolutions in the subsampler
+
+
+class _AudioTower:
+    """Mirror of mlx-vlm ``AudioEncoder``: returns ``(encodings, padding_mask)``."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[mx.Dtype, tuple[int, ...], mx.array]] = []
+
+    def __call__(self, mel: mx.array, padding: mx.array) -> tuple[mx.array, mx.array]:
+        self.calls.append((mel.dtype, mel.shape, padding))
+        rows = mel.shape[1] // AUDIO_STRIDE
+        return (
+            mx.ones((1, rows, TOWER_DIM), dtype=mel.dtype),
+            padding[:, ::AUDIO_STRIDE][:, :rows],
+        )
+
+
+class _EmbedAudio:
+    def __call__(self, features: mx.array) -> mx.array:
+        return mx.concatenate([features, features], axis=-1) * 5.0  # (1, rows, HIDDEN)
+
+
 def _sidecar(
-    tower: _Tower | None = None, pixel_dtype: mx.Dtype = mx.bfloat16
+    tower: _Tower | None = None,
+    pixel_dtype: mx.Dtype = mx.bfloat16,
+    audio_tower: _AudioTower | None = None,
 ) -> Gemma4VisionSidecar:
     return Gemma4VisionSidecar(
         vision_tower=tower or _Tower(),
@@ -84,17 +110,53 @@ def _sidecar(
         pixel_dtype=pixel_dtype,
         num_parameters=1,
         num_bytes=2,
+        audio_tower=audio_tower,
+        embed_audio=_EmbedAudio() if audio_tower is not None else None,
     )
 
 
 def _adapter(
-    tower: _Tower | None = None, *, bidirectional_attention: str | None = "vision"
+    tower: _Tower | None = None,
+    *,
+    bidirectional_attention: str | None = "vision",
+    audio_tower: _AudioTower | None = None,
 ) -> tuple[Gemma4MultimodalAdapter, _TextModel]:
     text_model = _TextModel(_Backbone())
     adapter = Gemma4MultimodalAdapter.from_loaded(
-        text_model, _sidecar(tower), bidirectional_attention=bidirectional_attention
+        text_model,
+        _sidecar(tower, audio_tower=audio_tower),
+        bidirectional_attention=bidirectional_attention,
     )
     return adapter, text_model
+
+
+def _audio_feature(
+    *, num_embeds: int = 3, offset: int = 1, num_rows: int | None = None
+) -> MultiModalFeatureSpec:
+    """An unpadded clip, as vLLM's Gemma 4 processor stores it, inside boa/eoa.
+
+    ``num_rows`` is how many rows the encoder yields (default ``num_embeds``).
+    """
+    frames = (num_rows if num_rows is not None else num_embeds) * AUDIO_STRIDE
+    field = MultiModalFieldConfig.batched("audio")
+    mel = field.build_elems(
+        "input_features_padded", torch.zeros((1, frames, MEL_BINS))
+    )[0]
+    mask = field.build_elems(
+        "input_features_mask", torch.ones((1, frames), dtype=torch.bool)
+    )[0]
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem(
+            {"input_features_padded": mel, "input_features_mask": mask}
+        ),
+        modality="audio",
+        identifier=f"audio-{offset}",
+        mm_position=PlaceholderRange(
+            offset=offset,
+            length=num_embeds + 2,
+            is_embed=torch.tensor([False] + [True] * num_embeds + [False]),
+        ),
+    )
 
 
 def _image_item(num_patches: int) -> MultiModalKwargsItem:
@@ -211,8 +273,36 @@ class TestEncodeMultimodal:
 
     def test_video_modality_rejected(self) -> None:
         adapter, _ = _adapter()
-        with pytest.raises(ValueError, match="only supports image features"):
+        with pytest.raises(ValueError, match="got modality='video'"):
             adapter.encode_multimodal([_feature(modality="video")])
+
+    def test_audio_rows_are_divided_by_rounded_scale(self) -> None:
+        audio_tower = _AudioTower()
+        adapter, _ = _adapter(audio_tower=audio_tower)
+
+        [result] = adapter.encode_multimodal([_audio_feature(num_embeds=3)])
+
+        mel_dtype, mel_shape, padding = audio_tower.calls[0]
+        assert mel_dtype == mx.float32  # processor features go in unchanged
+        assert mel_shape == (1, 3 * AUDIO_STRIDE, MEL_BINS)
+        assert not padding.any().item()  # True-is-valid mask inverted
+        assert result.hidden_states.shape == (3, HIDDEN)
+        assert result.hidden_states.dtype == mx.bfloat16
+        restored = result.hidden_states.astype(mx.float32) * adapter.embed_scale_rounded
+        assert mx.abs(restored - 5.0).max().item() <= 5.0 * 2**-7
+
+    def test_audio_past_the_placeholder_cap_keeps_the_first_rows(self) -> None:
+        """vLLM caps placeholders at 30 s of audio; a longer clip encodes more rows."""
+        adapter, _ = _adapter(audio_tower=_AudioTower())
+
+        [result] = adapter.encode_multimodal([_audio_feature(num_embeds=3, num_rows=5)])
+
+        assert result.hidden_states.shape == (3, HIDDEN)
+
+    def test_audio_rejected_without_audio_tower(self) -> None:
+        adapter, _ = _adapter()
+        with pytest.raises(ValueError, match="got modality='audio'"):
+            adapter.encode_multimodal([_audio_feature()])
 
     def test_missing_data_rejected(self) -> None:
         adapter, _ = _adapter()
@@ -320,7 +410,7 @@ class TestPositions:
 
     def test_video_feature_rejected(self) -> None:
         adapter, _ = _adapter()
-        with pytest.raises(ValueError, match="only supports image features"):
+        with pytest.raises(ValueError, match="got modality='video'"):
             adapter.get_mrope_input_positions([1, 2], [_feature(modality="video")])
 
 

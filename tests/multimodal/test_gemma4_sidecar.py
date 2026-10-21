@@ -64,9 +64,18 @@ class _Embed(nn.Module):
         self.embedding_projection = nn.Linear(4, 8, bias=False)
 
 
-def _composite(tower: nn.Module | None, embed: nn.Module | None) -> SimpleNamespace:
+def _composite(
+    tower: nn.Module | None,
+    embed: nn.Module | None,
+    audio_tower: nn.Module | None = None,
+    embed_audio: nn.Module | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        vision_tower=tower, embed_vision=embed, language_model=object()
+        vision_tower=tower,
+        embed_vision=embed,
+        audio_tower=audio_tower,
+        embed_audio=embed_audio,
+        language_model=object(),
     )
 
 
@@ -88,6 +97,33 @@ class TestGemma4VisionSidecarLoad:
         assert sidecar.pixel_dtype == mx.float32
         assert sidecar.num_parameters == 4 * 4 + 4 * 4 + 4 * 8
         assert sidecar.num_bytes > 0
+        assert sidecar.audio_tower is None and sidecar.embed_audio is None
+
+    def test_loads_audio_tower_and_embedder_when_present(self, tmp_path: Path) -> None:
+        tower = _Tower(nn.Linear(4, 4, bias=False))
+        audio_tower = nn.Linear(4, 2, bias=False)
+        embed_audio = _Embed()
+
+        sidecar = Gemma4VisionSidecar.load(
+            tmp_path,
+            load_composite=lambda _: _composite(
+                tower, _Embed(), audio_tower, embed_audio
+            ),
+        )
+
+        assert sidecar.audio_tower is audio_tower
+        assert sidecar.embed_audio is embed_audio
+        assert sidecar.num_parameters == 4 * 4 + 4 * 4 + 4 * 8 + 4 * 2 + 4 * 8
+
+    def test_half_an_audio_encoder_is_refused(self, tmp_path: Path) -> None:
+        tower = _Tower(nn.Linear(4, 4, bias=False))
+        with pytest.raises(RuntimeError, match="audio_tower/embed_audio"):
+            Gemma4VisionSidecar.load(
+                tmp_path,
+                load_composite=lambda _: _composite(
+                    tower, _Embed(), nn.Linear(4, 2), None
+                ),
+            )
 
     def test_quantized_input_projection_is_refused(self, tmp_path: Path) -> None:
         proj = nn.QuantizedLinear(64, 64, bias=False, group_size=32, bits=4)

@@ -572,8 +572,9 @@ class DefaultModelAdapter(ModelAdapter):
         that the compatibility path intentionally bypasses; clearing it makes
         ``is_multimodal_model`` ``False`` so the input processor skips that
         setup. When the mode is ``text_sidecar`` (Gemma 4), the config is
-        kept but restricted to images only, so the frontend rejects video
-        and audio inputs the sidecar cannot serve. ``native`` leaves the
+        kept but video is turned off, and audio too unless the checkpoint has
+        an audio encoder, so the frontend rejects inputs the sidecar cannot
+        serve. ``native`` leaves the
         config untouched. :meth:`multimodal_backbone_mode` is the single
         source of truth for which mode applies.
         """
@@ -594,22 +595,32 @@ class DefaultModelAdapter(ModelAdapter):
             )
             return
         if mode == "text_sidecar":
-            self._restrict_to_images(model_config.multimodal_config)
+            # Only E2B/E4B carry an audio encoder; the processor and the
+            # sidecar both follow ``audio_config``.
+            keep_audio = getattr(hf_config, "audio_config", None) is not None
+            self._restrict_to_images(
+                model_config.multimodal_config, keep_audio=keep_audio
+            )
             logger.info(
-                "Metal: Gemma 4 serves images through the vision sidecar on the "
-                "mlx_lm text backbone; video and audio inputs are refused"
+                "Metal: Gemma 4 serves %s through the encoder sidecar on the "
+                "mlx_lm text backbone; %s inputs are refused",
+                "images and audio" if keep_audio else "images",
+                "video" if keep_audio else "video and audio",
             )
 
     @staticmethod
-    def _restrict_to_images(multimodal_config: Any) -> None:
-        """Set video/audio limits to 0 so the frontend rejects them (idempotent)."""
+    def _restrict_to_images(
+        multimodal_config: Any, *, keep_audio: bool = False
+    ) -> None:
+        """Set video (and audio, unless kept) limits to 0 so the frontend
+        rejects them (idempotent)."""
         from vllm.config.multimodal import AudioDummyOptions, VideoDummyOptions
 
+        refused: list[tuple[str, type]] = [("video", VideoDummyOptions)]
+        if not keep_audio:
+            refused.append(("audio", AudioDummyOptions))
         limits = multimodal_config.limit_per_prompt
-        for modality, options_cls in (
-            ("video", VideoDummyOptions),
-            ("audio", AudioDummyOptions),
-        ):
+        for modality, options_cls in refused:
             current = limits.get(modality)
             if current is not None and int(getattr(current, "count", 0)) > 0:
                 logger.warning(

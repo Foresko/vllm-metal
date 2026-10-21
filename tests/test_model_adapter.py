@@ -1640,6 +1640,18 @@ class TestNormalizeModelConfigSidecar:
             and limits["audio"].count == 0
         )
 
+    def test_audio_stays_enabled_with_an_audio_encoder(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(tmp_path)
+        config.hf_config.audio_config = SimpleNamespace(hidden_size=1024)
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert "audio" not in limits
+        assert limits["video"].count == 0
+
     def test_restriction_is_idempotent_and_warns_on_override(
         self, tmp_path: Path, _sidecar_ready, caplog
     ) -> None:

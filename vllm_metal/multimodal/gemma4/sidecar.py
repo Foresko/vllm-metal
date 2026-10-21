@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gemma 4 vision sidecar: ``vision_tower`` + ``embed_vision`` next to mlx_lm.
+"""Gemma 4 multimodal sidecar: the encoder towers next to mlx_lm.
 
 The text backbone stays the mlx_lm Gemma 4 model that vllm-metal already
-serves; only the vision tower and the multimodal embedder are taken from the
-mlx-vlm composite, loaded lazily so the language-model weights are never
+serves; only ``vision_tower`` + ``embed_vision`` (and, on checkpoints with an
+audio encoder, ``audio_tower`` + ``embed_audio``) are taken from the mlx-vlm
+composite, loaded lazily so the language-model weights are never
 materialised twice.
 """
 
@@ -69,13 +70,19 @@ def _load_composite(model_path: Path) -> Any:
 
 @dataclass(frozen=True)
 class Gemma4VisionSidecar:
-    """The vision tower and multimodal embedder of a Gemma 4 checkpoint."""
+    """The encoder towers and multimodal embedders of a Gemma 4 checkpoint.
+
+    ``audio_tower`` and ``embed_audio`` are ``None`` when the checkpoint has
+    no audio encoder (only E2B/E4B ship one).
+    """
 
     vision_tower: Any
     embed_vision: Any
     pixel_dtype: mx.Dtype
     num_parameters: int
     num_bytes: int
+    audio_tower: Any = None
+    embed_audio: Any = None
 
     @classmethod
     def load(
@@ -84,7 +91,7 @@ class Gemma4VisionSidecar:
         *,
         load_composite: Callable[[Path], Any] = _load_composite,
     ) -> Gemma4VisionSidecar:
-        """Load only the vision modules of the checkpoint at ``model_path``.
+        """Load only the encoder modules of the checkpoint at ``model_path``.
 
         ``model_path`` must be the original checkpoint directory (not the
         mlx_lm shard-compatibility view).  Any failure raises: by the time
@@ -108,6 +115,17 @@ class Gemma4VisionSidecar:
         ) + cast("list[tuple[str, Any]]", tree_flatten(embed_vision.parameters()))
         if not params:
             raise RuntimeError(f"no vision parameters were loaded from {model_path}")
+        audio_tower = getattr(composite, "audio_tower", None)
+        embed_audio = getattr(composite, "embed_audio", None)
+        if audio_tower is not None and embed_audio is not None:
+            params += cast(
+                "list[tuple[str, Any]]", tree_flatten(audio_tower.parameters())
+            ) + cast("list[tuple[str, Any]]", tree_flatten(embed_audio.parameters()))
+        elif audio_tower is not None or embed_audio is not None:
+            raise RuntimeError(
+                "mlx_vlm Gemma 4 composite exposes only one of "
+                "audio_tower/embed_audio; mlx-vlm version drift detected."
+            )
 
         input_proj = getattr(
             getattr(vision_tower, "patch_embedder", None), "input_proj", None
@@ -127,7 +145,8 @@ class Gemma4VisionSidecar:
         num_parameters = sum(int(value.size) for _, value in params)
         num_bytes = sum(int(value.nbytes) for _, value in params)
         logger.info(
-            "Gemma 4 vision sidecar loaded: %d parameters, %.1f MiB, pixel dtype %s",
+            "Gemma 4 sidecar loaded (%s): %d parameters, %.1f MiB, pixel dtype %s",
+            "vision + audio" if audio_tower is not None else "vision",
             num_parameters,
             num_bytes / (1024 * 1024),
             weight.dtype,
@@ -138,4 +157,6 @@ class Gemma4VisionSidecar:
             pixel_dtype=weight.dtype,
             num_parameters=num_parameters,
             num_bytes=num_bytes,
+            audio_tower=audio_tower,
+            embed_audio=embed_audio,
         )
