@@ -197,6 +197,7 @@ class TestParityTool:
             gpu_memory_utilization,
             log_path,
             env,
+            additional_config,
             trust_remote_code,
         ):
             assert not trust_remote_code
@@ -205,6 +206,7 @@ class TestParityTool:
             assert env["VLLM_METAL_BACKEND"] == backend
             if backend == "mps":
                 assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+            assert additional_config is None
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")

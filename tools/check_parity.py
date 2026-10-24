@@ -105,6 +105,7 @@ def serving(
     gpu_memory_utilization: float,
     log_path: Path,
     env: dict,
+    additional_config: str | None = None,
     trust_remote_code: bool = False,
 ):
     """Start one local server and clean up its process group on every exit."""
@@ -134,7 +135,8 @@ def serving(
                 "--generation-config",
                 "vllm",
             ]
-            + (["--trust-remote-code"] if trust_remote_code else []),
+            + (["--trust-remote-code"] if trust_remote_code else [])
+            + (["--additional-config", additional_config] if additional_config else []),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -175,6 +177,7 @@ def check_parity(
     batch_sizes: tuple[int, ...] = (1, 2),
     output_dir: Path | None = None,
     gpu_memory_utilization: float = 0.65,
+    additional_config: str | None = None,
     trust_remote_code: bool = False,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
@@ -233,6 +236,7 @@ def check_parity(
         gpu_memory_utilization,
         output_dir / "serve.log",
         env,
+        additional_config,
         trust_remote_code,
     ) as base_url:
         for size in batch_sizes:
@@ -397,6 +401,10 @@ def main() -> None:
         action="store_true",
         help="Allow custom code from the checkpoint, for both backends",
     )
+    parser.add_argument(
+        "--additional-config",
+        help="JSON passed to vllm serve --additional-config (serving side only)",
+    )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.max_tokens < 1:
@@ -449,6 +457,7 @@ def main() -> None:
         tuple(args.batch_size),
         args.output_dir,
         args.gpu_memory_utilization,
+        args.additional_config,
         args.trust_remote_code,
     )
     raise SystemExit(0 if passed else 1)
