@@ -715,6 +715,9 @@ def sdpa_forward(
     )
     head_dim = cache_head_dim
 
+    # The attention output keeps the query dtype, not the cache dtype.
+    attention_output_dtype = queries.dtype
+
     # Reshape to 3D: (1, heads, L, hd) → (L, heads, hd)
     q_3d = mx.contiguous(queries[0].transpose(1, 0, 2).astype(kv_cache.dtype))
     k_3d = mx.contiguous(keys[0].transpose(1, 0, 2).astype(kv_cache.dtype))
@@ -1152,6 +1155,11 @@ def sdpa_forward(
 
     # Reshape + strip padding back to actual head_dim before o_proj.
     out = truncate_padded_output(out, B, L, n_heads, cache_head_dim, actual_head_dim)
+    # The kernel returns the cache dtype. MLX promotes bfloat16 with float16
+    # to float32, so a float16 checkpoint with a bfloat16 cache would
+    # otherwise carry a float32 residual stream.
+    if out.dtype != attention_output_dtype:
+        out = out.astype(attention_output_dtype)
     if gate is not None:
         out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
