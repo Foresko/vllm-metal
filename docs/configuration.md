@@ -101,6 +101,16 @@ The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
 flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
 
+Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
+positive byte count to **override** automatic sizing, for example
+`--kv-cache-memory-bytes 2147483648` for 2 GiB. This budgets paged cache storage;
+weights, activations, runtime workspace, and the
+[offload host pool](kv_offloading.md) need additional memory.
+
+Sizes round down to whole blocks. Startup profiling and the memory probe still
+run; an explicit budget that would need shrinking is rejected. The separate
+`--num-gpu-blocks-override` takes precedence over byte-derived block counts.
+
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
 but not necessarily generation speed. Use `--disable-hybrid-kv-cache-manager`
@@ -163,4 +173,4 @@ The budget keeps the full byte count: vLLM chooses its own grouped layout from
 the bytes it is handed. If free memory is merely below the plan, the pool keeps
 its capacity and the shortfall is logged: a plan is a cap, and only the blocks
 requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and trust `--gpu-memory-utilization` alone.
+skip the touch and use the configured cache budget.
