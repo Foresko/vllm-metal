@@ -397,7 +397,7 @@ class MetalModelRunner:
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self.metal_config = get_config()
-        # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
+        # MLX-native sampling key chain (VLLM_METAL_NATIVE_SAMPLING, default on).
         # Derived from the engine seed, so sampling is reproducible for a
         # fixed request schedule; split once per sampling call. A live key is
         # the single runtime capability signal for the native random path.
