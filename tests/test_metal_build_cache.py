@@ -543,6 +543,7 @@ def test_source_and_wheel_modes_load_metallibs(
         nax_supported=lambda: True,
         init_library_path=Mock(),
         init_nax_library_path=Mock(),
+        gqa_mma_decode_min_grid=lambda: 0,
     )
     monkeypatch.setenv("VLLM_METAL_BUILD_FROM_SOURCE", build_from_source)
     monkeypatch.delenv("VLLM_METAL_DISABLE_NAX", raising=False)
@@ -731,7 +732,11 @@ def test_debug_artifacts_load_without_build_environment(patched, compiler, monke
         "_metal_toolchain_id",
         _raise(AssertionError("runtime queried toolchain")),
     )
-    ops = SimpleNamespace(nax_supported=lambda: False, init_library_path=Mock())
+    ops = SimpleNamespace(
+        nax_supported=lambda: False,
+        init_library_path=Mock(),
+        gqa_mma_decode_min_grid=lambda: 0,
+    )
     loader = SimpleNamespace(exec_module=Mock())
     monkeypatch.setattr(
         metal.importlib.util,

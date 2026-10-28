@@ -1849,11 +1849,11 @@ inline int64_t paged_attention_compact_offset(
 }
 
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
-          int PARTITION_SIZE = 0>
+          int PARTITION_SIZE = 0, typename TMP_T = T>
 [[kernel]] void paged_attention_v2_reduce(
     device T *out [[buffer(0)]], const device float *exp_sums [[buffer(1)]],
     const device float *max_logits [[buffer(2)]],
-    const device T *tmp_out [[buffer(3)]],
+    const device TMP_T *tmp_out [[buffer(3)]],
     device uint32_t *context_lens [[buffer(4)]],
     const constant int &max_num_partitions [[buffer(5)]],
     const device float *sinks
@@ -1914,7 +1914,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // ========================================================================
   if (num_partitions == 1 && !use_sinks) {
     device T *out_ptr = out + out_offset;
-    const device T *tmp_out_ptr = tmp_out + partial_offset;
+    const device TMP_T *tmp_out_ptr = tmp_out + partial_offset;
 
     if (use_turboquant) {
       // Warp 0 owns the entire HEAD_SIZE vector as a lane-strided register
@@ -1942,7 +1942,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       // Non-TQ: plain copy from partition 0.
       for (int i = thread_position_in_threadgroup.x; i < HEAD_SIZE;
            i += threads_per_threadgroup.x) {
-        out_ptr[i] = tmp_out_ptr[i];
+        out_ptr[i] = T(tmp_out_ptr[i]);
       }
     }
     return;
@@ -2028,7 +2028,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   // vector, and (c) the number of FWHTs per kernel drops from
   // O(num_partitions) to 1.
   // ========================================================================
-  const device T *tmp_out_ptr = tmp_out + partial_offset;
+  const device TMP_T *tmp_out_ptr = tmp_out + partial_offset;
   device T *out_ptr = out + out_offset;
 
   if (use_turboquant) {
@@ -2840,3 +2840,44 @@ instantiate_gqa_decode_tq(half, 256);
 
 instantiate_gqa_small_reduce(bfloat16_t, 256);
 instantiate_gqa_small_reduce(half, 256);
+
+// fp32 partials written by paged_attention_gqa_mma_decode
+// (pagedattention_tiled.metal).
+#define instantiate_paged_attention_v2_reduce_tmpf32_inner(                    \
+    type, head_size, num_threads, num_simd_lanes, partition_size)              \
+  template [[host_name("paged_attention_v2_reduce_" #type "_tmpf32_hs"         \
+                       #head_size "_nt" #num_threads "_nsl" #num_simd_lanes    \
+                       "_ps" #partition_size)]] [[kernel]] void                \
+  paged_attention_v2_reduce<type, head_size, num_threads, num_simd_lanes,      \
+                            partition_size, float>(                            \
+      device type * out [[buffer(0)]],                                         \
+      const device float *exp_sums [[buffer(1)]],                              \
+      const device float *max_logits [[buffer(2)]],                            \
+      const device float *tmp_out [[buffer(3)]],                               \
+      device uint32_t *context_lens [[buffer(4)]],                             \
+      const constant int &max_num_partitions [[buffer(5)]],                    \
+      const device float *sinks [[buffer(6), function_constant(use_sinks)]],   \
+      device const int32_t *cu_seqlens_q [[buffer(7)]],                        \
+      const constant int &num_seqs [[buffer(8)]],                              \
+      const device int64_t *partition_offsets                                 \
+      [[buffer(9), function_constant(use_compact_scratch)]],                   \
+      threadgroup char *shared_mem [[threadgroup(0)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
+      uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], \
+      uint3 threads_per_threadgroup [[threads_per_threadgroup]],               \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                        \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_paged_attention_v2_reduce_tmpf32(type, partition_size)     \
+  instantiate_paged_attention_v2_reduce_tmpf32_inner(type, 128, 256, 32,       \
+                                                     partition_size);          \
+  instantiate_paged_attention_v2_reduce_tmpf32_inner(type, 256, 256, 32,       \
+                                                     partition_size);          \
+  instantiate_paged_attention_v2_reduce_tmpf32_inner(type, 512, 256, 32,       \
+                                                     partition_size);
+
+instantiate_paged_attention_v2_reduce_tmpf32(half, 256);
+instantiate_paged_attention_v2_reduce_tmpf32(half, 512);
+instantiate_paged_attention_v2_reduce_tmpf32(bfloat16_t, 256);
+instantiate_paged_attention_v2_reduce_tmpf32(bfloat16_t, 512);

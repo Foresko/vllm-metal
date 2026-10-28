@@ -318,6 +318,13 @@ def get_ops() -> ModuleType:
     if nax_ready:
         logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
 
+    if not envs.VLLM_METAL_DISABLE_GQA_DECODE:
+        logger.info(
+            "GQA MMA decode attention enabled for measured shapes "
+            "(single pass from %d head-group x token threadgroups on this GPU)",
+            mod.gqa_mma_decode_min_grid(),
+        )
+
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")
     return mod

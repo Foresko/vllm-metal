@@ -183,6 +183,98 @@ int gqa_decode_plan_for_lengths(
       ? partition : 0;
 }
 
+// ---------------------------------------------------------------------------
+// GQA MMA decode (paged_attention_gqa_mma_decode in pagedattention_tiled.metal)
+// ---------------------------------------------------------------------------
+// Serves up to 8 query heads of one KV head as the rows of one 8x8 MMA tile,
+// so each KV head is read once.  It covers the head_size-512 layers that the
+// GQA-shared kernel's geometry table above does not.
+
+// Tests and benchmarks: dispatch every supported shape, not only the shapes
+// in the measured-win table.
+static std::atomic<bool> gqa_mma_decode_force_{false};
+// -1: automatic split; 0: single pass; 256 / 512: that partition size.
+static std::atomic<int> gqa_mma_decode_partition_override_{-1};
+// Dispatch counters, so tests can prove routing without comparing outputs.
+static std::atomic<int64_t> gqa_mma_decode_single_pass_dispatches_{0};
+static std::atomic<int64_t> gqa_mma_decode_partitioned_dispatches_{0};
+
+// GQA MMA decode dispatch rules, measured on an M3 Ultra (60 GPU cores) with
+// tools/benchmark/gqa_mma_decode_bench.py (serial call chain, cold KV),
+// 2026-09-23:
+//   * (512, 8) beats the per-token kernel once a batch's tokens x context
+//     reach kGqaMmaMinTokenContext; below it (1-3 tokens at 1-3K context) the
+//     per-token kernel's many light threadgroups win.
+//   * A threadgroup walks its partition serially (~4.5 us per 8-key tile),
+//     so a single pass pays off only on a full grid: at 256 decode tokens
+//     (grid 512) 512-token partitions are 14-20% faster, at 512 tokens
+//     (grid 1024) a single pass is 1-3% faster.
+//   * 256-token partitions beat 512 while the split grid stays under 1.5
+//     threadgroups per core; above that 512 is equal or better.
+constexpr int64_t kGqaMmaMinTokenContext = 4096;
+constexpr int kGqaMmaSinglePassGridPerCore = 16;
+
+// (head_size, G) shapes where the GQA MMA decode kernel measured faster than
+// the per-token kernel, and the tokens x context from which it does; every
+// other supported shape runs only under force.
+//   (512, 8): Gemma 4 full attention (16 q / 2 KV heads), M3 Ultra, 2026-09.
+static bool gqa_mma_decode_measured_win(int head_size, int g, int total_q_tokens,
+                                        int max_seq_len) {
+  return head_size == 512 && g == 8
+         && int64_t(total_q_tokens) * max_seq_len >= kGqaMmaMinTokenContext;
+}
+
+// head_size -> TILE_KV; must match instantiate_paged_attention_gqa_mma_decode_ps
+// in pagedattention_tiled.metal.  0 = unsupported head size.
+static int gqa_mma_decode_tile_kv(int head_size) {
+  switch (head_size) {
+    case 128: return 32;
+    case 256: return 16;
+    case 512: return 8;
+    default:  return 0;
+  }
+}
+
+void set_gqa_mma_decode_force(bool force) {
+  gqa_mma_decode_force_.store(force, std::memory_order_relaxed);
+}
+
+void set_gqa_mma_decode_partition_override(int size) {
+  if (size != -1 && size != 0 && size != 256 && size != 512) {
+    throw std::invalid_argument(
+        "GQA MMA decode partition size must be -1 (auto), 0, 256 or 512");
+  }
+  gqa_mma_decode_partition_override_.store(size, std::memory_order_relaxed);
+}
+
+std::tuple<int64_t, int64_t> gqa_mma_decode_dispatch_counts() {
+  return {gqa_mma_decode_single_pass_dispatches_.load(std::memory_order_relaxed),
+          gqa_mma_decode_partitioned_dispatches_.load(std::memory_order_relaxed)};
+}
+
+// Head-group x token threadgroups from which the GQA MMA kernel runs a single
+// pass instead of splitting KV into partitions.
+int gqa_mma_decode_min_grid() {
+  return gpu_core_count() * kGqaMmaSinglePassGridPerCore;
+}
+
+int gqa_mma_decode_partition_size(int num_groups, int total_q_tokens,
+                                  int max_seq_len) {
+  const int override_size =
+      gqa_mma_decode_partition_override_.load(std::memory_order_relaxed);
+  if (override_size >= 0) {
+    return override_size;
+  }
+  const int grid = num_groups * total_q_tokens;
+  if (grid >= gqa_mma_decode_min_grid()) {
+    return 0;
+  }
+  // 256 while grid x ceil(ctx / 512) < 1.5 threadgroups per core.
+  const int partitions_512 = (max_seq_len + 511) / 512;
+  const int ps = 2 * grid * partitions_512 < 3 * gpu_core_count() ? 256 : 512;
+  return max_seq_len > ps ? ps : 0;  // one partition would only add the reduce
+}
+
 // Load a precompiled .metallib instead of compiling its source. Uses MLX's
 // get_library(name, path) overload, which loads the library at `path` and
 // caches it under `name`; a later dispatch's get_library(name) (no path) then
@@ -569,7 +661,7 @@ struct PagedAttentionMetadata {
 enum class PagedAttentionRoute {
   MixedNaxSplit, MixedNaxUnsplit, MixedTiled,
   NaxSplit, NaxUnsplit, Tiled,
-  GqaDecode, PerToken, SplitKv, Window, WindowSplitKv
+  GqaDecode, GqaMmaDecode, PerToken, SplitKv, Window, WindowSplitKv
 };
 
 struct PagedAttentionPlan {
@@ -792,6 +884,28 @@ static PagedAttentionPlan select_paged_attention_route(
       ? (partition ? PagedAttentionRoute::WindowSplitKv : PagedAttentionRoute::Window)
       : (partition ? PagedAttentionRoute::SplitKv : PagedAttentionRoute::PerToken);
   plan.route = scratch_fits ? PagedAttentionRoute::GqaDecode : plan.fallback;
+
+  // GQA MMA decode: pure-decode batches whose (head_size, G) is a measured
+  // win.  The kernel maps query row t to sequence t over the whole query, so
+  // a mixed batch's decode prefix (decode_only_rows > 0) keeps the routes
+  // above.  Its test force claims every supported shape, also ahead of the
+  // GQA-shared kernel.
+  const int mma_g = m.num_kv_heads > 0 ? m.num_heads / m.num_kv_heads : 0;
+  const bool mma_supported = !m.gqa_disabled && !has_prefill
+      && m.decode_only_rows == 0 && !m.use_turboquant && mma_g >= 2
+      && m.num_heads % m.num_kv_heads == 0
+      && (m.query_dtype == float16 || m.query_dtype == bfloat16)
+      && m.query_dtype == m.key_dtype && m.query_dtype == m.value_dtype
+      && gqa_mma_decode_tile_kv(m.head_size) != 0
+      && (m.block_size == 8 || m.block_size == 16 || m.block_size == 32);
+  const bool mma_force = gqa_mma_decode_force_.load(std::memory_order_relaxed);
+  if (mma_supported
+      && (mma_force
+          || (plan.route != PagedAttentionRoute::GqaDecode
+              && gqa_mma_decode_measured_win(
+                  m.head_size, mma_g, total_q_tokens, m.max_seq_len)))) {
+    plan.route = PagedAttentionRoute::GqaMmaDecode;
+  }
   return plan;
 }
 
@@ -970,6 +1084,119 @@ static void dispatch_paged_attention_gqa_decode(
       /*use_tq_fc=*/tq, plan.gqa_partition_size, gqa_rkernel,
       plan.compact ? &*g_offsets : nullptr);
   return;
+}
+
+static void dispatch_paged_attention_gqa_mma_decode(
+    const PagedAttentionArrays& arrays, const PagedAttentionMetadata& metadata,
+    const PagedAttentionPlan& plan, const PagedAttentionEncoding& encoding) {
+  auto& d = *encoding.device;
+  auto& enc = *encoding.encoder;
+  record_paged_dispatch(PagedDispatch::GqaMmaDecode);
+
+  const int total_q_tokens = plan.total_q_tokens;
+  const int num_heads = metadata.num_heads;
+  const int head_size = metadata.head_size;
+  const int g = num_heads / metadata.num_kv_heads;
+  const int num_groups = metadata.num_kv_heads * ((g + 7) / 8);
+  const int tile_kv = gqa_mma_decode_tile_kv(head_size);
+  const int ps = gqa_mma_decode_partition_size(num_groups, total_q_tokens,
+                                               metadata.max_seq_len);
+  const int num_partitions =
+      ps > 0 ? (metadata.max_seq_len + ps - 1) / ps : 1;
+  bool use_partitioning = ps > 0;
+  bool use_sinks = arrays.sinks != nullptr;
+
+  const std::string kname =
+      "paged_attention_gqa_mma_decode_" + encoding.dt +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(metadata.block_size) +
+      "_tk" + std::to_string(tile_kv) +
+      "_ps" + std::to_string(ps);
+  // MLX caches pipelines by hash name: every function constant goes in it.
+  const std::string hash_name = kname + "_pt" + (use_partitioning ? "1" : "0")
+                                + "_sk" + (use_sinks ? "1" : "0");
+  auto* kernel = d.get_kernel(
+      kname, encoding.library, hash_name,
+      {{&use_partitioning, MTL::DataType::DataTypeBool, NS::UInteger(10)},
+       {&use_sinks,        MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+
+  // Q (8 rows) + K + V tiles with padded rows (mirrors LD in the kernel) and
+  // the partial-S exchange; the fp32 output staging reuses the Q/K region.
+  const int t_size = static_cast<int>(arrays.query.itemsize());
+  const int ld = head_size + 16 / t_size;
+  size_t shmem = static_cast<size_t>((8 + 2 * tile_kv) * ld * t_size)
+               + static_cast<size_t>(4 * (tile_kv / 8) * 64 * sizeof(float));
+  shmem = (shmem + 15) & ~size_t(15);
+
+  constexpr int kThreads = 128;
+  int32_t num_heads_i = static_cast<int32_t>(num_heads);
+
+  if (!use_partitioning) {
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_threadgroup_memory_length(shmem, 0);
+    bind_paged_attn_buffers(
+        enc, arrays.out, arrays.query, arrays.key_cache, arrays.value_cache,
+        metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
+        arrays.seq_lens, arrays.cu_seqlens_q,
+        metadata.block_size, metadata.sliding_window);
+    enc.set_bytes(metadata.scale, 9);
+    if (use_sinks) {
+      enc.set_input_array(*arrays.sinks, 18);
+    }
+    enc.set_bytes(num_heads_i, 22);
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_groups, total_q_tokens, 1),
+        MTL::Size::Make(kThreads, 1, 1));
+    gqa_mma_decode_single_pass_dispatches_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  // Split-KV: fp32 partials, then the shared reduce (tmpf32 variant).
+  array tmp_out = make_paged_attention_temp(
+      enc, Shape{total_q_tokens, num_heads, num_partitions, head_size}, float32);
+  array exp_sums = make_paged_attention_temp(
+      enc, Shape{total_q_tokens, num_heads, num_partitions}, float32);
+  array max_logits = make_paged_attention_temp(
+      enc, Shape{total_q_tokens, num_heads, num_partitions}, float32);
+
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_threadgroup_memory_length(shmem, 0);
+  bind_paged_attn_buffers(
+      enc, tmp_out, arrays.query, arrays.key_cache, arrays.value_cache,
+      metadata.num_kv_heads, metadata.softcap, arrays.block_tables,
+      arrays.seq_lens, arrays.cu_seqlens_q,
+      metadata.block_size, metadata.sliding_window);
+  enc.set_bytes(metadata.scale, 9);
+  enc.set_output_array(exp_sums, 0);
+  enc.set_output_array(max_logits, 1);
+  if (use_sinks) {
+    // Declared under function constant 40, so it must be bound; the reduce
+    // folds the sink once for all partitions.
+    enc.set_input_array(*arrays.sinks, 18);
+  }
+  enc.set_bytes(num_heads_i, 22);
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_groups, total_q_tokens, num_partitions),
+      MTL::Size::Make(kThreads, 1, 1));
+
+  const std::string rname =
+      "paged_attention_v2_reduce_" + encoding.dt + "_tmpf32_hs" +
+      std::to_string(head_size) + "_nt256_nsl32_ps" + std::to_string(ps);
+  bool use_tq = false;
+  bool compact = false;
+  const std::string rhash = rname + "_v2reduce_tq0_sk"
+      + (use_sinks ? "1" : "0") + "_compact0";
+  auto* rkernel = d.get_kernel(
+      rname, encoding.library, rhash,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)},
+       {&use_tq,    MTL::DataType::DataTypeBool, NS::UInteger(50)},
+       {&compact,   MTL::DataType::DataTypeBool, NS::UInteger(130)}});
+  dispatch_paged_attention_v2_reduce(
+      d, enc, arrays.out, exp_sums, max_logits, tmp_out,
+      arrays.seq_lens, arrays.cu_seqlens_q, plan.num_seqs, total_q_tokens,
+      num_heads, head_size, num_partitions, encoding.dt, use_sinks,
+      arrays.sinks, use_tq, ps, rkernel);
+  gqa_mma_decode_partitioned_dispatches_.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void dispatch_paged_attention_per_token(
@@ -1195,6 +1422,9 @@ static void dispatch_paged_attention_v2_online(
       return;
     case PagedAttentionRoute::GqaDecode:
       dispatch_paged_attention_gqa_decode(arrays, metadata, plan, encoding, gqa_rkernel);
+      return;
+    case PagedAttentionRoute::GqaMmaDecode:
+      dispatch_paged_attention_gqa_mma_decode(arrays, metadata, plan, encoding);
       return;
     case PagedAttentionRoute::PerToken:
     case PagedAttentionRoute::SplitKv:

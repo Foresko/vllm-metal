@@ -492,7 +492,7 @@ NB_MODULE(_paged_ops, m) {
         static constexpr const char* names[] = {
             "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode"};
+            "mixed_nax_prefill_decode", "gqa_mma_decode"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
                       "PagedDispatch and its diagnostic names must stay in sync");
         return names[static_cast<size_t>(
@@ -501,9 +501,32 @@ NB_MODULE(_paged_ops, m) {
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
-      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\"). "
-      "Diagnostic surface for routing tests; empty "
+      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\", "
+      "\"gqa_mma_decode\"). Diagnostic surface for routing tests; empty "
       "when diagnostics are disabled, cleared or before the first recorded eval.");
+
+  m.def("set_gqa_mma_decode_force", &set_gqa_mma_decode_force,
+        nb::arg("force"),
+        "Dispatch the GQA MMA decode kernel for every supported shape, not only "
+        "the measured ones (tests / benchmarks).");
+
+  m.def("set_gqa_mma_decode_partition_size",
+        &set_gqa_mma_decode_partition_override, nb::arg("size"),
+        "Force the GQA MMA decode split: -1 automatic, 0 single pass, 256 or "
+        "512 (tests / benchmarks).");
+
+  m.def("gqa_mma_decode_dispatch_counts", &gqa_mma_decode_dispatch_counts,
+        "(single-pass, partitioned) GQA MMA decode dispatches since process "
+        "start.");
+
+  m.def("gqa_mma_decode_min_grid", &gqa_mma_decode_min_grid,
+        "Head-group x token threadgroups from which the GQA MMA decode kernel "
+        "runs a single pass on this machine.");
+
+  m.def("gqa_mma_decode_partition_size", &gqa_mma_decode_partition_size,
+        nb::arg("num_groups"), nb::arg("total_q_tokens"), nb::arg("max_seq_len"),
+        "KV partition size the GQA MMA decode kernel picks for this grid on "
+        "this machine: 0 (single pass), 256 or 512; honours the test override.");
 
   m.def("gdn_linear_attention", &gdn_linear_attention_primitive_fn,
         nb::arg("q"), nb::arg("k"), nb::arg("v"),
