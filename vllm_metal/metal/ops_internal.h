@@ -31,7 +31,7 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
   TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode,
-  NaxGqa6Prefill, Count
+  NaxGqa6Prefill, GqaMmaDecode, Count
 };
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
@@ -127,6 +127,14 @@ int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
     int max_seq_len = 0);
+// GQA MMA decode (paged_attention_gqa_mma_decode): test and benchmark
+// controls, and the split the kernel picks on this machine.
+void set_gqa_mma_decode_force(bool force);
+void set_gqa_mma_decode_partition_override(int size);
+std::tuple<int64_t, int64_t> gqa_mma_decode_dispatch_counts();
+int gqa_mma_decode_min_grid();
+int gqa_mma_decode_partition_size(int num_groups, int total_q_tokens,
+                                  int max_seq_len);
 void init_library_path(const std::string& name, const std::string& path);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
