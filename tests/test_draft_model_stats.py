@@ -5,12 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.stub_draft_model import StubDraftModel
 from tests.stub_runner import make_stub_runner
 from tests.test_draft_model_proposer import (
     _context,
     _proposer,
     _request_state,
-    _StubDraftModel,
 )
 from vllm_metal.v1.worker import MetalWorker
 
@@ -24,7 +24,7 @@ def _worker(runner):
 @pytest.mark.parametrize("min_draft_tokens", [0, 1, 3])
 def test_worker_reports_effective_limits_and_detached_snapshots(min_draft_tokens):
     proposer = _proposer(
-        _StubDraftModel(),
+        StubDraftModel(),
         max_model_len=4096,
         min_speculative_tokens=min_draft_tokens,
     )
@@ -43,7 +43,7 @@ def test_worker_reports_effective_limits_and_detached_snapshots(min_draft_tokens
 
 
 def test_counter_is_cumulative_after_cleanup_and_independent_of_log_level(caplog):
-    proposer = _proposer(_StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
+    proposer = _proposer(StubDraftModel(), max_model_len=32, min_speculative_tokens=3)
     runner = make_stub_runner(_drafter=proposer)
     worker = _worker(runner)
     caplog.set_level("ERROR", logger="vllm_metal.v1.draft_model_proposer")
@@ -59,7 +59,7 @@ def test_counter_is_cumulative_after_cleanup_and_independent_of_log_level(caplog
         assert first["num_context_limit_fallback_requests"] == expected_count
         assert worker.get_draft_model_stats() == first
     assert not caplog.records
-    fresh = _proposer(_StubDraftModel())
+    fresh = _proposer(StubDraftModel())
     assert fresh.get_stats()["num_context_limit_fallback_requests"] == 0
 
 

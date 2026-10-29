@@ -492,6 +492,7 @@ inline float tg_forward_fwht_scalar(float x, threadgroup float* buf, uint t) {
 // bit patterns which read back correctly as `int8_t` in decode kernels.
 // ===========================================================================
 
+constant float TQ_MIN_SCALE = 0x1.0p-14f;
 constant int  tq_enc_k_bits   [[function_constant(80)]];
 constant bool tq_enc_k_signed [[function_constant(81)]];
 constant int  tq_enc_v_bits   [[function_constant(90)]];
@@ -616,10 +617,14 @@ template <typename T, int HEAD_SIZE>
     float k_zp_f;
     int   k_idx_i;
 
+    const half k_abs_max_h = half(max(fabs(k_min_f), fabs(k_max_f)));
     if (tq_enc_k_signed) {
         // q8_0 / int8  (bits == 8)
         const int max_val = (1 << (tq_enc_k_bits - 1)) - 1;
         k_scale_h = half(half(k_max_f - k_min_f) / half(2.0f * float(max_val)));
+        if (k_scale_h < half(TQ_MIN_SCALE)) {
+            k_scale_h = max(half(k_abs_max_h / half(2.0f * float(max_val))), half(TQ_MIN_SCALE));
+        }
         const half k_sum_h = half(k_max_f + k_min_f);
         k_zp_f    = rint(float(k_sum_h / (half(2.0f) * k_scale_h)));
         k_idx_i   = int(rint(float(half(k_val) / k_scale_h) - k_zp_f));
@@ -628,6 +633,9 @@ template <typename T, int HEAD_SIZE>
         // uint8 / q5_0 / q4_0 / int4 / uint4 / int2 / uint2
         const int max_val = (1 << tq_enc_k_bits) - 1;
         k_scale_h = half(half(k_max_f - k_min_f) / half(float(max_val)));
+        if (k_scale_h < half(TQ_MIN_SCALE)) {
+            k_scale_h = max(half(k_abs_max_h / half(float(max_val))), half(TQ_MIN_SCALE));
+        }
         k_zp_f    = rint(float(half(k_min_f) / k_scale_h));
         k_idx_i   = int(rint(float(half(k_val) / k_scale_h) - k_zp_f));
         k_idx_i   = clamp(k_idx_i, 0, max_val);

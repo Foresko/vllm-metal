@@ -4,10 +4,19 @@ state-family factory."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx_lm.models.bailing_moe_v3 import (
+    BailingKDA,
+    BailingMLA,
+)
+from mlx_lm.models.bailing_moe_v3 import (
+    ModelArgs as BailingModelArgs,
+)
 from mlx_lm.models.nemotron_h import (
     Model,
     ModelArgs,
@@ -21,11 +30,15 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from tests.stub_runner import (
     NEMOTRON_H_TINY_ARGS,
     initialize_hybrid_runtime,
+    make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
 )
+from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
+from vllm_metal.attention.impls.kda import KDAPagedAttentionWrapper
 from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper
 from vllm_metal.attention.impls.mamba2 import Mamba2PagedStateWrapper
+from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
 from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
@@ -235,6 +248,14 @@ class TestStateFamilyFactory:
         with pytest.raises(ValueError, match="must be positive integers"):
             build_hybrid_runtime_plan(args, 8, STATE_DTYPES)
 
+    def test_routes_bailing_v3_to_the_kda_family(self) -> None:
+        plan = make_bailing_hybrid_plan(5)
+
+        assert plan.family.label == "kda"
+        assert plan.layers.attention_indices == (1, 3, 4)
+        assert plan.layers.state_indices == (0, 2)
+        assert plan.geometry.state_shapes == ((2, 24), (2, 4, 4))
+
 
 class TestNemotronHPlanDecision:
     def test_string_pattern_reads_as_characters(self) -> None:
@@ -429,6 +450,52 @@ class TestHybridPatchModel:
         assert gdn_2._gdn_cache_idx == 1
         assert gdn_0._gdn_state_cache is runtime.state_cache
         assert gdn_2._gdn_state_cache is runtime.state_cache
+
+    def test_bailing_patches_mla_and_kda_on_shared_storage(self) -> None:
+        args = BailingModelArgs(
+            hidden_size=16,
+            num_hidden_layers=2,
+            layer_group_size=2,
+            num_attention_heads=2,
+            head_dim=4,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            short_conv_kernel_size=3,
+            max_position_embeddings=32,
+        )
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=make_bailing_hybrid_plan(
+                2, state_dtypes=(torch.float32, torch.float32)
+            ),
+            dtype=mx.float32,
+        )
+        initialize_hybrid_runtime(
+            runtime, 2, head_dim=args.kv_lora_rank + args.qk_rope_head_dim, mla=True
+        )
+        model = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(attention=BailingKDA(args)),
+                    SimpleNamespace(attention=BailingMLA(args)),
+                ]
+            )
+        )
+
+        assert runtime.patch_model(model) == 2
+
+        kda = model.model.layers[0].attention
+        mla = model.model.layers[1].attention
+        assert isinstance(kda, KDAPagedAttentionWrapper)
+        assert isinstance(mla, MLAPagedAttentionWrapper)
+        assert isinstance(runtime.kv_cache, MLAPagedLatentCache)
+        assert kda._kda_cache_idx == 0
+        assert mla._mla_layer_idx == 0
+        assert runtime.kv_cache.latent_caches.storage is runtime.storage
+        assert runtime.state_cache.conv_states.storage is runtime.storage
+        assert runtime.state_cache.recurrent_states.storage is runtime.storage
 
     def test_repatch_rebinds_cached_wrappers_through_owner_methods(self) -> None:
         runtime_a = _make_runtime()

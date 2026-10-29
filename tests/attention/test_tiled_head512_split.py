@@ -46,8 +46,7 @@ def _kernel(
     query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window, **kwargs
 ):
     hd = int(query.shape[-1])
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -60,7 +59,6 @@ def _kernel(
         BLOCK,
         max(kv_lens),
         window if window is not None else -1,
-        out,
         **kwargs,
     )
     mx.eval(out)

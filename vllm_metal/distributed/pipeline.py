@@ -46,12 +46,7 @@ def _ring_hosts(peer_ips: list[str]) -> list[list[str]]:
     same base on every node to move the ring off a busy port. The env var is
     read per call, like every other vllm_metal env knob.
     """
-    base_port = envs.VLLM_METAL_RING_BASE_PORT
-    if not (1024 <= base_port <= 65535):
-        raise ValueError(
-            "VLLM_METAL_RING_BASE_PORT must be in the user-port range "
-            f"[1024, 65535], got {base_port}"
-        )
+    base_port = envs.VLLM_METAL_RING_BASE_PORT  # envs checks [1024, 65535]
     max_port = base_port + len(peer_ips) - 1
     if max_port > 65535:
         raise ValueError(

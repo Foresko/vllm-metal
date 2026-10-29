@@ -30,10 +30,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 from tests.stub_runner import make_gemma4_mixed_attention_runner, make_stub_runner
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
 from vllm_metal.attention.runtime.sdpa import (
     SDPAPagedAttentionRuntime,
@@ -617,12 +617,14 @@ class TestUpstreamAttentionStorage:
             (30, 8, 2),
         ),
     )
+    @pytest.mark.parametrize("explicit", [False, True])
     def test_cache_policy_initializes_gemma4_grouped_layout_from_budget(
         self,
         monkeypatch,
         num_layers: int,
         sliding_kv_heads: int,
         full_kv_heads: int,
+        explicit: bool,
     ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=num_layers,
@@ -641,6 +643,11 @@ class TestUpstreamAttentionStorage:
         # dense blocks no longer serve one max_model_len request.
         reported_dense_blocks = 3
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        if explicit:
+            runner.cache_config.gpu_memory_utilization = 0.1
+            runner.cache_config.kv_cache_memory_bytes = (
+                dense_block_bytes * reported_dense_blocks + 17
+            )
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -657,6 +664,8 @@ class TestUpstreamAttentionStorage:
         )
 
         available = planner.determine_available_memory()
+        if explicit:
+            assert available == runner.cache_config.kv_cache_memory_bytes
 
         specs = runner.get_kv_cache_spec()
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
@@ -675,6 +684,8 @@ class TestUpstreamAttentionStorage:
 
         backend = runner.paged_attention_runtime
         assert isinstance(backend, SDPAPagedAttentionRuntime)
+        # Group descriptors alias one allocation; count its backing only once.
+        assert backend.storage.nbytes <= available
         assert backend.num_blocks() == config.num_blocks
         assert runner._paged_scheduler_group_indices == (0, 1, 2, 3, 4, 5)
         assert runner._paged_group_block_sizes == (16, 16, 16, 16, 16, 32)
@@ -732,7 +743,10 @@ class TestUpstreamAttentionStorage:
         assert runner.paged_attention_runtime is not None
         assert runner.paged_attention_runtime.num_blocks() == config.num_blocks
 
-    def test_block_override_uses_engine_block_count(self, monkeypatch) -> None:
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_block_override_uses_engine_block_count(
+        self, monkeypatch, explicit
+    ) -> None:
         runner = self.gemma4_mixed_runner(
             num_layers=6,
             sliding_kv_heads=2,
@@ -748,6 +762,8 @@ class TestUpstreamAttentionStorage:
             lambda: metal_config,
         )
         dense_block_bytes = runner.get_cache_block_size_bytes()
+        if explicit:
+            runner.cache_config.kv_cache_memory_bytes = dense_block_bytes
         worker = SimpleNamespace(
             model_runner=runner,
             metal_config=metal_config,
@@ -771,7 +787,10 @@ class TestUpstreamAttentionStorage:
         config = get_kv_cache_configs(runner.vllm_config, [specs], [available])[0]
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
 
-        assert available < 0
+        if explicit:
+            assert available == dense_block_bytes
+        else:
+            assert available < 0
         assert config.num_blocks == 100
         runner.initialize_kv_cache(config)
         assert runner.paged_attention_runtime.num_blocks() == 100
@@ -825,12 +844,12 @@ class TestUpstreamAttentionStorage:
             cache.value_caches[0],
             mx.arange(seq_len, dtype=mx.int64),
         )
-        block_tables, kernel_block_size = _build_block_tables(
+        block_tables, kernel_block_size = build_block_tables(
             [[0]], cache.block_size_for_layer(0)
         )
         output = mx.array(0)
         scale = head_size**-0.5
-        get_ops().paged_attention_primitive(
+        output = get_ops().paged_attention_primitive(
             query,
             key_cache,
             value_cache,
@@ -843,7 +862,6 @@ class TestUpstreamAttentionStorage:
             kernel_block_size,
             seq_len,
             -1,
-            output,
         )
         reference = mx.fast.scaled_dot_product_attention(
             query.transpose(1, 0, 2)[None],

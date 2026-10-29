@@ -118,11 +118,18 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
 Eligible TurboQuant prefills materialize the referenced KV pages and use the
 existing NAX or tiled attention kernel. `VLLM_METAL_TQ_PREFILL=auto` enables this
 when NAX is available (M5; `VLLM_METAL_DISABLE_NAX=1` makes it behave as `0`);
-`1` opts into tiled prefill on other GPUs, and `0` disables it. The crossover was calibrated on M5 Pro; broader hardware and shape
-calibration is required before enabling tiled prefill by default on M1–M4.
+`1` opts into tiled prefill on other GPUs, and `0` disables it. M5 Pro and M3
+calibration is described below; broader hardware and shape validation is still
+required before enabling tiled prefill by default on M1–M4.
 
 Eligibility uses the **new query tokens in the current scheduler chunk**:
-`max(128, head_dim / 2, ceil(256 * num_kv_heads / num_query_heads))` or more.
+The default minimum is
+`max(128, head_dim // 2, ceil(256 * num_kv_heads / num_query_heads))`.
+For signed K8 (`q8_0` or its equivalent `int8`) with V3 (`q3_0`), hd128,
+Q/KV heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context at least 8192,
+the calibrated minimum is 64. Other K/V encodings retain the default formula,
+including unsigned `uint8` keys. Each request uses its own context
+and threshold; the cached prefix counts toward context but not new query tokens.
 The lane supports single/multiple requests, mixed prefill/decode batches, and
 prefix caching on or off. After a prefix hit, only the uncached suffix contributes
 query tokens; the attention still reads the relevant cached history. Decode,
@@ -143,16 +150,43 @@ per layer **per scheduler step**; each prefill chunk re-materializes its
 referenced history. Scheduler-owned storage, block tables and their lifetime
 remain authoritative.
 
-Workspace resolution and routing plans are cached in the existing per-forward,
-per-KV-group metadata. A fully selected batch reuses the original sequence
-metadata without constructing query-reordering indices.
+The worker resolves the workspace allowance once, before KV allocation, and
+passes that same value to each forward. Routing plans remain cached in the
+existing per-forward, per-KV-group metadata. A fully selected batch reuses the
+original sequence metadata without constructing query-reordering indices.
 
 `VLLM_METAL_TQ_PREFILL_MAX_MIB=auto` reserves 2% of the device's recommended
-working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling. A
-number overrides the allowance in MiB; `0` disables materialization. Set these
-variables before worker startup. The existing cache planner subtracts the
-allowance **once, inside `gpu_memory_utilization`**, before allocating KV blocks.
-This is a fixed allowance, not permission to borrow currently free memory.
+working set, rounded up to 64 MiB, with a 256 MiB floor and 2 GiB ceiling before
+applying a model-specific cap. For non-speculative serving, the cap covers all
+eligible independent histories allowed by `max_model_len`, `max_num_seqs` and
+`max_num_batched_tokens`, including page padding and mixed-batch routing
+copies. It can reduce the reservation below 256 MiB for small configurations.
+A scheduler chunk limits new queries, not the historical KV they can read.
+Layers reuse one allowance.
+
+The cap uses `max_model_len` when the worker plans the KV budget, before vLLM
+auto-fits the context to available memory. Later auto-fit reductions do not
+recompute or reclaim the reservation. Set an explicit `--max-model-len` to cap
+the reservation using a shorter context at planning time.
+
+Speculative configurations retain the device-based allowance. A number
+explicitly overrides the allowance in MiB without applying the model cap;
+`0` disables materialization. Set these variables before worker startup.
+The existing cache planner subtracts the allowance **once, inside
+`gpu_memory_utilization`**, before allocating KV blocks. This is a fixed
+allowance, not permission to borrow currently free memory.
+
+For example, on M5 Pro 64 GB with K8/V3, `max_model_len=4104`,
+`max_num_seqs=1` and `max_num_batched_tokens=2048`:
+
+| Model | Device-only reservation | Model-capped reservation | Additional KV budget |
+|---|---:|---:|---:|
+| Qwen3-0.6B-4bit | 1,088 MiB | 16.13 MiB | 1,071.87 MiB |
+| Qwen3.5-0.8B BF16 | 1,088 MiB | 10.71 MiB | 1,077.29 MiB |
+
+Both retain the accelerated path for their eligible prefills. The released
+budget goes to the existing KV planner within the same memory-utilization
+limit; these capacity figures do not imply a further TTFT speedup.
 
 Admission counts final K/V, page indices, block tables and any mixed-batch
 query/output copies. Independent histories add their sizes; shared physical
@@ -165,9 +199,190 @@ successive layers cannot accumulate. Normal model buffers remain in the
 existing profiled execution budget.
 
 The worker logs the reserved allowance, first lane activation and first budget
-fallback. Debug logs include selected/fallback request counts, gathered tokens
-and estimated bytes. Larger histories still need more scratch space: this is
-bounded materialization, not constant-memory streaming attention.
+fallback. Unsupported activation dtypes, head dimensions and cache layouts
+also report their fallback reason once. Debug logs include selected/fallback
+request counts, gathered tokens and estimated bytes. Larger histories still need
+more scratch space: this is bounded materialization, not constant-memory
+streaming attention.
+
+## Head-Dimension 128 Crossover
+
+M5 Pro 64 GB, K8/V3, head dimension 128, eight query heads, FP16/BF16,
+8K/32K KV histories and TF32 disabled. The table reports the range across both
+precisions and history lengths. Ratios are compressed time divided by
+materialized time; values below 1 mean materialization is slower. These are
+warmed single-layer production-wrapper timings, including projection, cache
+writes, planning, materialization and synchronization, not model TTFT.
+
+| Backend | Q/KV heads | 16 new tokens | 32 | 64 | 96 | 128 | 256 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| NAX | GQA 8/2 | 0.65–0.69× | 1.06–1.11× | 2.35–2.69× | 2.70–3.10× | 4.22–5.23× | 7.38–9.97× |
+| NAX | MHA 8/8 | 0.56–0.60× | 0.90–0.95× | 1.95–2.28× | 2.32–2.61× | 3.56–4.31× | 6.00–8.07× |
+| Tiled | GQA 8/2 | 0.52–0.61× | 0.90–0.95× | 1.67–1.72× | 2.37–2.51× | 3.07–3.25× | 4.24–4.96× |
+| Tiled | MHA 8/8 | 0.47–0.51× | 0.77–0.80× | 1.35–1.51× | 1.89–2.18× | 2.50–2.91× | 3.89–4.37× |
+
+On this device, the observed NAX GQA crossover is between 16 and 32 new tokens;
+the advantage at 32 tokens remains small. NAX MHA and both tiled shapes
+cross between 32 and 64 tokens. These measurements do not establish thresholds
+for other GPUs or model shapes. Some configurations
+still show timing variation of several percent; the shortest cases can vary
+by about 10–13%, so small gains near the crossover need confirmation.
+
+### M3 calibration and bounded admission
+
+M3 Air, 24 GiB, tiled attention, K8/V3, FP16/BF16, 8K/32K total KV context
+and TF32 disabled. Ratios use the same compressed/materialized median
+definition as the M5 table above.
+
+| Q/KV heads | 16 new tokens | 32 | 64 | 96 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|---:|
+| 8/2 | 0.72–0.88× | 1.37–1.70× | 2.69–3.29× | 3.86–4.72× | 2.98–3.54× | 4.07–4.78× |
+| 8/8 | 0.67–0.72× | 1.18–1.33× | 2.19–2.61× | 3.16–3.76× | 2.68–3.10× | 3.73–4.40× |
+| 32/8 (Qwen3-4B) | 1.36–1.59× | 2.62–2.94× | 3.81–4.42× | 4.42–5.12× | 4.81–5.37× | 5.70–6.59× |
+| 16/2 (MiniCPM5-2B) | 1.42–1.68× | 2.56–3.15× | 2.88–3.68× | 4.33–5.26× | 4.19–5.13× | 5.25–6.61× |
+
+The two model rows use their attention head geometry in the single-layer
+fixture; they are not whole-model latency measurements. Fresh 64-token prompts
+yielded only 0.81–0.93× across these geometries and precisions: materialization
+was slower. A global 64-token cutoff would therefore regress this workload.
+The 8K context gate is conservative, not a measured optimum; 2K contexts also
+favored materialization in this matrix.
+
+On M5 Pro 64 GB, the additional model geometries have these NAX ratios for
+FP16/BF16 and 8K/32K contexts, with the same K8/V3 comparison:
+
+| Q/KV heads | 64 new tokens | 96 | 128 |
+|---|---:|---:|---:|
+| 32/8 (Qwen3-4B) | 6.30–8.29× | 7.80–9.54× | 8.86–10.22× |
+| 16/2 (MiniCPM5-2B) | 4.09–5.38× | 4.89–6.16× | 7.44–10.44× |
+
+Admission uses 64 new query tokens only for signed K8/V3, hd128 with Q/KV
+heads 8/2, 8/8, 32/8 or 16/2 and total visible KV context of at least 8192
+tokens. FP16/BF16 in these tables describes activation precision, not additional
+K/V encodings. Shorter contexts, other K/V encodings and other geometries
+retain the original
+`max(128, head_dim // 2, ceil(256 * KV_heads / Q_heads))` threshold. The context
+condition is evaluated per request, so mixed batches may contain both policies.
+The workspace cap uses the same encoding-aware policy and the minimum threshold
+reachable up to `max_model_len`, including the extra independent histories
+admitted by the lower cutoff.
+Default hardware rollout is unchanged: M3 still requires
+`VLLM_METAL_TQ_PREFILL=1`. Contexts above 32K were not calibrated, and ordinary
+workspace rejection still applies before materialization.
+
+```bash
+# Actual model geometries, with the same long-context protocol:
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled \
+  --head-pairs 32:8 16:2 --query-tokens 16 32 64 96 128 192 256 \
+  --reps 31 --warmup 5
+# Context 0 means a fresh prompt (total KV length equals the query length):
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled \
+  --head-pairs 8:2 8:8 32:8 16:2 --query-tokens 64 96 128 192 \
+  --context-tokens 0 256 2048 --reps 15 --warmup 3
+```
+
+The `crossover-hd128` suite forces only the query-count threshold in the
+benchmark to compare both algorithms below the production cutoff. It retains
+shape validation, the workspace limit and the normal synchronization boundary,
+and rejects a sample if materialization did not run or any output is nonfinite.
+Each record also reports `production_lane_selected`, separately from the
+forced measurement. The older `crossover` suite continues to measure ordinary
+routing, including fallbacks.
+
+```bash
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --reps 31 --warmup 5
+# The same matrix through tiled attention:
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  python tools/benchmark/tq_lane_verify.py --suite crossover-hd128 --tiled --reps 31 --warmup 5
+```
+
+### M3 whole-model policy comparison
+
+Qwen3-4B-4bit (32 Q / 8 KV heads, hd128, 36 layers), BF16 activations and
+K8/V3, with exactly 8192 cached tokens. Both arms used the same workspace
+allowance and KV budget. The table reports in-process, instrumented vLLM TTFT
+medians with engine multiprocessing disabled, without HTTP or serving queues.
+
+| Uncached queries | Old TTFT (ms) | New TTFT (ms) | Old/new medians | Median paired ratio | Materialized layers old/new |
+|---|---:|---:|---:|---:|---:|
+| 32 | 907.97 | 1008.10 | 0.901× | 0.919× | 0/0 |
+| 63 | 1859.21 | 1990.24 | 0.934× | 0.982× | 0/0 |
+| 64 | 2151.62 | 539.12 | 3.991× | 3.886× | 0/36 |
+| 65 | 2297.26 | 773.19 | 2.971× | 2.979× | 0/36 |
+| 96 | 3205.37 | 760.99 | 4.212× | 4.045× | 0/36 |
+| 127 | 4211.42 | 995.32 | 4.231× | 4.231× | 0/36 |
+| 128 | 1028.18 | 1026.26 | 1.002× | 1.002× | 36/36 |
+| 129 | 1229.25 | 1196.16 | 1.028× | 1.028× | 36/36 |
+| 256 | 1929.08 | 1925.55 | 1.002× | 1.000× | 36/36 |
+
+First-token outputs matched, with exact cache hits and the expected layer
+dispatch. Each query reuse occupied one prefill scheduler step. The 64-token
+materialization used 32.38 MiB within a 33.20 MiB allowance. These are gains
+from the scoped policy change, unlike the forced single-layer algorithm
+ratios above.
+
+The unchanged compressed controls at 32 and 63 tokens were 11.0% and 7.05%
+slower on the new side despite identical routing; the cause is unresolved.
+Unchanged materialized controls at 128/129/256 were approximately flat.
+The 65-token point varied substantially, with a new-side latency as high as
+1094.78 ms and paired speedups of 2.062–3.043×. These ranges are observations,
+not confidence intervals or a general serving-throughput/SLO claim.
+
+The mixed probe used three independent 8192-token cached histories with
+64/9/1 uncached tokens and eight generated tokens per request. Every measured
+batch had the actual cumulative queries `[0, 64, 73, 74]` in one prefill
+scheduler step. All 36 layers selected one request and retained two compressed
+fallbacks under the new policy; the old policy retained all three fallbacks.
+Cache hits were exact and eight-token continuations matched. Batch TTFT
+(maximum of the three request TTFTs) was
+2719.64 ms old versus 1030.55 ms new, a 2.639× median ratio; individual paired
+ratios were 2.460–2.708×. Actual materialization workspace stayed at 34.12 MiB
+within the shared 145.36 MiB allowance. Batch generation wall time was
+3413.05 ms old versus 1818.65 ms new (1.877×). The one-query-token request is
+a prefix-reuse fallback; this does not establish overlap with an already
+running decode request or concurrent HTTP throughput.
+
+### M5 Pro whole-model policy comparison
+
+M5 Pro 64 GB, Qwen3-4B-4bit, NAX, BF16 activations, K8/V3 and an 8192-token
+cached prefix. The in-process comparison controls workspace and KV capacity
+between the old/new policies, with engine multiprocessing disabled. TTFT
+values are medians; first-token outputs match.
+
+| Uncached queries | Old TTFT (ms) | New TTFT (ms) | Old/new | Materialized layers old/new |
+|---|---:|---:|---:|---:|
+| 32 | 224.89 | 224.73 | 1.001× | 0/0 |
+| 64 | 424.68 | 105.58 | 4.022× | 0/36 |
+| 96 | 624.03 | 136.34 | 4.577× | 0/36 |
+| 128 | 124.72 | 124.30 | 1.003× | 36/36 |
+
+### M5 Pro HTTP serving comparison
+
+The same model, precision and 8K prefix workload through streamed HTTP
+completions, with one request at a time and eight generated tokens. The server
+uses the standard multiprocessing topology (`VLLM_ENABLE_V1_MULTIPROCESSING=1`).
+TTFT uses the upstream serving benchmark's request function and ends at the
+first generated token received by the client. Both policies use the same
+workspace allowance and KV capacity. Values are medians.
+
+| Uncached queries | Old TTFT (ms) | New TTFT (ms) | Old/new | Materialized layers old/new |
+|---|---:|---:|---:|---:|
+| 32 | 246.56 | 246.64 | 1.000× | 0/0 |
+| 64 | 446.45 | 127.82 | 3.493× | 0/36 |
+| 96 | 646.07 | 158.46 | 4.077× | 0/36 |
+| 128 | 147.14 | 146.36 | 1.005× | 36/36 |
+
+Worker observations confirm the exact cache hit, uncached query length and
+expected layer routing. Eight-token continuations match. Paired TTFT speedups
+span 3.48–3.52× at 64 queries and 4.04–4.09× at 96; both unchanged controls
+stay within 1% in their medians.
+These HTTP results include serving overhead and should be kept separate from
+the in-process results above. They cover single-request latency; concurrent
+throughput, queueing under load and SLO goodput remain unmeasured. Agreement
+on this fixed workload does not establish corpus-level model quality.
 
 ## Validation and Reproduction
 
@@ -179,7 +394,8 @@ bounds. Fused dequantization is compared with the independent Python decoder.
 
 The attention microbenchmark uses the same fixture, with interleaved timings,
 numerical error, actual dispatch and peak additional MLX memory. Suites are
-`crossover`, `geometry` and `long`; add `--tiled` to test the tiled backend:
+`crossover`, `crossover-hd128`, `geometry` and `long`; add `--tiled` to test
+the tiled backend:
 
 ```bash
 PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
@@ -200,13 +416,81 @@ JSON records vLLM's `first_token_latency`, wall time, actual layer dispatch,
 workspace, MLX memory and runtime versions. TTFT summaries are medians of the
 measured repetitions, excluding warmup. Missing TTFT or an inactive requested
 TQ lane fails explicitly. This offline tool excludes HTTP and concurrent serving
-queues. `--prefix-probe --prompt-tokens 8192` instead seeds and reuses real cached
-prefixes with short/long suffixes, recording cache hits and dispatch.
+queues.
 
-For HTTP latency and throughput, start the same model with prefix caching off:
+For threshold calibration, the prefix probe accepts an exact cached history and
+the number of query tokens that must remain uncached. The history must be a
+multiple of the scheduler block size. The probe seeds one extra token so the
+entire requested history can be cached, then verifies both the cache-hit count
+and the remaining query count on every reuse. A partial hit fails the probe.
 
 ```bash
-MLX_ENABLE_TF32=0 VLLM_METAL_TQ_PREFILL=1 vllm serve /path/to/model \
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  VLLM_METAL_TQ_PREFILL=1 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/hd128-model --prefix-probe --prefix-tokens 8192 \
+  --query-tokens 32 63 64 65 96 127 128 129 256 \
+  --max-tokens 1 --reps 3 --warmup 1 --output prefix-8k.json
+```
+
+Use `--prefix-tokens 32768` for a longer history when the model and device can
+hold it. These explicit prefix/query lengths determine the required model
+context limit; `--prompt-tokens` is for the ordinary prompt-length sweep.
+Without `--prefix-tokens`, the prefix probe retains its two-block history;
+default query lengths are 1, 9 and 257. Query lengths are not appended-suffix
+lengths: vLLM must retain at least one query to compute logits. Query lengths
+must fit within `--batch-tokens` so the measured reuse occupies one scheduler step.
+
+Each arm gets a fresh prefix seeded through the same production path, keeping
+cached hidden states independent of the measured arm. Warmup and measured pairs
+alternate arm order, and summaries report median reuse TTFT, actual lane calls
+and greedy token agreement. Dispatch checks use the loaded model's production threshold,
+so short seeds and MHA thresholds do not inherit a hard-coded GQA cutoff.
+An eligible probe with no materialized layers fails rather than reporting a
+fallback as a materialized result.
+
+The hd128 microbenchmark can run on M3 with `--tiled`, and on M5 with both
+backends. Use the same source and dependency versions for calibration. The
+microbenchmark measures the two algorithms below the policy cutoff; the prefix
+probe measures compressed attention against the current production policy.
+To compare the previous threshold with the current production policy, add
+`--compare-policies`. Both arms reset the cache and seed it through the old
+policy, then execute normal production admission for the measured reuse. They
+share a workspace reservation large enough for either policy and the same KV
+budget; this isolates admission latency rather than measuring a capacity change.
+The records include per-request cache hits, context-aware thresholds, actual
+selected/fallback counts and prompt/output equality. `--max-tokens` may exceed
+one in this mode to check greedy continuation; seeds still generate one token.
+
+```bash
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  VLLM_METAL_TQ_PREFILL=1 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/hd128-model --prefix-probe --compare-policies \
+  --prefix-tokens 8192 --query-tokens 32 63 64 65 96 127 128 129 256 \
+  --max-tokens 1 --reps 3 --warmup 1 --output policies-8k.json
+# Distinct cached histories must be co-scheduled in full; verify the mixture
+# of newly eligible prefill, short fallback and one uncached query token:
+PYTHONPATH=. VLLM_METAL_BUILD_FROM_SOURCE=1 MLX_ENABLE_TF32=0 \
+  VLLM_METAL_TQ_PREFILL=1 python tools/benchmark/tq_e2e_arm.py \
+  --model /path/to/hd128-model --mixed-prefix-probe --compare-policies \
+  --prefix-tokens 8192 --query-tokens 64 9 1 --max-tokens 8 \
+  --reps 3 --warmup 1 --output policies-mixed-8k.json
+```
+
+Mixed summaries report the maximum per-request TTFT for each submitted batch;
+each request's own TTFT remains in the raw records. Planner-observed steps
+exclude later decode steps. These are offline instrumented probes, without
+HTTP or external serving queues. Failed probes preserve their output and exit
+nonzero; choose a new output path for a repeat. Enabling non-M5 devices by
+default remains a separate rollout decision.
+
+For HTTP latency and throughput, follow the
+[macOS serving benchmark guide](https://github.com/vllm-project/vllm-metal/blob/main/docs/benchmarking-macos.md).
+To compare the whole prefill lane with compressed attention, start the same
+model with prefix caching off:
+
+```bash
+VLLM_ENABLE_V1_MULTIPROCESSING=1 MLX_ENABLE_TF32=0 \
+  VLLM_METAL_TQ_PREFILL=1 vllm serve /path/to/model \
   --host 127.0.0.1 --served-model-name tq-prefill --dtype bfloat16 \
   --max-model-len 9216 --max-num-batched-tokens 2048 --max-num-seqs 4 \
   --gpu-memory-utilization 0.7 --no-enable-prefix-caching --generation-config vllm \
@@ -227,6 +511,15 @@ vllm bench serve --model /path/to/model --served-model-name tq-prefill \
 
 The client reports median TTFT and throughput over the full HTTP workload,
 including server queueing. These differ from the in-process TTFT probe above.
+
+For the hd128 admission-policy comparison, use the
+[HTTP reproduction package](https://gist.github.com/suntp/31fb918815b34ecf48313ea2087bed1e).
+It provides a parameterized client and worker observer, the exact old-policy
+switch, original serving records and a script that verifies the published
+results. Both services keep the lane enabled and use the same model and
+capacity, with exact 8K prefix hits and returned-token validation. Download the
+package and follow its README; the in-process probe above does not replace
+this HTTP comparison.
 
 For teacher-forced perplexity, use a fixed corpus and score the same windows in
 both paths. This isolates the prefill implementation:

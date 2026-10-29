@@ -118,6 +118,82 @@ def test_punica_handles_fragmented_routing() -> None:
     )
 
 
+def test_punica_decode_batch_does_not_gather_weights_per_row(monkeypatch) -> None:
+    """Decode rows sharing an adapter run one matmul pair, not a weight copy
+    per row: per-row gathers cost rows x (in + out) x rank on every wrapped
+    layer and made LoRA decode at 48 requests 83% slower than the base model.
+    """
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=4, max_batches=4, max_loras=2
+    )
+    wrapper.update_metadata(
+        LoRAMapping(
+            index_mapping=(11, 11, 22, 11),
+            prompt_mapping=(11, 11, 22, 11),
+            is_prefill=False,
+        ),
+        lora_index_to_id=[11, 22],
+    )
+    a_stacked = mx.array(np.array([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=np.float32))
+    b_stacked = mx.array(np.array([[[1.0]], [[10.0]]], dtype=np.float32))
+    gathered_rows: list[int] = []
+    real_take = mx.take
+
+    def spy_take(a, indices, axis=None):
+        if axis == 0 and a.ndim == 3:
+            gathered_rows.append(int(indices.shape[0]))
+        return real_take(a, indices, axis=axis)
+
+    monkeypatch.setattr(punica_mod.mx, "take", spy_take)
+
+    out = wrapper.add_lora_linear(
+        mx.zeros((4, 1)), mx.ones((4, 2)), a_stacked, b_stacked, scale=1.0
+    )
+
+    np.testing.assert_array_equal(np.array(out).flatten(), [1, 1, 10, 1])
+    assert gathered_rows == []
+
+
+def test_punica_mixed_decode_prefill_does_not_gather_weights_per_row(
+    monkeypatch,
+) -> None:
+    """A decode row next to a prefill chunk must not copy LoRA weights per row.
+
+    Per-row gathers cost rows x out x rank: for a 248k-vocab ``lm_head`` at rank
+    64 a few 2k-token image prompts beside one decode asked Metal for a 180 GB
+    buffer and killed the engine.
+    """
+    wrapper = punica_mod.PunicaWrapperMLX(
+        max_num_batched_tokens=5, max_batches=2, max_loras=2
+    )
+    wrapper.update_metadata(
+        LoRAMapping(
+            index_mapping=(11, 22, 22, 22, 22),
+            prompt_mapping=(11, 22),
+            is_prefill=False,
+        ),
+        lora_index_to_id=[11, 22],
+    )
+    a_stacked = mx.array(np.array([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=np.float32))
+    b_stacked = mx.array(np.array([[[1.0]], [[10.0]]], dtype=np.float32))
+    gathered_rows: list[int] = []
+    real_take = mx.take
+
+    def spy_take(a, indices, axis=None):
+        if axis == 0 and a.ndim == 3:
+            gathered_rows.append(int(indices.shape[0]))
+        return real_take(a, indices, axis=axis)
+
+    monkeypatch.setattr(punica_mod.mx, "take", spy_take)
+
+    out = wrapper.add_lora_linear(
+        mx.zeros((5, 1)), mx.ones((5, 2)), a_stacked, b_stacked, scale=1.0
+    )
+
+    np.testing.assert_array_equal(np.array(out).flatten(), [1, 10, 10, 10, 10])
+    assert gathered_rows == []
+
+
 def test_punica_output_dtype_matches_base_for_all_routing_paths() -> None:
     routing_cases = (
         ((11, 22, 11, 22), False, np.float32),
@@ -339,7 +415,10 @@ def test_peft_loader_materializes_weights_before_return(tmp_path: Path) -> None:
     [
         ({"r": 1024}, "is greater than max_lora_rank"),
         ({"use_dora": True}, "does not yet support DoRA"),
-        ({"modules_to_save": ["lm_head"]}, "modules_to_save being None"),
+        (
+            {"modules_to_save": ["lm_head"]},
+            r"Unsupported modules_to_save: \['lm_head'\]",
+        ),
     ],
 )
 def test_peft_loader_rejects_unsupported_configs(
@@ -1307,7 +1386,14 @@ def _make_worker_manager() -> worker_manager_mod.MetalWorkerLoRAManager:
 def _patch_loader(monkeypatch, adapters: dict[int, peft_loader_mod.LoadedLoRA]) -> None:
     monkeypatch.setattr("vllm.lora.utils.get_adapter_absolute_path", lambda p: p)
 
-    def _fake_load(path, *, lora_id, max_position_embeddings, lora_config):
+    def _fake_load(
+        path,
+        *,
+        lora_id,
+        max_position_embeddings,
+        lora_config,
+        weights_mapper,
+    ):
         return adapters[lora_id]
 
     monkeypatch.setattr(worker_manager_mod, "load_peft_adapter", _fake_load)
@@ -1556,3 +1642,274 @@ def test_worker_manager_load_inplace_replaces_pinned_adapter(monkeypatch) -> Non
     state[7] = v2
     assert manager.add_adapter(_stub_lora_request(7, load_inplace=True)) is True
     np.testing.assert_array_equal(_active_fc1_lora_b(manager, 7), [5.0, 0.0])
+
+
+# Tower/connector LoRA (--enable-tower-connector-lora)
+
+
+def test_peft_loader_maps_hf_vlm_names_to_wrapped_modules(tmp_path: Path) -> None:
+    """A standard HF Qwen3-VL/Qwen3.5 adapter names both towers by their HF
+    prefixes; the adapter's mapper must land them on the wrapped MLX names."""
+    from safetensors.torch import save_file
+
+    from vllm_metal.multimodal.qwen3_vl.adapter import Qwen3VLMultimodalAdapter
+
+    config = {"peft_type": "LORA", "r": 1, "lora_alpha": 1, "target_modules": []}
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+    tensors = {}
+    for module in (
+        "model.visual.blocks.0.attn.qkv",
+        "model.language_model.layers.0.mlp.up_proj",
+    ):
+        tensors[f"base_model.model.{module}.lora_A.weight"] = torch.zeros(1, 2)
+        tensors[f"base_model.model.{module}.lora_B.weight"] = torch.zeros(2, 1)
+    save_file(tensors, str(tmp_path / "adapter_model.safetensors"))
+
+    loaded = peft_loader_mod.load_peft_adapter(
+        tmp_path,
+        lora_id=1,
+        weights_mapper=Qwen3VLMultimodalAdapter.lora_weights_mapper,
+    )
+
+    assert set(loaded.weights) == {
+        "visual.blocks.0.attn.qkv",
+        "model.layers.0.mlp.up_proj",
+    }
+
+
+_TINY_QWEN3_5_TEXT_CONFIG = {
+    "model_type": "qwen3_5",
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 8,
+    "vocab_size": 64,
+    "linear_num_value_heads": 2,
+    "linear_num_key_heads": 1,
+    "linear_key_head_dim": 8,
+    "linear_value_head_dim": 8,
+    "linear_conv_kernel_dim": 4,
+    "full_attention_interval": 4,
+    "tie_word_embeddings": True,
+}
+
+
+@pytest.mark.parametrize("wrap_text_submodel", [False, True])
+def test_hf_vlm_adapter_loads_on_text_backbone(
+    tmp_path: Path, wrap_text_submodel: bool
+) -> None:
+    """A standard HF Qwen3.5/Gemma 4 adapter names text modules
+    ``model.language_model.*``. On the mlx_lm text backbone there is no
+    multimodal adapter to supply a mapper, so the manager must land those
+    names on the wrapper (``language_model.model.*``) or on the text sub-model
+    (``model.*``) by itself."""
+    from mlx_lm.models import qwen3_5
+    from safetensors.torch import save_file
+
+    config = {
+        "peft_type": "LORA",
+        "r": 2,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+    key = "base_model.model.model.language_model.layers.3.self_attn.q_proj"
+    save_file(
+        {
+            f"{key}.lora_A.weight": torch.ones(2, 16),
+            f"{key}.lora_B.weight": torch.ones(32, 2),  # q_proj emits q and gate
+        },
+        str(tmp_path / "adapter_model.safetensors"),
+    )
+    model = qwen3_5.Model(
+        qwen3_5.ModelArgs(model_type="qwen3_5", text_config=_TINY_QWEN3_5_TEXT_CONFIG)
+    )
+    manager = worker_manager_mod.MetalWorkerLoRAManager(
+        model=model.language_model if wrap_text_submodel else model,
+        lora_config=_lora_config_stub(
+            max_loras=1, max_lora_rank=2, target_modules=["q_proj"]
+        ),
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+    )
+
+    request = SimpleNamespace(
+        lora_int_id=1, lora_path=str(tmp_path), load_inplace=False
+    )
+    assert manager.add_adapter(request) is True
+    assert manager.list_adapters() == {1}
+
+
+def _make_encoder_manager() -> tuple[
+    model_manager_mod.MLXLoRAModelManager, _TwoLinearModel, _TwoLinearModel
+]:
+    language_model, encoder = _TwoLinearModel(), _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=language_model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1),
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+        encoder=model_manager_mod.EncoderLoRATarget(module=encoder, prefix="visual."),
+    )
+    adapter = peft_loader_mod.LoadedLoRA(
+        lora_id=1,
+        rank=1,
+        weights={
+            "visual.fc1": peft_loader_mod.LoRALayerWeightsMLX(
+                module_name="visual.fc1",
+                rank=1,
+                lora_a=mx.array([[1.0, 0.0]]),
+                lora_b=mx.array([[3.0], [0.0]]),
+                scaling=1.0,
+            )
+        },
+    )
+    manager.add_adapter(adapter)
+    manager.activate_adapter(1)
+    return manager, language_model, encoder
+
+
+def test_manager_encoder_adapter_applies_to_every_encoder_row() -> None:
+    """Encoder rows carry no per-token routing: the selected adapter applies to
+    all of them, and only while it is selected."""
+    manager, language_model, encoder = _make_encoder_manager()
+    assert set(manager.modules) == {"fc1", "fc2", "visual.fc1", "visual.fc2"}
+    x = mx.array([[1.0, 0.0]] * 3)
+
+    np.testing.assert_allclose(np.array(encoder.fc1(x)), np.zeros((3, 2)))
+    manager.set_encoder_adapter(1)
+    np.testing.assert_allclose(np.array(encoder.fc1(x)), [[3.0, 0.0]] * 3)
+    np.testing.assert_allclose(np.array(language_model.fc1(x)), np.zeros((3, 2)))
+    manager.set_encoder_adapter(None)
+    np.testing.assert_allclose(np.array(encoder.fc1(x)), np.zeros((3, 2)))
+
+
+def test_adapter_churn_does_not_accumulate_buffers_in_idle_encoder() -> None:
+    """Slot writes must not pile up on a module that does not run between
+    them. Text-only steps never run the encoder, yet every activation rewrites
+    its slot; left lazy, each write keeps the previous chain and its buffers
+    alive, until Metal's live-buffer limit fails an allocation."""
+    import gc
+
+    language_model, encoder = _TwoLinearModel(), _TwoLinearModel()
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=language_model,
+        lora_config=_lora_config_stub(max_loras=1, max_lora_rank=1, max_cpu_loras=2),
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+        encoder=model_manager_mod.EncoderLoRATarget(module=encoder, prefix="visual."),
+    )
+    for lora_id in (1, 2):
+        manager.add_adapter(
+            _make_adapter(
+                lora_id, fc1_a=np.array([[1.0, 0.0]]), fc1_b=np.array([[1.0], [0.0]])
+            )
+        )
+    x = mx.array([[1.0, 0.0]])
+
+    def churn(cycles: int) -> None:
+        for _ in range(cycles):
+            for lora_id in (1, 2):
+                manager.activate_adapter(lora_id)
+                manager.set_adapter_mapping(
+                    LoRAMapping(index_mapping=(lora_id,), prompt_mapping=(lora_id,))
+                )
+                mx.eval(language_model(x))  # text-only step: encoder idle
+
+    def live_bytes() -> int:
+        mx.synchronize()
+        gc.collect()
+        mx.clear_cache()
+        return mx.get_active_memory()
+
+    churn(5)
+    before = live_bytes()
+    churn(100)
+
+    assert live_bytes() == before
+
+
+def test_manager_deactivation_clears_encoder_routing() -> None:
+    """An evicted slot must not keep feeding the encoder stale weights."""
+    manager, _, encoder = _make_encoder_manager()
+    manager.set_encoder_adapter(1)
+    manager.deactivate_adapter(1)
+
+    out = encoder.fc1(mx.array([[1.0, 0.0]]))
+
+    np.testing.assert_allclose(np.array(out), [[0.0, 0.0]])
+
+
+def test_manager_rejects_encoder_routing_for_inactive_adapter() -> None:
+    manager, _, _ = _make_encoder_manager()
+    manager.deactivate_adapter(1)
+
+    with pytest.raises(ValueError, match="not active"):
+        manager.set_encoder_adapter(1)
+
+
+@pytest.mark.parametrize(
+    "enabled,is_multimodal,adapter_kind,expect_target",
+    [
+        (True, True, "supported", True),
+        (False, True, "supported", False),  # off by default, as upstream
+        (True, True, "unsupported", False),  # warns and ignores, as upstream
+        (True, True, None, False),  # language-model-only load: disabled
+        (True, False, None, False),  # text model: flag is irrelevant
+    ],
+)
+def test_runner_gates_tower_connector_lora_like_upstream(
+    enabled: bool, is_multimodal: bool, adapter_kind: str | None, expect_target: bool
+) -> None:
+    target = model_manager_mod.EncoderLoRATarget(module=_TwoLinearModel(), prefix="v.")
+    adapter = {
+        "supported": SimpleNamespace(lora_encoder_target=lambda: target),
+        "unsupported": SimpleNamespace(),
+        None: None,
+    }[adapter_kind]
+    runner = make_stub_runner(
+        _multimodal_adapter=adapter,
+        model_config=SimpleNamespace(model="m", is_multimodal_model=is_multimodal),
+    )
+    lora_config = SimpleNamespace(enable_tower_connector_lora=enabled)
+
+    resolved = runner._lora_encoder_target(lora_config)
+
+    assert resolved is (target if expect_target else None)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_runner_text_only_vlm_tower_connector_flag_has_no_effect(
+    enabled: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A VLM that Metal forces text-only has its ``multimodal_config`` cleared:
+    no multimodal adapter and ``is_multimodal_model`` false. The flag must warn
+    that it does nothing, and LoRA must wrap only the language model."""
+    runner = make_stub_runner(
+        _multimodal_adapter=None,
+        model_config=SimpleNamespace(model="vlm", is_multimodal_model=False),
+    )
+    lora_config = _lora_config_stub(max_loras=1, max_lora_rank=1)
+    lora_config.enable_tower_connector_lora = enabled
+
+    with caplog.at_level("WARNING", logger=model_runner_mod.__name__):
+        encoder = runner._lora_encoder_target(lora_config)
+
+    assert encoder is None
+    warned = "`enable_tower_connector_lora` has no effect" in caplog.text
+    assert warned is enabled
+
+    manager = model_manager_mod.MLXLoRAModelManager(
+        model=_TwoLinearModel(),
+        lora_config=lora_config,
+        max_num_seqs=1,
+        max_num_batched_tokens=4,
+        dtype=mx.float32,
+        encoder=encoder,
+    )
+    assert set(manager.modules) == {"fc1", "fc2"}

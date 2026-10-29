@@ -44,8 +44,7 @@ def _setup(seed: int, *, n: int, seq_len: int, hd: int, cache_hd: int):
 
 def _kernel(query, key_cache, value_cache, table, *, kv_len, q_len, window):
     hd = int(query.shape[-1])
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -58,7 +57,6 @@ def _kernel(query, key_cache, value_cache, table, *, kv_len, q_len, window):
         BLOCK,
         kv_len,
         window if window is not None else -1,
-        out,
     )
     mx.eval(out)
     return out

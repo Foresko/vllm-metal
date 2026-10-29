@@ -9,7 +9,7 @@ from typing import Any
 
 import mlx.core as mx
 import torch
-from vllm.config import AttentionConfig, CacheConfig
+from vllm.config import AttentionConfig, CacheConfig, DeviceConfig
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 
 import vllm_metal.v1.model_runner as mr
@@ -42,6 +42,7 @@ def initialize_hybrid_runtime(
     num_kv_heads=1,
     head_dim=4,
     mamba_cache_mode="none",
+    mla=False,
 ):
     """Build the test runtime from vLLM's real grouping and placement functions."""
     from dataclasses import replace
@@ -50,12 +51,13 @@ def initialize_hybrid_runtime(
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 
-    from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
+    from vllm_metal.tensor_bridge import MLX_TO_TORCH_DTYPE
 
     plan = runtime._hybrid_plan
-    attention = FullAttentionSpec(
+    attention_cls = MLAAttentionSpec if mla else FullAttentionSpec
+    attention = attention_cls(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
@@ -79,7 +81,51 @@ def initialize_hybrid_runtime(
             for i in plan.layers.state_indices
         }
     )
-    config = SimpleNamespace(
+    config = _grouping_config(block_size, num_blocks)
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, num_blocks * page * len(specs)
+    )
+    cache.kv_cache_layout = "LBNHC"
+    runtime.initialize_from_config(cache)
+    return cache
+
+
+def initialize_mla_runtime(
+    num_blocks, *, num_layers, kv_lora_rank=512, rope_dim=64, block_size=16
+):
+    """Build a standalone MLA runtime through the cache policy, from vLLM's real
+    grouping and placement of the policy's specs."""
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    runner = make_stub_runner(
+        model_args={"kv_lora_rank": kv_lora_rank, "qk_rope_head_dim": rope_dim},
+        num_layers=num_layers,
+        num_kv_cache_layers=num_layers,
+        num_kv_heads=1,
+        head_dim=kv_lora_rank + rope_dim,
+        kv_cache_dtype=mx.float16,
+        cache_config=make_cache_config(block_size=block_size),
+        model=SimpleNamespace(layers=[]),
+    )
+    specs = runner.get_kv_cache_spec()
+    page = next(iter(specs.values())).page_size_bytes
+    config = _grouping_config(block_size, num_blocks)
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, num_blocks * page * len(specs)
+    )
+    cache.kv_cache_layout = "LBNHC"
+    runner.initialize_kv_cache(cache)
+    return runner.paged_attention_runtime
+
+
+def _grouping_config(block_size: int, num_blocks: int) -> SimpleNamespace:
+    """The engine config fields vLLM's KV grouping and placement read."""
+    return SimpleNamespace(
         speculative_config=None,
         attention_config=AttentionConfig(),
         cache_config=make_cache_config(
@@ -88,13 +134,6 @@ def initialize_hybrid_runtime(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         model_config=SimpleNamespace(is_deepseek_v4=False),
     )
-    groups = get_kv_cache_groups(config, specs)
-    cache = get_kv_cache_config_from_groups(
-        config, groups, num_blocks * page * len(specs)
-    )
-    cache.kv_cache_layout = "LBNHC"
-    runtime.initialize_from_config(cache)
-    return cache
 
 
 def make_cache_config(**kwargs: Any) -> CacheConfig:
@@ -146,8 +185,10 @@ def make_stub_runner(
         "tokenizer": None,
         "_is_vlm": False,
         "_multimodal_adapter": None,
+        "_supports_mm_inputs": True,
         "_gemma4_mtp_assistant": None,
         "_drafter": None,
+        "_aux_capture": None,
         "_draft_dims": None,
         "encoder_cache": None,
         "_paged_attention_runtime": None,
@@ -158,11 +199,14 @@ def make_stub_runner(
         "_paged_state_group_indices": (),
         "_state_block_ids_by_req": {},
         "_request_states": {},
+        "_awaiting_readmission": set(),
         "_mm_bidi_states": {},
         "_paged_request_seq_lens": {},
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
         "_execute_model_state": None,
+        "_sample_failure": None,
+        "_diffusion": None,
         "_selective_logits_supported": False,
         "pp": None,
         "_pp_model": None,
@@ -270,13 +314,16 @@ def make_gemma4_mixed_attention_runner(
     )
     vllm_config = SimpleNamespace(
         speculative_config=None,
+        num_prefill_lookahead_tokens=0,
         attention_config=AttentionConfig(),
+        device_config=DeviceConfig(device="cpu"),
         max_in_flight_tokens=max_in_flight_tokens,
         model_config=SimpleNamespace(
             max_model_len=max_model_len,
             original_max_model_len=original_max_model_len,
         ),
         parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
@@ -344,6 +391,29 @@ _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
     2,
     (torch.float16, torch.float32),
 ).family
+
+
+def make_bailing_hybrid_plan(
+    num_layers: int,
+    *,
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.float32),
+    **overrides: Any,
+) -> HybridRuntimePlan:
+    """Build a small Bailing V3 plan through the production family owner."""
+    return build_hybrid_runtime_plan(
+        {
+            "model_type": "bailing_hybrid",
+            "layer_group_size": 2,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "short_conv_kernel_size": 3,
+            "no_kda_lora": True,
+            "kda_safe_gate": True,
+            **overrides,
+        },
+        num_layers,
+        state_dtypes,
+    )
 
 
 def make_gdn_hybrid_plan(

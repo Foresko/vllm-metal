@@ -8,7 +8,7 @@ from .layers import (
     can_wrap,
     can_wrap_qlora,
 )
-from .model_manager import MLXLoRAModelManager
+from .model_manager import EncoderLoRATarget, MLXLoRAModelManager
 from .peft_loader import LoadedLoRA, LoRALayerWeightsMLX, load_peft_adapter
 from .punica_wrapper import PunicaWrapperMLX
 from .runtime import MetalLoRARuntime
@@ -21,6 +21,7 @@ __all__ = [
     "MLXQuantizedLinearWithLoRA",
     "can_wrap",
     "can_wrap_qlora",
+    "EncoderLoRATarget",
     "MLXLoRAModelManager",
     "MetalLoRARuntime",
     "MetalWorkerLoRAManager",

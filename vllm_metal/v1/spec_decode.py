@@ -26,6 +26,7 @@ class _PagedDecodeStateLike(Protocol):
 
 class _SpecDecodeRequestStateLike(Protocol):
     sampling_params: Any
+    generated_tokens: int
 
 
 class _SpecDecodePrefillLike(Protocol):
@@ -119,6 +120,7 @@ class SpeculativeDecodeController:
         is_hybrid: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
+        hybrid_family: str | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs."""
         # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
@@ -141,11 +143,31 @@ class SpeculativeDecodeController:
         }
         has_invalid_spec_tokens = any(count > 0 for count in invalid_counts.values())
 
+        # Hybrid GDN targets verify n-gram drafts through packed decode spans:
+        # full-attention layers take the extra query rows, the GDN layers run
+        # their state scan over the span, and the acceptance fixup in gdn_spec
+        # rolls partial accepts back to the accepted depth. The staging and
+        # fixup live in the GDN state wrapper only — other hybrid state
+        # families (mamba2, KDA, shortconv) have no rollback, so a partial
+        # accept would silently corrupt their recurrent state — and the other
+        # speculators are not validated on hybrid targets yet.
         if (active_spec_tokens or has_invalid_spec_tokens) and is_hybrid:
-            raise NotImplementedError(
-                "Speculative decode verification is not supported for hybrid "
-                "models on Metal yet."
+            if hybrid_family is not None and hybrid_family != "gdn":
+                raise NotImplementedError(
+                    "Speculative decode verification for hybrid models on "
+                    f"Metal is implemented for the GDN state family only; "
+                    f"this target's state family is {hybrid_family!r}."
+                )
+            method = (
+                speculative_config.method if speculative_config is not None else None
             )
+            if method != "ngram":
+                raise NotImplementedError(
+                    "Speculative decode verification for hybrid models on "
+                    "Metal supports the ngram method only (draft-model, MTP, "
+                    "and block drafts are not validated on hybrid GDN "
+                    "targets yet)."
+                )
 
         decode_req_ids = {req_id for req_id, _ in decode_reqs}
         unexpected_req_ids = sorted(set(spec_tokens) - decode_req_ids)
@@ -345,6 +367,10 @@ class SpeculativeDecodeController:
         request_state: _SpecDecodeRequestStateLike,
     ) -> bool:
         """Whether a request may be drafted under greedy-only spec decode."""
+        # Sampling updates the output count before the scheduler retires a request.
+        max_tokens = request_state.sampling_params.max_tokens
+        if max_tokens is not None and request_state.generated_tokens >= max_tokens:
+            return False
         try:
             self._validate_greedy_sampling([(req_id, request_state)])
         except NotImplementedError:
@@ -361,16 +387,16 @@ class SpeculativeDecodeController:
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
-        Shared eligibility filter used by the draft-model and n-gram proposers
-        that draft greedily: skip decode rows that did not sample this step,
-        skip non-greedy requests via :meth:`can_draft_greedy`, skip
+        Shared eligibility filter for block-draft, draft-model and n-gram
+        proposers: skip decode rows that did not sample this step, skip
+        exhausted or non-greedy requests via :meth:`can_draft_greedy`, skip
         intermediate prefill chunks, and de-duplicate prefill rows whose
         ``req_id`` was already admitted through decode.
 
         Callers post-process the returned pairs (e.g. the draft-model
         proposer maps each to its per-step ingest plan and drops rows with
         no newly-committed tokens), but the eligibility decisions live here
-        so the two proposers cannot drift out of sync.
+        so the proposers cannot drift out of sync.
         """
         eligible: list[tuple[str, RequestState]] = []
         seen: set[str] = set()

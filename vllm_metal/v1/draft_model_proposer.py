@@ -74,6 +74,7 @@ from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
 from vllm_metal.v1.proposer import (
     _DECODE_INGEST_MAX_TOKENS,
+    NoOwnKVProposer,
     validate_scheduler_blocks,
 )
 
@@ -84,11 +85,20 @@ if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
     from vllm_metal.v1.model_adapter import ModelAdapter
-    from vllm_metal.v1.model_runner import PrefillRequest, RequestState
+    from vllm_metal.v1.model_runner import (
+        MetalModelRunner,
+        PrefillRequest,
+        RequestState,
+    )
     from vllm_metal.v1.proposer import ProposeContext
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 logger = init_logger(__name__)
+
+# The ingest's head-bound reason, built once: it is read on every propose.
+_INGEST_HEAD_MISMATCH = (
+    f"the draft head size exceeds the window mode's {PA_WINDOW_MAX_HEAD_SIZE}"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +131,7 @@ class _DraftPlan:
 _SELECTIVE_LOGITS_MIN_ROWS = 16
 
 
-class DraftModelProposer:
+class DraftModelProposer(NoOwnKVProposer):
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by a separate model."""
 
     def __init__(
@@ -164,17 +174,7 @@ class DraftModelProposer:
         # versa).
         self._merge_ingest_windows = merge_ingest_windows
         # Resolve once during drafter construction so invalid values fail before serving.
-        try:
-            self._ingest_chunk = envs.VLLM_METAL_SPEC_INGEST_CHUNK
-        except ValueError as exc:
-            raise ValueError(
-                f"VLLM_METAL_SPEC_INGEST_CHUNK must be an integer: {exc}"
-            ) from exc
-        if self._ingest_chunk < 0:
-            raise ValueError(
-                "VLLM_METAL_SPEC_INGEST_CHUNK must be a positive chunk size, or 0 "
-                f"for single-forward ingest; got {self._ingest_chunk}"
-            )
+        self._ingest_chunk = envs.VLLM_METAL_SPEC_INGEST_CHUNK
         # Stateless RoPE/mask shims for the draft forward (one per layer). The
         # real per-request offsets come from the paged context, so these carry
         # no state — allocate once and reuse across steps, not per propose().
@@ -200,6 +200,8 @@ class DraftModelProposer:
         # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
         # later via adopt_scheduler_group().
         self._scheduler_group_index: int | None = None
+        self._dims: DraftDims | None = None
+        self._draft_model_name: str | None = None
 
     # -- construction --------------------------------------------------------
 
@@ -211,39 +213,17 @@ class DraftModelProposer:
         parallel_config: ParallelConfig,
         controller: SpeculativeDecodeController,
         model_adapter: ModelAdapter,
-        num_blocks: int,
         max_model_len: int,
         max_num_seqs: int,
         block_size: int,
-        dtype: mx.Dtype,
         allow_deferred_zero_k_ingest: bool,
     ) -> DraftModelProposer:
+        """Load draft weights without binding the paged cache."""
         model, dims = _load_draft_model(speculative_config, parallel_config)
         # The capability probe uses a cacheless forward and must run before
         # patch_model() installs attention wrappers that require a paged
         # context. Unsupported model heads retain the full-logits fallback.
         selective_logits_supported = model_adapter.supports_selective_logits(model)
-        backend = SDPAPagedAttentionRuntime(
-            num_layers=dims.num_layers,
-            num_kv_heads=dims.num_kv_heads,
-            head_dim=dims.head_dim,
-            block_size=block_size,
-            dtype=dtype,
-        )
-        backend.initialize(num_blocks)
-        n_patched = backend.patch_model(model)
-        logger.info(
-            "Draft model loaded for speculative decoding: %s "
-            "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
-            "num_blocks=%d, selective_logits=%s)",
-            speculative_config.draft_model_config.model,
-            dims.num_layers,
-            dims.num_kv_heads,
-            dims.head_dim,
-            n_patched,
-            num_blocks,
-            selective_logits_supported,
-        )
         min_speculative_tokens = speculative_config.num_speculative_tokens
         schedule = speculative_config.num_speculative_tokens_per_batch_size
         if schedule:
@@ -251,7 +231,7 @@ class DraftModelProposer:
                 schedule, max_num_seqs, speculative_config.num_speculative_tokens
             )
             min_speculative_tokens = min((k for k in widths[1:] if k > 0), default=0)
-        return cls(
+        proposer = cls(
             model=model,
             block_size=block_size,
             max_model_len=max_model_len,
@@ -270,6 +250,77 @@ class DraftModelProposer:
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
             allow_deferred_zero_k_ingest=allow_deferred_zero_k_ingest,
         )
+        proposer._dims = dims
+        proposer._draft_model_name = speculative_config.draft_model_config.model
+        logger.info(
+            "Draft model weights loaded for speculative decoding: %s "
+            "(layers=%d, kv_heads=%d, head_dim=%d, selective_logits=%s)",
+            proposer._draft_model_name,
+            dims.num_layers,
+            dims.num_kv_heads,
+            dims.head_dim,
+            selective_logits_supported,
+        )
+        mismatch = proposer._ingest_window_mismatch()
+        if mismatch is None:
+            logger.info(
+                "Metal: draft-model committed-token ingest uses the window layout"
+            )
+        else:
+            logger.info(
+                "Metal: draft-model committed-token ingest uses the expanded "
+                "per-token layout (%s)",
+                mismatch,
+            )
+        return proposer
+
+    def bind_paged_cache(
+        self,
+        *,
+        num_blocks: int,
+        block_size: int,
+        dtype: mx.Dtype,
+    ) -> None:
+        """Allocate the draft KV pool and patch attention. Weights stay put."""
+        dims = self._dims
+        if dims is None:
+            raise RuntimeError(
+                "DraftModelProposer.bind_paged_cache() requires build() first"
+            )
+        self._block_size = block_size
+        backend = SDPAPagedAttentionRuntime(
+            num_layers=dims.num_layers,
+            num_kv_heads=dims.num_kv_heads,
+            head_dim=dims.head_dim,
+            block_size=block_size,
+            dtype=dtype,
+        )
+        backend.initialize(num_blocks)
+        n_patched = backend.patch_model(self._model)
+        logger.info(
+            "Draft model paged cache bound: %s "
+            "(layers=%d, kv_heads=%d, head_dim=%d, patched=%d, "
+            "num_blocks=%d, selective_logits=%s)",
+            self._draft_model_name,
+            dims.num_layers,
+            dims.num_kv_heads,
+            dims.head_dim,
+            n_patched,
+            num_blocks,
+            self._selective_logits_supported,
+        )
+
+    def _ingest_window_mismatch(self) -> str | None:
+        """Why committed-token ingest stays expanded, or ``None`` when it merges.
+
+        The same switch as the target's verify windows, read per call; the
+        structural half is the head bound resolved in ``build``.
+        """
+        if not envs.VLLM_METAL_SPEC_VERIFY_WINDOW:
+            return "VLLM_METAL_SPEC_VERIFY_WINDOW is off"
+        if not self._merge_ingest_windows:
+            return _INGEST_HEAD_MISMATCH
+        return None
 
     def adopt_scheduler_group(
         self, group_index: int, target_max_model_len: int
@@ -277,9 +328,8 @@ class DraftModelProposer:
         """Adopt the scheduler cache group and final target context limit.
 
         Called from ``ModelCachePolicy._adopt_draft_scheduler_group`` once
-        ``kv_cache_config`` exists -- after this proposer is built, since the
-        physical backend above is sized before the scheduler has decided
-        groups.
+        ``kv_cache_config`` exists -- after ``bind_paged_cache``, since the
+        physical backend is sized before the scheduler has decided groups.
         """
         self._scheduler_group_index = group_index
         # The engine may auto-fit the target limit after memory profiling.
@@ -306,6 +356,40 @@ class DraftModelProposer:
         # A standalone draft model consumes only token ids; it never reads the
         # target's hidden states (mirrors upstream pass_hidden_states_to_model=False).
         return False
+
+    def profile_warmup(self, runner: MetalModelRunner, tokens: mx.array) -> None:
+        """Include a cacheless draft forward in the measured peak.
+
+        Must run before ``bind_paged_cache``: patched attention wrappers
+        require a paged context that does not exist at profile time.
+        """
+        warmup = tokens
+        if tokens.shape[1] > self._max_model_len:
+            warmup = tokens[:, : self._max_model_len]
+        num_tokens = int(warmup.shape[1])
+        indices = None
+        if (
+            self._selective_logits_supported
+            and num_tokens >= _SELECTIVE_LOGITS_MIN_ROWS
+        ):
+            num_logits = min(num_tokens, runner.scheduler_config.max_num_seqs)
+            if num_logits < num_tokens:
+                indices = mx.arange(
+                    num_tokens - num_logits,
+                    num_tokens,
+                    dtype=mx.int32,
+                )
+        if indices is not None:
+            assert self._model_adapter is not None
+            logits = self._model_adapter.target_forward(
+                self._model,
+                warmup,
+                cache=None,
+                logits_indices=indices,
+            ).logits
+        else:
+            logits = self._extract_logits(self._model(warmup, cache=None))
+        mx.eval(logits)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
@@ -694,8 +778,7 @@ class DraftModelProposer:
                 decode_specs,
                 [],
                 self._block_size,
-                merge_verify_windows=self._merge_ingest_windows
-                and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
+                merge_verify_windows=self._ingest_window_mismatch() is None,
             )
             try:
                 last = self._project_ingest_rows(
@@ -810,7 +893,7 @@ def resolve_draft_dims(
     Config-only and weight-free, so this can run early in the runner
     lifecycle (before ``determine_available_memory()``/``get_kv_cache_spec()``)
     to size a scheduler-visible KV-cache group for the draft model, well
-    before its MLX weights are actually loaded in ``_load_draft_model``.
+    before its MLX weights are actually loaded in ``DraftModelProposer.build``.
 
     Delegates to ``ModelConfig``'s own accessors rather than re-deriving GQA
     head-count and head-size fallbacks from raw ``hf_config`` fields --

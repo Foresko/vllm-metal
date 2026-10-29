@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import get_uniform_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import (
+    make_bailing_hybrid_plan,
     make_gdn_hybrid_plan,
     make_nemotron_hybrid_plan,
     make_stub_runner,
@@ -65,6 +66,16 @@ def test_mla_spec_matches_single_latent_cache() -> None:
     # _kv_factor() == 1 for MLA
     metal_per_block = 1 * BLOCK_SIZE * DTYPE.itemsize * layers * 1 * latent
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
+
+
+def test_mla_reports_layout_budget_unless_drafting() -> None:
+    """MLA binds vLLM's shared allocation; only draft-model speculation keeps
+    the count-based pool."""
+    policy = _policy(num_layers=2, is_mla=True, head_dim=576, num_kv_heads=1)
+    assert policy.scheduler_memory_reporting_mode() == "paged_attention_layout_budget"
+
+    policy._runner._draft_dims = SimpleNamespace(num_layers=1)
+    assert policy.scheduler_memory_reporting_mode() == "paged_attention_capacity"
 
 
 def test_yoco_shared_layers_get_no_spec() -> None:
@@ -164,3 +175,31 @@ def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
     assert cdiv(prompt_tokens, attention_block_size) == 3
     assert spec.block_size == max_model_len
     assert cdiv(prompt_tokens, spec.block_size) == 1
+
+
+def test_bailing_hybrid_emits_mla_and_kda_specs() -> None:
+    runner = make_stub_runner(
+        model_args={"model_type": "bailing_hybrid", "kv_lora_rank": 512},
+        is_hybrid=True,
+        num_layers=2,
+        hybrid_runtime_plan=make_bailing_hybrid_plan(
+            2,
+            num_attention_heads=16,
+            head_dim=128,
+            short_conv_kernel_size=4,
+        ),
+        num_kv_heads=1,
+        head_dim=576,
+        kv_cache_dtype=mx.bfloat16,
+        cache_config=SimpleNamespace(
+            block_size=BLOCK_SIZE,
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
+    )
+
+    specs = runner._cache_policy.get_kv_cache_spec()
+
+    assert isinstance(specs["layers.0.linear_attn"], MambaSpec)
+    assert isinstance(specs["layers.1.self_attn"], MLAAttentionSpec)

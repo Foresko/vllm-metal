@@ -1,14 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Raw-block GGUF tensors executed by custom Metal kernels.
 
-Q6_K uses 16-element sub-groups, which MLX's affine representation
-(group_size 32/64/128) cannot express, so the weight keeps its raw GGUF block
-bytes in memory and computes through ``mx.fast.metal_kernel`` programs
-instead (#761). The contract mirrors
+Q2_K, Q3_K, and Q6_K use 16-element sub-groups, which MLX's affine
+representation (group_size 32/64/128) cannot express, so the weight keeps its
+raw GGUF block bytes in memory and computes through ``mx.fast.metal_kernel``
+programs instead (#761). The contract mirrors
 :class:`~vllm_metal.gguf.mlx_native.GGUFMLXQuantizedTensor`: ``qweight``
 holds the packed bytes, ``qweight_type`` the GGUF enum, and computation never
 materializes a persistent dense copy — the large-batch matmul path
 dequantizes transiently for one GEMM and frees the copy with the graph.
+
+A Q2_K superblock is 84 bytes for 256 weights: sixteen bytes packing a 4-bit
+sub-scale and 4-bit sub-min per group, 64 two-bit code bytes ``qs``, an fp16
+``d``, and an fp16 ``dmin``. Element ``e`` of group ``g = e/16`` decodes as
+``d*(sc[g]&0xF)*q - dmin*(sc[g]>>4)`` with
+``q = (qs[(e/128)*32 + e%32] >> (2*((e/32)%4))) & 3``.
+
+A Q3_K superblock is 110 bytes for 256 weights: 32 high-bit bytes ``hmask``,
+64 two-bit code bytes ``qs``, twelve bytes packing sixteen 6-bit sub-scales,
+and an fp16 ``d``. Element ``e`` of group ``g = e/16`` decodes as
+``d*sc[g]*(low2 - ((1-hbit)<<2))`` where ``low2`` shares Q2_K's ``qs``
+layout, ``hbit`` is bit ``e/32`` of ``hmask[e%32]``, and ``sc[g]`` is the
+6-bit sub-scale minus 32.
 
 A Q6_K superblock is 210 bytes for 256 weights: 128 low-nibble bytes ``ql``,
 64 high-2-bit bytes ``qh``, sixteen int8 sub-scales, and an fp16 ``d``.
@@ -25,17 +38,12 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
-
-try:
-    from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "GGUF support requires the optional 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
 # qtypes executed from raw GGUF block bytes by the kernels below (#761).
 _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {
+    GGMLQuantizationType.Q2_K: 2,
+    GGMLQuantizationType.Q3_K: 3,
     GGMLQuantizationType.Q6_K: 6,
 }
 RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
@@ -44,7 +52,38 @@ RAW_KERNEL_GGUF_TYPES = frozenset(_RAW_KERNEL_BITS)
 # dequantize + dense GEMM (measured; numbers in the PR).
 _QMV_MAX_BATCH = 8
 
-_DEQUANT_SOURCE = """
+_Q2K_DEQUANT_SOURCE = """
+    uint elem = thread_position_in_grid.x;
+    if (elem >= n[0]) return;
+    uint block = elem / 256;
+    uint e = elem % 256;
+    device const uint8_t* b = blocks + (size_t)block * 84;
+    uint sc = b[e / 16];
+    float d = float(as_type<half>(((device const uint16_t*)(b + 80))[0]));
+    float dmin = float(as_type<half>(((device const uint16_t*)(b + 82))[0]));
+    uint q = (b[16 + (e / 128) * 32 + (e % 32)] >> (2 * ((e / 32) % 4))) & 3;
+    out[elem] =
+        static_cast<T>(d * float(sc & 0x0F) * float(q) - dmin * float(sc >> 4));
+"""
+
+_Q3K_DEQUANT_SOURCE = """
+    uint elem = thread_position_in_grid.x;
+    if (elem >= n[0]) return;
+    uint block = elem / 256;
+    uint e = elem % 256;
+    device const uint8_t* b = blocks + (size_t)block * 110;
+    uint g = e / 16;
+    float d = float(as_type<half>(((device const uint16_t*)(b + 108))[0]));
+    uint low2 = (b[32 + (e / 128) * 32 + (e % 32)] >> (2 * ((e / 32) % 4))) & 3;
+    uint hbit = (b[e % 32] >> (e / 32)) & 1;
+    int q = int(low2) - int((1 - hbit) << 2);
+    uint lo = (g < 8) ? (b[96 + g] & 0x0F) : (b[96 + g - 8] >> 4);
+    uint hi = (b[104 + g % 4] >> (2 * (g / 4))) & 3;
+    int sc = int(lo | (hi << 4)) - 32;
+    out[elem] = static_cast<T>(d * float(sc) * float(q));
+"""
+
+_Q6K_DEQUANT_SOURCE = """
     uint elem = thread_position_in_grid.x;
     if (elem >= n[0]) return;
     uint block = elem / 256;
@@ -63,22 +102,111 @@ _DEQUANT_SOURCE = """
     out[elem] = static_cast<T>(d * float(sc[within / 16]) * float(q));
 """
 
-_QMV_SOURCE = """
-    // One 256-thread threadgroup per row; thread t strides the row's
-    // 16-element groups, decoding each once for all NB batch rows, then a
-    // two-stage reduction per batch row into y[batch, row].
+# Shared QMV skeleton: one 256-thread threadgroup per row. Thread t strides
+# the row's 16-element groups; a per-qtype body decodes each group once and
+# accumulates into acc[NB] for all NB batch rows, then a two-stage reduction
+# per batch row writes y[batch, row].
+_QMV_PROLOGUE = """
     uint row = threadgroup_position_in_grid.x;
     uint t = thread_position_in_threadgroup.x;
     uint blocks_per_row = dims[0];
     uint out_features = dims[1];
     uint total_groups = blocks_per_row * 16;
-    device const uint8_t* rowblocks = blocks + (size_t)row * blocks_per_row * 210;
     float acc[NB];
     for (uint batch = 0; batch < NB; ++batch) acc[batch] = 0.0f;
     for (uint g = t; g < total_groups; g += 256) {
         uint blk = g / 16;
         uint grp = g % 16;
-        device const uint8_t* b = rowblocks + blk * 210;
+"""
+
+_QMV_EPILOGUE = """
+    }
+    threadgroup float shared[8 * NB];
+    uint sg = t / 32;
+    for (uint batch = 0; batch < NB; ++batch) {
+        float ssum = simd_sum(acc[batch]);
+        if ((t & 31) == 0) shared[sg * NB + batch] = ssum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < NB) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; ++i) total += shared[i * NB + t];
+        y[(size_t)t * out_features + row] = total;
+    }
+"""
+
+_Q2K_QMV_SOURCE = (
+    _QMV_PROLOGUE
+    + """
+        device const uint8_t* b =
+            blocks + ((size_t)row * blocks_per_row + blk) * 84;
+        uint scm = b[grp];
+        float d = float(as_type<half>(((device const uint16_t*)(b + 80))[0]));
+        float dmin = float(as_type<half>(((device const uint16_t*)(b + 82))[0]));
+        float s = d * float(scm & 0x0F);
+        float m = dmin * float(scm >> 4);
+        uint shift = 2 * ((grp / 2) % 4);
+        device const uint8_t* qb = b + 16 + (grp / 8) * 32 + (grp % 2) * 16;
+        float w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) {
+            w[i] = float((qb[i] >> shift) & 3);
+        }
+        uint x_offset = blk * 256 + grp * 16;
+        for (uint batch = 0; batch < NB; ++batch) {
+            device const float* xg =
+                x + (size_t)batch * blocks_per_row * 256 + x_offset;
+            float part = 0.0f;
+            float xsum = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) {
+                part += xg[i] * w[i];
+                xsum += xg[i];
+            }
+            acc[batch] += s * part - m * xsum;
+        }
+"""
+    + _QMV_EPILOGUE
+)
+
+_Q3K_QMV_SOURCE = (
+    _QMV_PROLOGUE
+    + """
+        device const uint8_t* b =
+            blocks + ((size_t)row * blocks_per_row + blk) * 110;
+        float d = float(as_type<half>(((device const uint16_t*)(b + 108))[0]));
+        uint lo = (grp < 8) ? (b[96 + grp] & 0x0F) : (b[96 + grp - 8] >> 4);
+        uint hi = (b[104 + grp % 4] >> (2 * (grp / 4))) & 3;
+        float sc = d * float(int(lo | (hi << 4)) - 32);
+        uint shift = 2 * ((grp / 2) % 4);
+        uint hbit = grp / 2;
+        device const uint8_t* qb = b + 32 + (grp / 8) * 32 + (grp % 2) * 16;
+        device const uint8_t* hb = b + (grp % 2) * 16;
+        float w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) {
+            int low2 = int((qb[i] >> shift) & 3);
+            int hset = (hb[i] >> hbit) & 1;
+            w[i] = sc * float(low2 - ((1 - hset) << 2));
+        }
+        uint x_offset = blk * 256 + grp * 16;
+        for (uint batch = 0; batch < NB; ++batch) {
+            device const float* xg =
+                x + (size_t)batch * blocks_per_row * 256 + x_offset;
+            float part = 0.0f;
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) part += xg[i] * w[i];
+            acc[batch] += part;
+        }
+"""
+    + _QMV_EPILOGUE
+)
+
+_Q6K_QMV_SOURCE = (
+    _QMV_PROLOGUE
+    + """
+        device const uint8_t* b =
+            blocks + ((size_t)row * blocks_per_row + blk) * 210;
         uint half_idx = grp / 8;
         uint e0 = (grp % 8) * 16;
         device const uint8_t* ql = b + half_idx * 64;
@@ -105,37 +233,45 @@ _QMV_SOURCE = """
             for (uint i = 0; i < 16; ++i) part += xg[i] * w[i];
             acc[batch] += s * part;
         }
-    }
-    threadgroup float shared[8 * NB];
-    uint sg = t / 32;
-    for (uint batch = 0; batch < NB; ++batch) {
-        float ssum = simd_sum(acc[batch]);
-        if ((t & 31) == 0) shared[sg * NB + batch] = ssum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t < NB) {
-        float total = 0.0f;
-        for (uint i = 0; i < 8; ++i) total += shared[i * NB + t];
-        y[(size_t)t * out_features + row] = total;
-    }
 """
+    + _QMV_EPILOGUE
+)
 
 # mlx types metal_kernel's return as a plain object; the callable contract
 # lives in its docs, so the constants carry Any.
-_DEQUANT_KERNEL: Any = mx.fast.metal_kernel(
-    name="gguf_q6k_dequant",
-    input_names=["blocks", "n"],
-    output_names=["out"],
-    source=_DEQUANT_SOURCE,
-)
-_QMV_KERNEL: Any = mx.fast.metal_kernel(
-    name="gguf_q6k_qmv",
-    input_names=["blocks", "x", "dims"],
-    output_names=["y"],
-    source=_QMV_SOURCE,
-)
+_DEQUANT_SOURCES: dict[GGMLQuantizationType, str] = {
+    GGMLQuantizationType.Q2_K: _Q2K_DEQUANT_SOURCE,
+    GGMLQuantizationType.Q3_K: _Q3K_DEQUANT_SOURCE,
+    GGMLQuantizationType.Q6_K: _Q6K_DEQUANT_SOURCE,
+}
+_QMV_SOURCES: dict[GGMLQuantizationType, str] = {
+    GGMLQuantizationType.Q2_K: _Q2K_QMV_SOURCE,
+    GGMLQuantizationType.Q3_K: _Q3K_QMV_SOURCE,
+    GGMLQuantizationType.Q6_K: _Q6K_QMV_SOURCE,
+}
 
-# Must match the literal 256 stride and 8-simdgroup reduction in _QMV_SOURCE.
+# Kernel names stay unique per qtype so Metal caches them separately.
+_DEQUANT_KERNELS: dict[GGMLQuantizationType, Any] = {
+    qtype: mx.fast.metal_kernel(
+        name=f"gguf_{qtype.name.lower()}_dequant",
+        input_names=["blocks", "n"],
+        output_names=["out"],
+        source=source,
+    )
+    for qtype, source in _DEQUANT_SOURCES.items()
+}
+_QMV_KERNELS: dict[GGMLQuantizationType, Any] = {
+    qtype: mx.fast.metal_kernel(
+        name=f"gguf_{qtype.name.lower()}_qmv",
+        input_names=["blocks", "x", "dims"],
+        output_names=["y"],
+        source=source,
+    )
+    for qtype, source in _QMV_SOURCES.items()
+}
+
+# Must match the literal 256 stride in _QMV_PROLOGUE and the 8-simdgroup
+# reduction in _QMV_EPILOGUE.
 _KERNEL_THREADGROUP = 256
 
 
@@ -149,8 +285,8 @@ class GGUFRawBlockTensor:
       superblocks per row.
     * ``qweight_type`` — a ``gguf.GGMLQuantizationType`` in
       :data:`RAW_KERNEL_GGUF_TYPES`.
-    * logical weight is ``(out_features, in_features)``; :attr:`bits` is 6
-      for Q6_K.
+    * logical weight is ``(out_features, in_features)``; :attr:`bits` is the
+      qtype's code width (2, 3, or 6).
     * activations: :meth:`matmul` accepts float16/bfloat16/float32 ``x`` and
       returns ``x``'s dtype; :meth:`embedding` returns an explicit
       ``output_dtype``.
@@ -309,8 +445,8 @@ class GGUFRawBlockTensor:
         """Return a copy with output rows reordered by ``index`` (load-time).
 
         Every superblock is self-contained within its row, so gathering the
-        packed byte rows is bit-exact. Used to undo llama.cpp's RoPE weight
-        layout on q/k projections at load time.
+        packed byte rows is bit-exact. Used to undo llama.cpp's stored row
+        order at load time.
         """
         out_features = self.out_features
         if index.ndim != 1 or index.shape[0] != out_features:
@@ -335,7 +471,7 @@ class GGUFRawBlockTensor:
     def _qmv(self, x_f32: mx.array) -> mx.array:
         batch = x_f32.shape[0]
         dims = mx.array([self.in_features // 256, self.out_features], dtype=mx.uint32)
-        (y,) = _QMV_KERNEL(
+        (y,) = _QMV_KERNELS[self.qweight_type](
             inputs=[self.qweight, x_f32, dims],
             template=[("NB", batch)],
             output_shapes=[(batch, self.out_features)],
@@ -352,7 +488,7 @@ class GGUFRawBlockTensor:
         n_rows = packed_rows.shape[0]
         n_elements = n_rows * self.in_features
         n = mx.array([n_elements], dtype=mx.uint32)
-        (out,) = _DEQUANT_KERNEL(
+        (out,) = _DEQUANT_KERNELS[self.qweight_type](
             inputs=[packed_rows, n],
             template=[("T", output_dtype)],
             output_shapes=[(n_elements,)],

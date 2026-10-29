@@ -73,6 +73,18 @@ class PagedAttentionRuntimeBase:
         """Dense KV pages need no zeroing; hybrid state overrides this hook."""
         del block_ids
 
+    def release_kv_memory(self) -> None:
+        """Free the KV cache memory for sleep mode; its contents are discarded."""
+        raise NotImplementedError(
+            f"Sleep mode does not support the {type(self).__name__} KV cache."
+        )
+
+    def restore_kv_memory(self) -> None:
+        """Re-create the KV cache memory freed by ``release_kv_memory``."""
+        raise NotImplementedError(
+            f"Sleep mode does not support the {type(self).__name__} KV cache."
+        )
+
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""
         return False

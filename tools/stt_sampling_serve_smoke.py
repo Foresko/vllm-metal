@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Live serve smoke for request sampling on the one-shot STT decode.
 
-Starts ``vllm serve <whisper-model>``, waits for /health, then transcribes one
-speech clip under several sampling params and one synthetic non-speech clip.
+Starts ``vllm serve <whisper-model>``, verifies /health and the served model,
+then transcribes one speech clip under several sampling params and one
+synthetic non-speech clip.
 It checks the contracts the decode owes a request: a greedy transcription is
 stable, a sampled one is served, a seeded one repeats, and language
 auto-detection (which vLLM runs as a hidden
@@ -33,22 +34,51 @@ import wave
 from pathlib import Path
 
 _HEALTH_TIMEOUT_S = 300
+_MAX_PORT_ATTEMPTS = 3
 _SAMPLE_RATE = 16000
 _NON_SPEECH_SECONDS = 5
 
 
-def _wait_for_health(base_url: str, timeout_s: int, serve: subprocess.Popen) -> bool:
+def _probe_port(requested_port: int) -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", requested_port))
+        return sock.getsockname()[1]
+
+
+def _wait_for_health(
+    base_url: str, timeout_s: float, serve: subprocess.Popen, served_model: str
+) -> bool:
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         if serve.poll() is not None:
             return False
         try:
-            with urllib.request.urlopen(f"{base_url}/health", timeout=5) as resp:
-                if resp.status == 200:
-                    return serve.poll() is None
-        except (urllib.error.URLError, ConnectionError, OSError):
+            with urllib.request.urlopen(
+                f"{base_url}/health", timeout=min(5, remaining)
+            ) as resp:
+                healthy = resp.status == 200
+            if healthy:
+                if serve.poll() is not None:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                with urllib.request.urlopen(
+                    f"{base_url}/v1/models", timeout=min(5, remaining)
+                ) as models_resp:
+                    models = json.load(models_resp)
+                if isinstance(models, dict) and isinstance(models.get("data"), list):
+                    if any(
+                        model.get("id") == served_model
+                        for model in models["data"]
+                        if isinstance(model, dict)
+                    ):
+                        return serve.poll() is None
+        except (urllib.error.URLError, ConnectionError, OSError, ValueError):
             pass
-        time.sleep(2)
+        if serve.poll() is not None:
+            return False
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
     return False
 
 
@@ -88,12 +118,12 @@ def _transcribe(base_url: str, audio: Path, **form: str) -> tuple[int, str]:
         return exc.code, exc.read().decode(errors="replace")
 
 
-def _run_checks(base_url: str, speech: Path, silence: Path) -> bool:
+def _run_checks(base_url: str, speech: Path, silence: Path, served_model: str) -> bool:
     timed: dict[str, float] = {}
 
     def timed_transcribe(label: str, audio: Path, **form: str) -> tuple[int, str]:
         started = time.monotonic()
-        result = _transcribe(base_url, audio, **form)
+        result = _transcribe(base_url, audio, model=served_model, **form)
         timed[label] = time.monotonic() - started
         return result
 
@@ -161,50 +191,67 @@ def main() -> int:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     args = parser.parse_args()
 
-    try:
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", args.port))
-            port = sock.getsockname()[1]
-    except OSError as exc:
-        print(f"FAIL: cannot bind localhost port {args.port}: {exc}", file=sys.stderr)
-        return 1
-
-    base_url = f"http://127.0.0.1:{port}"
-    serve = subprocess.Popen(
-        [
-            "vllm",
-            "serve",
-            args.model,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--gpu-memory-utilization",
-            str(args.gpu_memory_utilization),
-        ]
-    )
-    try:
-        print(f"Waiting for {base_url}/health ...", flush=True)
-        if not _wait_for_health(base_url, _HEALTH_TIMEOUT_S, serve):
-            exit_code = serve.poll()
-            message = (
-                f"server exited during startup (exit code {exit_code})"
-                if exit_code is not None
-                else "server did not become healthy"
-            )
-            print(f"FAIL: {message}", file=sys.stderr)
-            return 1
-        with tempfile.TemporaryDirectory() as workdir:
-            silence = Path(workdir) / "silence.wav"
-            _write_silence(silence)
-            return 0 if _run_checks(base_url, Path(args.audio), silence) else 1
-    finally:
-        serve.terminate()
+    attempts = _MAX_PORT_ATTEMPTS if args.port == 0 else 1
+    for attempt in range(attempts):
         try:
-            serve.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            serve.kill()
-            serve.wait()
+            port = _probe_port(args.port)
+        except OSError as exc:
+            print(
+                f"FAIL: cannot bind localhost port {args.port}: {exc}", file=sys.stderr
+            )
+            return 1
+
+        base_url = f"http://127.0.0.1:{port}"
+        served_model = f"stt-smoke-{uuid.uuid4().hex}"
+        serve = subprocess.Popen(
+            [
+                "vllm",
+                "serve",
+                args.model,
+                "--served-model-name",
+                served_model,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--gpu-memory-utilization",
+                str(args.gpu_memory_utilization),
+            ]
+        )
+        try:
+            print(f"Waiting for {base_url}/health ...", flush=True)
+            if not _wait_for_health(base_url, _HEALTH_TIMEOUT_S, serve, served_model):
+                exit_code = serve.poll()
+                if args.port == 0 and exit_code is not None and attempt + 1 < attempts:
+                    try:
+                        _probe_port(port)
+                    except OSError:
+                        print(f"Port {port} was claimed; retrying on a new port")
+                        continue
+                message = (
+                    f"server exited during startup (exit code {exit_code})"
+                    if exit_code is not None
+                    else "server did not become healthy"
+                )
+                print(f"FAIL: {message}", file=sys.stderr)
+                return 1
+            with tempfile.TemporaryDirectory() as workdir:
+                silence = Path(workdir) / "silence.wav"
+                _write_silence(silence)
+                return (
+                    0
+                    if _run_checks(base_url, Path(args.audio), silence, served_model)
+                    else 1
+                )
+        finally:
+            if serve.poll() is None:
+                serve.terminate()
+            try:
+                serve.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                serve.kill()
+                serve.wait()
+    return 1
 
 
 if __name__ == "__main__":

@@ -113,7 +113,9 @@ fetch_release_vllm_tag() {
 install_vllm() {
   local vllm_release_tag="$1"
   local vllm_version="${vllm_release_tag#v}"
-  local vllm_wheel_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}/vllm-${vllm_version}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
+  local download_url="https://github.com/vllm-project/vllm/releases/download/${vllm_release_tag}"
+  # vLLM's prebuilt macOS arm64 wheel is tagged cp38-abi3.
+  local vllm_wheel_url="${download_url}/vllm-${vllm_version}%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
 
   echo ""
   section "Installing vLLM core"
@@ -269,7 +271,7 @@ EOF
     install_vllm "$vllm_release_tag"
 
     # Source checkouts build native artifacts; release installs use the wheel.
-    uv pip install -e .
+    uv pip install -e ".[build]"
     ensure_metal_toolchain
     build_native_artifacts
   else

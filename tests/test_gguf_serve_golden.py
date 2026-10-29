@@ -26,8 +26,11 @@ checkpoints, not synthetic fixtures). Run a family with its env trio, e.g.::
     pytest tests/test_gguf_serve_golden.py -m slow
 
 (Qwen3 Q4_1 uses ``VLLM_METAL_TEST_GGUF_Q41_*``, Qwen3 Q4_K_M uses
-``VLLM_METAL_TEST_GGUF_Q4KM_*``, llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*``,
-and mistral uses ``VLLM_METAL_TEST_GGUF_MISTRAL_*`` for the same trio.)
+``VLLM_METAL_TEST_GGUF_Q4KM_*``, Qwen2.5 Q4_K_M uses
+``VLLM_METAL_TEST_GGUF_QWEN25_*``, llama uses ``VLLM_METAL_TEST_GGUF_LLAMA_*``,
+mistral uses ``VLLM_METAL_TEST_GGUF_MISTRAL_*``, and Qwen3.5-9B Q4_K_M and
+Qwen3.5-4B Q5_K_M use ``VLLM_METAL_TEST_GGUF_QWEN35_9B_*`` and
+``VLLM_METAL_TEST_GGUF_QWEN35_4B_*`` for the same trio.)
 """
 
 from __future__ import annotations
@@ -160,6 +163,38 @@ _CASES = [
         dense_agree_prefix=12,
         target_dtype=mx.bfloat16,
     ),
+    # qwen2.5-0.5b-instruct-q4_k_m.gguf (Qwen, rev 9217f5db): Q4_K/Q6_K only on
+    # the 4864-wide ffn_down; the 896-wide rows, tied embedding included, fall
+    # back to Q5_0 (Q8_0 for some attn_v and the unused output.weight). All 16
+    # ids match the dense reference for this high-confidence factual sequence.
+    _GoldenCase(
+        label="qwen2.5-q4_k_m",
+        quantization="Q4_K_M",
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
+        gguf_env="VLLM_METAL_TEST_GGUF_QWEN25_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN25_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_QWEN25_DENSE_PATH",
+        golden_ids=(
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
     # Llama-3.2-1B-Instruct-Q8_0.gguf: agreement through index 12, divergence
     # at 13. Without the llama.cpp q/k RoPE row-un-permutation this prefix
     # agreement is only 1 token (attention is broken), so this pins the fix
@@ -221,6 +256,68 @@ _CASES = [
             781,
             781,
             1782,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
+    # Qwen3.5-9B-Q4_K_M.gguf (unsloth, rev 3885219b): untied, with a Q5_K
+    # ssm_out on the affine carrier. All 16 ids match the dense reference;
+    # without the V-head regrouping they diverge at index 2.
+    _GoldenCase(
+        label="qwen3.5-9b-q4_k_m",
+        quantization="Q4_K_M",
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
+        gguf_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_QWEN35_9B_DENSE_PATH",
+        golden_ids=(
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
+        ),
+        dense_agree_prefix=16,
+        target_dtype=mx.bfloat16,
+    ),
+    # Qwen3.5-4B-Q5_K_M.gguf (unsloth, rev e87f1764): tied, with a Q6_K
+    # ssm_out on the raw-block carrier. All 16 ids match the dense reference;
+    # without the V-head regrouping they diverge at index 1.
+    _GoldenCase(
+        label="qwen3.5-4b-q5_k_m",
+        quantization="Q5_K_M",
+        prompt="The first ten prime numbers are 2, 3, 5, 7,",
+        gguf_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_SERVE_PATH",
+        tokenizer_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_TOKENIZER_PATH",
+        dense_env="VLLM_METAL_TEST_GGUF_QWEN35_4B_DENSE_PATH",
+        golden_ids=(
+            220,
+            16,
+            16,
+            11,
+            220,
+            16,
+            18,
+            11,
+            220,
+            16,
+            22,
+            11,
+            220,
+            16,
+            24,
+            11,
         ),
         dense_agree_prefix=16,
         target_dtype=mx.bfloat16,

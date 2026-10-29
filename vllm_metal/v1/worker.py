@@ -13,6 +13,16 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -32,7 +42,7 @@ from vllm_metal.config import get_config
 from vllm_metal.distributed import PipelineGroup
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
-from vllm_metal.v1.cache_policy import WorkerCachePlanner
+from vllm_metal.v1.cache_policy import WorkerCachePlanner, uses_metal_offloading
 
 if TYPE_CHECKING:
     from vllm_metal.profiler.wrapper import MetalProfilerWrapper
@@ -75,6 +85,7 @@ class MetalWorker(WorkerBase):
     # because its worker-facing method set is a superset of STTModelRunner's;
     # STT models are assigned an STTModelRunner at runtime (see init_device).
     model_runner: MetalModelRunner  # type: ignore[assignment]
+    _kv_cache_released = False
 
     def __init__(
         self,
@@ -103,6 +114,7 @@ class MetalWorker(WorkerBase):
             self.metal_config.k_quant = add.get("k_quant", "q8_0")
             self.metal_config.v_quant = add.get("v_quant", "q3_0")
             self.metal_config._validate_turboquant()
+        self.metal_config.apply_moe_expert_offload(add)
 
         # Disable custom all reduce (not supported on Metal)
         self.parallel_config.disable_custom_all_reduce = True
@@ -248,7 +260,41 @@ class MetalWorker(WorkerBase):
         # layout through the config.
         if kv_cache_config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
+
+        if not uses_metal_offloading(self.vllm_config):
+            self.model_runner.initialize_kv_cache(kv_cache_config)
+            return
+
+        # Create the worker-side connector before the KV cache, as
+        # GPUWorker.initialize_from_config does. It refuses unsupported models.
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if not hasattr(self.model_runner, "register_kv_connector_caches"):
+            raise NotImplementedError(
+                "KV offloading is not supported for STT models on Metal."
+            )
+        # initialize_kv_cache allocates the KVCacheStorage, so the connector
+        # can only be handed it now.
+        self.model_runner.register_kv_connector_caches()
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Return KV connector handshake metadata keyed by (pp_rank, tp_rank).
+
+        Called by the engine core whenever a KV connector is configured.
+        Follows ``GPUWorker``; the offloading connector returns ``None``.
+        """
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        pp_rank = get_pp_group().rank_in_group
+        tp_rank = get_tp_group().rank_in_group
+        return {(pp_rank, tp_rank): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
@@ -297,6 +343,11 @@ class MetalWorker(WorkerBase):
         """
         return self.model_runner.model
 
+    def get_model_inspection(self) -> str:
+        # vLLM's default walks torch's named_children(); MLX modules have
+        # their own tree repr.
+        return repr(self.get_model())
+
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after engine auto-fits context to GPU memory."""
         self.model_config.max_model_len = max_model_len
@@ -338,20 +389,41 @@ class MetalWorker(WorkerBase):
         return self.model_runner.get_draft_model_stats()
 
     def sleep(self, level: int = 1) -> None:
-        """Enter sleep mode (not supported on Metal).
-
-        Args:
-            level: Sleep level
+        """Free the KV cache. Weights already live in unified memory, so
+        level 1 keeps them in place instead of copying them to the CPU.
         """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+        if level != 1:
+            raise NotImplementedError(
+                f"Metal supports sleep level 1 only, got {level}."
+            )
+        self.discard(("kv_cache",))
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up from sleep mode (not supported on Metal).
+        # vLLM marks the KV cache as sleeping even when discard() raised, so
+        # restore only what was actually released.
+        if self._kv_cache_released and (tags is None or "kv_cache" in tags):
+            self.model_runner.restore_kv_cache_memory()
+            self._kv_cache_released = False
 
-        Args:
-            tags: Wake up tags
-        """
-        logger.warning("Sleep mode is not supported on Metal, ignoring")
+    def discard(self, tags: tuple[str, ...]) -> None:
+        if set(tags) != {"kv_cache"}:
+            raise NotImplementedError(
+                f"Metal can only discard the KV cache, got tags {tags}."
+            )
+        if not hasattr(self.model_runner, "release_kv_cache_memory"):
+            raise NotImplementedError(
+                f"Sleep mode is not supported with {type(self.model_runner).__name__}."
+            )
+        before = mx.get_active_memory()
+        self.model_runner.release_kv_cache_memory()
+        self._kv_cache_released = True
+        gc.collect()
+        mx.clear_cache()
+        logger.info(
+            "Sleep mode freed %.2f GiB; %.2f GiB of Metal memory is still in use.",
+            (before - mx.get_active_memory()) / (1 << 30),
+            mx.get_active_memory() / (1 << 30),
+        )
 
     def check_health(self) -> None:
         """Check worker health."""
@@ -398,6 +470,23 @@ class MetalWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        if has_kv_transfer_group():
+            # Close any open connector step first. If execute_model opened one
+            # and sample_tokens never ran, its exit path still needs the
+            # transfer group that ensure_kv_transfer_shutdown drops.
+            runner = getattr(self, "model_runner", None)
+            finish_step = getattr(runner, "finish_kv_connector_step", None)
+            if finish_step is not None:
+                try:
+                    finish_step()
+                except Exception:
+                    logger.exception("Closing the KV connector step failed; continuing")
+            try:
+                ensure_kv_transfer_shutdown()
+            except Exception:
+                # Never let connector teardown block profiler or model cleanup.
+                logger.exception("KV transfer shutdown failed; continuing")
+
         if self._metal_profiler is not None:
             self._metal_profiler.shutdown()
             self._metal_profiler = None

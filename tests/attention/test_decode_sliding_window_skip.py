@@ -65,8 +65,7 @@ def _kernel(
     **kwargs,
 ):
     hd = int(query.shape[-1])
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -79,7 +78,6 @@ def _kernel(
         BLOCK,
         max(kv_lens),
         window if window is not None else -1,
-        out,
         **kwargs,
     )
     mx.eval(out)
@@ -349,15 +347,15 @@ def test_window_mode_row_with_fully_masked_block_stays_neutral(
     """One level below the fully masked partition: window mode reads blocks
     from the window start of the threadgroup's first row, so a block can be
     scanned for an earlier row while lying wholly left of a later row's
-    window, inside a partition that still holds real keys for it.  That
-    block's -FLT_MAX max must not clamp the row's running max to 0: every
-    later in-window key would then be weighted by exp2(score) instead of
-    exp2(score - max), collapsing rows whose real scores are far below 0
-    (#875).
+    window, inside a partition that still holds real keys for it.  A fully
+    masked block must not affect the row's max state or its V output:
+    pinning the running max to 0 weights every later in-window key by
+    exp2(score) instead of exp2(score - max) (#875), and a masked slot that
+    still contributes V turns inf cache elements into NaN.
 
     seq_len 1506 puts row 0's window start on the last token of a block
-    (window start mod BLOCK == BLOCK - 1), so that block is read for row 0
-    and fully masked for row 1.  Scores as in
+    (window start mod BLOCK == BLOCK - 1), so the rest of that block is
+    read for row 0 and fully masked for row 1.  Scores as in
     test_partitioned_window_with_strongly_negative_scores."""
     heads, kv_heads, hd = 4, 2, 64
     window, q_len = 96, 2 * PA_WINDOW_ROWS
@@ -365,7 +363,7 @@ def test_window_mode_row_with_fully_masked_block_stays_neutral(
     ops = get_ops()
     # The kernel masks token_idx < row_context_len - window with
     # row_context_len = (seq_len - q_len + 1) + r, so row 0's window starts
-    # at 1503 - 96 = 1407, the last token of a 16-token block: that block is
+    # at 1503 - 96 = 1407, the last token of a block: that block is
     # scanned for row 0 and fully masked for row 1.
     row0_win_start = (seq_len - q_len + 1) - window
     assert row0_win_start % BLOCK == BLOCK - 1
@@ -380,7 +378,14 @@ def test_window_mode_row_with_fully_masked_block_stays_neutral(
     key_cache = (
         -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
     ).astype(DTYPE)
-    mx.eval(query, key_cache)
+    # The masked block's V slots that no row may read get +/-inf; slot
+    # BLOCK - 1 stays finite — it is row 0's window start, a legitimate read.
+    vc = np.array(value_cache)
+    masked_block = rows[0][row0_win_start // BLOCK]
+    signs = np.where(np.arange(BLOCK - 1) % 2 == 0, np.inf, -np.inf)
+    vc[masked_block, : BLOCK - 1] = signs[:, None, None]
+    value_cache = mx.array(vc)
+    mx.eval(query, key_cache, value_cache)
     got = _kernel(
         query,
         key_cache,
@@ -392,16 +397,22 @@ def test_window_mode_row_with_fully_masked_block_stays_neutral(
         window=window,
         window_seqlen_q=q_len,
     )
+    # Masked slots never contribute to the true result, so the NumPy
+    # reference runs over a finite copy with them zeroed.
+    vc_ref = vc.copy()
+    vc_ref[masked_block, : BLOCK - 1] = 0.0
     ref = _reference(
         query,
         key_cache,
-        value_cache,
+        mx.array(vc_ref),
         rows[0],
         q_lo=seq_len - q_len,
         seq_len=seq_len,
         window=window,
     )
-    np.testing.assert_allclose(np.array(got), ref, atol=ATOL, rtol=RTOL)
+    out = np.array(got)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, ref, atol=ATOL, rtol=RTOL)
 
 
 def _zero_window_output(query, key_cache, value_cache, table, **common):

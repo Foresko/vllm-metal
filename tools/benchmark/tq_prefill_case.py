@@ -12,10 +12,15 @@ from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT
 from vllm_metal.attention.caches.storage import KVCacheStorage
-from vllm_metal.attention.caches.turboquant import QUANT_PARAMS, get_v_centroids
+from vllm_metal.attention.caches.turboquant import (
+    QUANT_PARAMS,
+    get_v_centroids,
+    prefill_workspace_bytes,
+)
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls import sdpa
 from vllm_metal.metal import get_ops
@@ -52,13 +57,12 @@ class AttentionCase:
             self.inner, self.x, self.ctx, self.inner.n_heads, self.inner.n_kv_heads
         )
         q = mx.contiguous(q[0].transpose(1, 0, 2).astype(c.dtype))
-        table, kb = sdpa._build_block_tables(self.ctx.block_tables, c.block_size)
+        table, kb = build_block_tables(self.ctx.block_tables, c.block_size)
 
         def kernel_view(array):
             return array.reshape(-1, kb, c.num_kv_heads, array.shape[-1])
 
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             q,
             kernel_view(c.key_caches[0]),
             kernel_view(c.value_caches[0]),
@@ -71,7 +75,6 @@ class AttentionCase:
             kb,
             max(self.ctx.context_lens),
             c.sliding_window_per_layer[0],
-            out,
             use_turboquant=True,
             quant_type=c.k_quant,
             v_bits=c.v_bits,
@@ -212,6 +215,7 @@ def build_case(
     x = mx.random.normal((1, sum(qlens), hidden), key=mx.random.key(94)).astype(dtype)
     mx.eval(x, inner.q_proj.weight, inner.k_proj.weight, inner.v_proj.weight)
     ctx = PagedAttentionContext(
+        tq_prefill_workspace_bytes=prefill_workspace_bytes(),
         slot_mapping=new_slots,
         block_tables=tables,
         context_lens=list(context_lens),

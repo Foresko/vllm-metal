@@ -30,7 +30,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tools.attention_bench_utils import ref_paged_attn
+from tools.attention_bench_utils import attention_tolerances, ref_paged_attn
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.caches.turboquant import (
     get_v_centroids,
@@ -44,14 +44,6 @@ NUM_KV_HEADS = 8
 HEAD_SIZE = 128
 BLOCK_SIZE = 16
 NUM_BLOCKS = 256
-
-# atol/rtol per dtype.  float32: both paths compute in fp32, only
-# kernel-order error is left.
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (1e-3, 1e-3),
-}
 
 
 def _run_paged_decode(
@@ -79,8 +71,7 @@ def _run_paged_decode(
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, kv_lens_arr, cu_seqlens_q)
 
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -93,7 +84,6 @@ def _run_paged_decode(
         BLOCK_SIZE,
         max_kv_len,
         -1,  # sliding_window (disabled here; windowed cells below)
-        out,
     )
     mx.eval(out)
 
@@ -111,7 +101,7 @@ def _run_paged_decode(
 
 
 def _assert_close(out: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype)
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)),
         np.array(ref.astype(mx.float32)),
@@ -207,8 +197,7 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -221,7 +210,6 @@ def test_split_decode_sliding_window(kv_len: int, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))[0]
@@ -301,10 +289,9 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
     block_tables = mx.arange(nblocks, dtype=mx.int32).reshape(1, nblocks)
     seq_lens = mx.array([kv_len], dtype=mx.int32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
-    out = mx.zeros((1, NUM_QUERY_HEADS, HEAD_SIZE), dtype=mx.float16)
-    mx.eval(block_tables, seq_lens, cu_seqlens_q, out)
+    mx.eval(block_tables, seq_lens, cu_seqlens_q)
 
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         cache.key_caches[layer],
         cache.value_caches[layer],
@@ -317,7 +304,6 @@ def test_split_decode_turboquant(quant: str, window: int) -> None:
         BLOCK_SIZE,
         kv_len,
         window,
-        out,
         key_scale_cache=cache.key_scale_caches[layer],
         value_scale_cache=cache.value_scale_caches[layer],
         key_zero_cache=cache.key_zero_caches[layer],
@@ -401,8 +387,7 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
     cu_seqlens_q = mx.arange(num_seqs + 1, dtype=mx.int32)
     mx.eval(key_cache, value_cache, query, block_tables, seq_lens, cu_seqlens_q)
 
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -415,7 +400,6 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
         GEMMA4_BLOCK_SIZE,
         max_kv_len,
         -1,
-        out,
     )
     mx.eval(out)
     o = np.array(out.astype(mx.float32))
@@ -424,7 +408,7 @@ def test_split_decode_gemma4_full_attention(kv_lens: list[int]) -> None:
     k_all = np.array(key_cache.astype(mx.float32))
     v_all = np.array(value_cache.astype(mx.float32))
     tables = np.array(block_tables)
-    atol, rtol = _TOLERANCES[mx.bfloat16]
+    atol, rtol = attention_tolerances(mx.bfloat16)
     for i, kv_len in enumerate(kv_lens):
         blocks = tables[i, : -(-kv_len // GEMMA4_BLOCK_SIZE)]
         rows = (-1, GEMMA4_NUM_KV_HEADS, GEMMA4_HEAD_SIZE)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Paged SDPA and state-family execution for hybrid models.
+"""Paged attention and state-family execution for hybrid models.
 
 The family plan supplies layer roles and wrappers. vLLM supplies the shared
 physical allocation and scheduler-owned block IDs for both state and KV.
@@ -13,12 +13,17 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, MLAAttentionSpec
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.impls.mla import (
+    MLAPagedAttentionWrapper,
+    is_mla_attention,
+)
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import (
     SDPAPagedAttentionWrapper,
@@ -68,9 +73,20 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             f"layers.{i}.{self._hybrid_plan.family.layer_name}"
             for i in layer_plan.state_indices
         ]
-        self._cache = MetalPagedKVCache.from_upstream(
-            self.storage, attention_names, dtype=self._dtype
-        )
+        attention_specs = [self.storage.specs[name] for name in attention_names]
+        mla_layers = [isinstance(spec, MLAAttentionSpec) for spec in attention_specs]
+        if all(mla_layers):
+            self._cache = MLAPagedLatentCache.from_upstream(
+                self.storage, attention_names
+            )
+        elif any(mla_layers):
+            raise NotImplementedError(
+                "hybrid models mixing MLA and standard attention are not supported"
+            )
+        else:
+            self._cache = MetalPagedKVCache.from_upstream(
+                self.storage, attention_names, dtype=self._dtype
+            )
         self._scheduler_group_indices = tuple(
             i
             for i, group in enumerate(config.kv_cache_groups)
@@ -110,17 +126,17 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
-        """Return scheduler KV groups consumed by SDPA layers."""
+        """Return scheduler KV groups consumed by attention layers."""
         self._require_initialized("kv_scheduler_group_indices")
         return self._scheduler_group_indices
 
     def kv_group_block_sizes(self) -> tuple[int, ...]:
-        """Return SDPA scheduler group page sizes."""
+        """Return attention scheduler group page sizes."""
         self._require_initialized("kv_group_block_sizes")
         return self._group_block_sizes
 
     def patch_model(self, model: nn.Module) -> int:
-        kv_cache = self._require_initialized("patch_model")
+        attention_cache = self._require_initialized("patch_model")
         state_cache = self.state_cache
         layer_plan = self._hybrid_plan.layers
         state_family = self._hybrid_plan.family
@@ -141,12 +157,31 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                     f"{state_family.label!r} state module."
                 )
             cache_idx = layer_plan.attention_cache_index(layer_idx)
+            if isinstance(attention_cache, MLAPagedLatentCache):
+                if isinstance(attn, MLAPagedAttentionWrapper):
+                    attn.rebind_cache(attention_cache, cache_idx=cache_idx)
+                    return attn
+                if is_mla_attention(attn):
+                    return MLAPagedAttentionWrapper(attn, cache_idx, attention_cache)
+                raise RuntimeError(
+                    f"Hybrid patch_model: layer {layer_idx} is an MLA layer in "
+                    f"the hybrid plan but {type(attn).__name__} does not expose "
+                    "the supported MLA interface."
+                )
             if isinstance(attn, SDPAPagedAttentionWrapper):
-                attn.rebind_cache(kv_cache, kv_cache.block_size, cache_idx=cache_idx)
+                attn.rebind_cache(
+                    attention_cache,
+                    attention_cache.block_size,
+                    cache_idx=cache_idx,
+                )
                 return attn
             if is_sdpa(attn):
                 return SDPAPagedAttentionWrapper(
-                    attn, layer_idx, kv_cache, kv_cache.block_size, cache_idx=cache_idx
+                    attn,
+                    layer_idx,
+                    attention_cache,
+                    attention_cache.block_size,
+                    cache_idx=cache_idx,
                 )
             raise RuntimeError(
                 f"Hybrid patch_model: layer {layer_idx} is an attention layer in "
@@ -162,7 +197,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     @property
-    def kv_cache(self) -> MetalPagedKVCache:
+    def kv_cache(self) -> MetalPagedKVCache | MLAPagedLatentCache:
         return self._require_initialized("kv_cache")
 
     @property
@@ -180,12 +215,17 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def needs_step_context(self) -> bool:
         return True
 
+    @property
+    def state_checkpoint_stride(self) -> int | None:
+        """Stride of align-mode state checkpoints; None for per-request states."""
+        return self.state_manager.checkpoint_stride
+
     def zero_blocks(self, block_ids: Sequence[int]) -> None:
         self.state_cache.apply_pending_states(block_ids)
         self.storage.zero_blocks(block_ids)
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
-        """Apply scheduler CoW copies to SDPA KV and align-mode state."""
+        """Apply scheduler CoW copies to attention KV and align-mode state."""
         self.state_cache.apply_pending_states(
             [slot for pair in block_copies for slot in pair]
         )
@@ -216,3 +256,10 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def materialize_pending_state(self) -> None:
         self.state_manager.materialize_pending_state()
+
+    def release_kv_memory(self) -> None:
+        self.state_manager.discard_pending_state()
+        self.storage.release()
+
+    def restore_kv_memory(self) -> None:
+        self.storage.reallocate()

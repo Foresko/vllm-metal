@@ -11,6 +11,8 @@ the [vLLM project](https://github.com/vllm-project/vllm) (Apache-2.0).
 `turboquant.metal`, `pagedattention_tiled.metal`, and `mla.metal` are
 vLLM-project Apache-2.0 sources. `pagedattention_nax.metal` adapts MLX's
 `steel_attention_nax` (MIT, © 2025 Apple Inc.).
+`gdn_recurrent_prefill.metal` adapts mlx-lm's packed recurrence layout
+(MIT, © 2025 Apple Inc.).
 
 ## How the shaders are compiled
 
@@ -19,11 +21,12 @@ The source builders concatenate shaders in the order below, stripping local
 
 ### 1. C++ `_paged_ops` extension: `__init__.py` and `build.py`
 
-By default, `get_ops()` loads the prebuilt nanobind extension and three
+By default, `get_ops()` loads the prebuilt nanobind extension and
 required `.metallib` libraries, plus optional NAX support. With
-`VLLM_METAL_BUILD_FROM_SOURCE=1`, it builds the extension and compiles the
-shader sources in-process through MLX. Packaging uses the same source
-builders to precompile the `.metallib` files via `python -m vllm_metal.metal.build`.
+`VLLM_METAL_BUILD_FROM_SOURCE=1`, it rebuilds changed artifacts with
+`mlx.extension.MetalExtension`, then loads the generated `.metallib` files.
+Packaging uses the same build via `python -m vllm_metal.metal.build`.
+Source builds require the `build` extra and the Xcode Metal toolchain.
 
 | Library | Source builder | Concatenated sources (in order) |
 |---------|----------------|----------------------------------|
@@ -34,7 +37,7 @@ builders to precompile the `.metallib` files via `python -m vllm_metal.metal.bui
 
 ### 2. `mx.fast.metal_kernel` snippets: `attention/impls/gdn_lazy.py`
 
-The lazy GDN decode and prefill paths compile four shaders directly through
+The lazy GDN decode and prefill paths compile the following shaders directly through
 MLX, via `_read_v2_metal_source`:
 
 | Shader | Compiled kernel name |
@@ -43,6 +46,14 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | `gdn_conv1d_silu_prefill_v2` |
 | `gdn_recurrent_decode.metal` | `gdn_recurrent_decode_v2` |
 | `gdn_recurrent_prefill.metal` | `gdn_recurrent_prefill_v2` |
+
+Recurrent prefill uses one source with a compile-time `Packed` parameter. Within
+the existing lazy prefill eligibility checks, key head dimension 128 and value
+head dimension divisible by eight automatically select eight value rows per
+SIMD-group. Other supported shapes retain the generic one-row layout. Both
+specializations share state access and the sequence loop, while preserving their
+respective reduction order. Selection is independent of GPU family and NAX;
+pure decode retains its existing kernel. There is no separate packed user switch.
 
 ## File reference
 
@@ -62,3 +73,18 @@ MLX, via `_read_v2_metal_source`:
 | `gdn_conv1d_silu_prefill.metal` | Lazy GDN prefill: causal conv1d + SiLU. |
 | `gdn_recurrent_decode.metal` | Lazy GDN decode: recurrent state update. |
 | `gdn_recurrent_prefill.metal` | Lazy GDN prefill: recurrent state updates over packed sequences. |
+
+### D512 NAX prefill
+
+The split pipeline divides D512's output columns across two threadgroups,
+each accumulating 256 columns. Both read the full 512-column Q/K vectors
+and repeat QK and online softmax, then write disjoint output slices. This
+halves live output accumulators without scratch buffers or a reduction pass.
+Complete KV tiles in full Q blocks omit bounds checks; partial Q blocks and
+partial KV tiles retain the guarded loads and masks.
+
+The existing host tile-work hint enables this path with at least four full
+Q blocks and eight times as much full-block as partial-block KV-tile work.
+Short or partial-dominated launches, callers without sequence metadata, and
+the MPS launcher retain the original D512 loop. Other head sizes keep their
+existing kernels and selection rules.

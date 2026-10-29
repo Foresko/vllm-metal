@@ -16,8 +16,7 @@ plugin's own mechanism), which vLLM loads in ``EngineArgs.__post_init__`` and
 again inside the EngineCore/worker subprocesses, so the registration is
 spawn-safe without import-time patching.
 
-This module must stay importable WITHOUT the optional ``gguf`` package: a
-default install loads it on every vLLM run via the entry point.
+Keep GGUF parsing imports lazy: the entry point loads on every vLLM run.
 
 # SCAFFOLDING: remove when vllm-project/vllm-gguf-plugin installs and imports
 # on macOS; then depend on it for this layer (register() already no-ops when
@@ -30,6 +29,7 @@ import importlib
 import importlib.util
 from functools import wraps
 from pathlib import Path
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.quantization import (
@@ -82,6 +82,13 @@ class MetalGGUFConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config: dict) -> MetalGGUFConfig:
         return cls()
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None, hf_config: Any = None
+    ) -> str | None:
+        # The .gguf carries its own quantization, so the config source's is ignored.
+        return "gguf" if user_quant == "gguf" else None
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> None:
         # Never exercised: vllm-metal bypasses vLLM's model executor.
@@ -148,7 +155,7 @@ class GGUFEngineIntegration:
         """Whether ``model`` reads as the plugin's ``repo_id:quant`` syntax.
 
         Mirrors the official plugin's public ``is_remote_gguf`` at the shape
-        level while keeping the optional ``gguf`` package out of this module.
+        level while keeping the ``gguf`` package out of this module.
         """
         return model is not None and RemoteGGUFReference.parse(model) is not None
 

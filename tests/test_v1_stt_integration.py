@@ -170,6 +170,7 @@ class TestWhisperRuntimeAdapterDecode:
 
         assert result[-1] == 50257
 
+    @pytest.mark.usefixtures("whisper_hub_tokenizer_cache")
     @pytest.mark.parametrize("n_vocab", [51864, 51865, 51866])
     def test_runner_uses_fallback_eot_for_tokenizer_free_snapshot(
         self, tmp_path: Path, n_vocab: int
@@ -514,7 +515,9 @@ class TestSTTRunnerWorkerContract:
         monkeypatch.setattr(loader, "_load_and_init_model", load_weights)
 
         vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(model=model_name, revision=revision),
+            model_config=SimpleNamespace(
+                model=model_name, revision=revision, dtype=torch.bfloat16
+            ),
             cache_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(),
         )
@@ -528,6 +531,7 @@ class TestSTTRunnerWorkerContract:
         load_weights.assert_called_once_with(
             fake_model, tmp_path, {"model_type": "whisper"}
         )
+        constructor.assert_called_once_with({"model_type": "whisper"}, mx.bfloat16)
         if source == "huggingface":
             download.assert_called_once_with(repo_id=model_name, revision=revision)
         elif source == "modelscope":

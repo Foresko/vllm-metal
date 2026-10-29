@@ -527,11 +527,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
                                         : fast::exp2(max_score - new_max);
     } else {
       factor = 1.0f;
-      // A fully window-masked tile (row_max -INFINITY, nothing unmasked
-      // seen yet) must not pin max_score at 0: later in-window keys would
-      // be weighted by exp2(s - 0) instead of exp2(s - s_max), collapsing
-      // rows whose real scores are all far below 0 (#876). Keeping
-      // -INFINITY is safe: every Sreg here is -INFINITY, so the
+      // A fully window-masked tile (new_max still -INFINITY, nothing
+      // unmasked seen yet) must not pin max_score at 0: later in-window
+      // keys would be weighted by exp2(s - 0) instead of exp2(s - s_max),
+      // collapsing rows whose real scores are all far below 0 (#876).
+      // Keeping -INFINITY is safe: every Sreg here is -INFINITY, so the
       // exponentiate below still emits p == 0, and the next unmasked tile
       // takes the factor == 0 rescale branch above.
     }
@@ -689,7 +689,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE,
       uint lane [[thread_index_in_simdgroup]]);
 
 // Each entry must match a (head_size -> TileConfig) row in select_tile_config
-// in vllm_metal/metal/paged_ops.cpp.
+// in vllm_metal/metal/paged_attention_kernels.h.
 #define instantiate_paged_attention_tiled_heads(type, block_size)              \
   instantiate_paged_attention_tiled_inner(type, 64,  block_size, 32, 32, 128, 1); \
   instantiate_paged_attention_tiled_inner(type, 96,  block_size, 32, 32, 128, 1); \
@@ -706,7 +706,7 @@ instantiate_paged_attention_tiled_all(half);
 instantiate_paged_attention_tiled_all(bfloat16_t);
 
 // ─────────────────────────────────────────────────────────────────────────
-// GQA-packed paged decode.
+// GQA MMA paged decode.
 //
 // The per-token decode kernel (paged_attention) runs one threadgroup per
 // query head, so every KV head is streamed once per query head that shares
@@ -730,7 +730,7 @@ instantiate_paged_attention_tiled_all(bfloat16_t);
 // ─────────────────────────────────────────────────────────────────────────
 template <typename T, typename OUT_T, int HEAD_SIZE, int BLOCK_SIZE,
           int TILE_KV, int PARTITION_SIZE>
-[[kernel]] void paged_attention_gqa_decode(
+[[kernel]] void paged_attention_gqa_mma_decode(
     device float *exp_sums
     [[buffer(0), function_constant(use_partitioning)]],
     device float *max_logits
@@ -1093,13 +1093,13 @@ template <typename T, typename OUT_T, int HEAD_SIZE, int BLOCK_SIZE,
   }
 }
 
-#define instantiate_paged_attention_gqa_decode_inner(                          \
+#define instantiate_paged_attention_gqa_mma_decode_inner(                      \
     type, out_type, head_size, block_size, tile_kv, ps)                        \
-  template [[host_name("paged_attention_gqa_decode_" #type                     \
+  template [[host_name("paged_attention_gqa_mma_decode_" #type                 \
                        "_hs" #head_size "_bs" #block_size                      \
                        "_tk" #tile_kv "_ps" #ps)]]                             \
-  [[kernel]] void paged_attention_gqa_decode<type, out_type, head_size,        \
-                                             block_size, tile_kv, ps>(         \
+  [[kernel]] void paged_attention_gqa_mma_decode<type, out_type, head_size,    \
+                                                 block_size, tile_kv, ps>(     \
       device float *exp_sums                                                   \
       [[buffer(0), function_constant(use_partitioning)]],                      \
       device float *max_logits                                                 \
@@ -1128,25 +1128,26 @@ template <typename T, typename OUT_T, int HEAD_SIZE, int BLOCK_SIZE,
       uint sg_idx [[simdgroup_index_in_threadgroup]],                          \
       uint lane [[thread_index_in_simdgroup]]);
 
-// (head_size -> TILE_KV) must match gqa_decode_tile_kv() in paged_ops.cpp.
-#define instantiate_paged_attention_gqa_decode_ps(type, out_type, block_size,  \
-                                                  ps)                          \
-  instantiate_paged_attention_gqa_decode_inner(type, out_type, 128,            \
-                                               block_size, 32, ps);            \
-  instantiate_paged_attention_gqa_decode_inner(type, out_type, 256,            \
-                                               block_size, 16, ps);            \
-  instantiate_paged_attention_gqa_decode_inner(type, out_type, 512,            \
-                                               block_size, 8, ps);
+// (head_size -> TILE_KV) must match gqa_mma_decode_tile_kv() in
+// paged_attention.cpp.
+#define instantiate_paged_attention_gqa_mma_decode_ps(type, out_type,          \
+                                                      block_size, ps)          \
+  instantiate_paged_attention_gqa_mma_decode_inner(type, out_type, 128,        \
+                                                   block_size, 32, ps);        \
+  instantiate_paged_attention_gqa_mma_decode_inner(type, out_type, 256,        \
+                                                   block_size, 16, ps);        \
+  instantiate_paged_attention_gqa_mma_decode_inner(type, out_type, 512,        \
+                                                   block_size, 8, ps);
 
-#define instantiate_paged_attention_gqa_decode_block(type, block_size)         \
-  instantiate_paged_attention_gqa_decode_ps(type, type, block_size, 0);        \
-  instantiate_paged_attention_gqa_decode_ps(type, float, block_size, 256);     \
-  instantiate_paged_attention_gqa_decode_ps(type, float, block_size, 512);
+#define instantiate_paged_attention_gqa_mma_decode_block(type, block_size)     \
+  instantiate_paged_attention_gqa_mma_decode_ps(type, type, block_size, 0);    \
+  instantiate_paged_attention_gqa_mma_decode_ps(type, float, block_size, 256); \
+  instantiate_paged_attention_gqa_mma_decode_ps(type, float, block_size, 512);
 
-#define instantiate_paged_attention_gqa_decode_all(type)                       \
-  instantiate_paged_attention_gqa_decode_block(type, 8);                       \
-  instantiate_paged_attention_gqa_decode_block(type, 16);                      \
-  instantiate_paged_attention_gqa_decode_block(type, 32);
+#define instantiate_paged_attention_gqa_mma_decode_all(type)                   \
+  instantiate_paged_attention_gqa_mma_decode_block(type, 8);                   \
+  instantiate_paged_attention_gqa_mma_decode_block(type, 16);                  \
+  instantiate_paged_attention_gqa_mma_decode_block(type, 32);
 
-instantiate_paged_attention_gqa_decode_all(half);
-instantiate_paged_attention_gqa_decode_all(bfloat16_t);
+instantiate_paged_attention_gqa_mma_decode_all(half);
+instantiate_paged_attention_gqa_mma_decode_all(bfloat16_t);

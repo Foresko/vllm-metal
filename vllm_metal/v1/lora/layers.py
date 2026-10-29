@@ -9,7 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 if TYPE_CHECKING:
-    from .punica_wrapper import PunicaWrapperMLX
+    from .punica_wrapper import EncoderPunicaWrapperMLX, PunicaWrapperMLX
 
 
 def can_wrap(module: Any) -> bool:
@@ -71,9 +71,11 @@ class _LoRALinearBase(nn.Module):
         self.lora_b_stacked = mx.zeros((slots, output_size, max_lora_rank), dtype)
         # MLX tracks lists assigned through Module.__setattr__; ranks are metadata.
         object.__setattr__(self, "_lora_ranks", [0] * slots)
-        self.punica_wrapper: PunicaWrapperMLX | None = None
+        self.punica_wrapper: PunicaWrapperMLX | EncoderPunicaWrapperMLX | None = None
 
-    def set_mapping(self, punica_wrapper: PunicaWrapperMLX) -> None:
+    def set_mapping(
+        self, punica_wrapper: PunicaWrapperMLX | EncoderPunicaWrapperMLX
+    ) -> None:
         self.punica_wrapper = punica_wrapper
 
     @property

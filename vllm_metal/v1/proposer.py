@@ -24,6 +24,9 @@ from vllm.v1.outputs import DraftTokenIds
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
+    from vllm_metal.attention.caches.storage import KVCacheStorage
     from vllm_metal.v1.model_runner import (
         MetalModelRunner,
         PrefillRequest,
@@ -81,6 +84,13 @@ class ProposeContext:
     # against absence from request_states (which the new request repopulates
     # under the same id).
     finished_req_ids: set[str]
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
+    # Per-request cap on draft length for the NEXT step (req_id -> max
+    # drafts). Set for hybrid align-mode targets: a verify span must not
+    # cross a state-checkpoint block boundary, or the checkpoint left behind
+    # would hold a state at the wrong depth for prefix reuse. Proposers trim
+    # to the cap; None or missing means uncapped.
+    draft_caps: Mapping[str, int] | None = None
 
 
 class MetalProposer(Protocol):
@@ -108,8 +118,63 @@ class MetalProposer(Protocol):
         """
         ...
 
+    def kv_specs(self, block_size: int) -> dict[str, KVCacheSpec]:
+        """Scheduler-visible KV specs for layers the proposer owns beyond the
+        target model's (and the draft-model group cache_policy already adds).
 
-class Gemma4MTPProposer:
+        ``{}`` for proposers that draft over the target's own KV or hold no
+        KV at all — n-gram, draft-model, and in-model MTP all qualify; only a
+        proposer with dedicated scheduler-visible layers (DFlash/DSpark) reports
+        specs and is then bound via :meth:`bind_cache`.
+        """
+        ...
+
+    def bind_cache(
+        self,
+        storage: KVCacheStorage,
+        *,
+        group_index: int,
+        max_model_len: int,
+    ) -> None:
+        """Attach the scheduler-owned KV pool for the proposer's own layers.
+
+        Called only when :meth:`kv_specs` reported a non-empty set; no-op
+        otherwise.
+        """
+        ...
+
+    def profile_warmup(self, runner: MetalModelRunner, tokens: mx.array) -> None:
+        """Materialize the proposer's own allocations during memory profiling.
+
+        No-op for proposers whose memory is already covered by the target's
+        warmup; a proposer that builds extra buffers on first use (DFlash's
+        captured-feature projection and block drafting) realizes them here so
+        the profile sees them.
+        """
+        ...
+
+
+class NoOwnKVProposer:
+    """Defaults for proposers that own no scheduler-visible KV layers.
+
+    N-gram holds no KV, Gemma4 MTP shares the target's, and the draft-model
+    group comes from ``cache_policy._draft_layer_specs``. Inherit this instead
+    of restating the three no-op seam members.
+    """
+
+    def kv_specs(self, block_size: int) -> dict[str, KVCacheSpec]:
+        return {}
+
+    def bind_cache(
+        self, storage: KVCacheStorage, *, group_index: int, max_model_len: int
+    ) -> None:
+        pass
+
+    def profile_warmup(self, runner: MetalModelRunner, tokens: mx.array) -> None:
+        pass
+
+
+class Gemma4MTPProposer(NoOwnKVProposer):
     """:class:`MetalProposer` backed by the in-model Gemma4 MTP assistant.
 
     The assistant is read lazily from the runner: cache setup replaces it with

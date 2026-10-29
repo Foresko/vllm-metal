@@ -22,6 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 import torch
+from mlx.utils import tree_flatten
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 from vllm.v1.kv_cache_interface import (
@@ -142,11 +143,12 @@ def _make_inner(
     *,
     with_v_proj: bool = True,
     with_v_norm: bool = False,
+    dtype: mx.Dtype = mx.float32,
 ) -> SimpleNamespace:
     """Build a fake Attention module matching sdpa_forward's contract."""
-    q_weight = mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN))
-    k_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
-    v_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN))
+    q_weight = mx.ones((_N_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
+    k_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
+    v_weight = mx.ones((_N_KV_HEADS * _HEAD_DIM, _HIDDEN), dtype=dtype)
 
     inner = SimpleNamespace(
         n_heads=_N_HEADS,
@@ -365,6 +367,22 @@ class TestPrepareSDPAQKV:
 
         # Assert — without v_proj we expect values to share K's projection.
         # After transpose they must be element-equal (same weights, same x).
+        mx.eval(keys, values)
+        assert bool(mx.all(keys == values).item())
+
+    def test_k_eq_v_fallback_when_v_proj_is_none(self) -> None:
+        # Arrange — DiffusionGemma full-attention layers keep v_proj = None
+        inner = _make_inner(with_v_proj=False)
+        inner.v_proj = None
+        ctx = _make_ctx(_SEQ_LEN)
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN))
+
+        # Act
+        _, keys, values, _, _ = prepare_sdpa_qkv(
+            inner, x, ctx, _N_HEADS, _N_KV_HEADS, shared_kv=None
+        )
+
+        # Assert — a None v_proj takes the K-eq-V path instead of calling None
         mx.eval(keys, values)
         assert bool(mx.all(keys == values).item())
 
@@ -639,16 +657,38 @@ class TestPrepareSDPAQKV:
         assert kv_for_sharing == (expected_k, values)
 
 
+class _PagedOpsCapsOff:
+    """Baseline capability answer: a current build reporting no GQA features."""
+
+    def paged_attention_capabilities(self) -> dict[str, bool]:
+        return {
+            "gqa_decode": False,
+            "gqa_disable": False,
+            "decode_routing_metadata": False,
+        }
+
+
 class _PagedRoutingOpsSpy:
     def __init__(self, *, supports_mm_prefix: bool = True) -> None:
         self.calls: list[SimpleNamespace] = []
         self._supports_mm_prefix = supports_mm_prefix
+        self.length_plans: list[tuple[int, ...]] = []
 
     def supports_mm_prefix(self) -> bool:
         return self._supports_mm_prefix
 
-    def supports_decode_routing_metadata(self) -> bool:
-        return True
+    def paged_attention_capabilities(self) -> dict[str, bool]:
+        return {
+            "gqa_decode": True,
+            "gqa_disable": True,
+            "decode_routing_metadata": True,
+            "gqa_length_plan": True,
+        }
+
+    def gqa_decode_length_plan(self, lengths):
+        plan = tuple(lengths)
+        self.length_plans.append(plan)
+        return plan
 
     def reshape_and_cache(
         self,
@@ -680,25 +720,33 @@ class _PagedRoutingOpsSpy:
         block_size: int,
         _max_seq_len: int,
         _sliding_window: int,
-        _out: mx.array,
         window_seqlen_q: int = 1,
         sinks: mx.array | None = None,
         mm_prefix_ranges: mx.array | None = None,
-        num_decode_requests: int = 0,
+        num_decode_requests: int = -1,
         num_decode_tokens: int = 0,
         max_decode_context_len: int = 0,
-    ) -> None:
+        gqa_disabled: bool = False,
+        gqa_length_plan: object = None,
+        nax_split_hint: int = -1,
+        nax_prefill_split_hint: int = -1,
+    ) -> mx.array:
         del window_seqlen_q, sinks
         self.calls[-1].block_tables = block_tables.tolist()
         self.calls[-1].block_size = block_size
-        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_requests = num_decode_requests
+        self.calls[-1].gqa_disabled = gqa_disabled
+        self.calls[-1].mm_prefix_ranges = mm_prefix_ranges
         self.calls[-1].num_decode_tokens = num_decode_tokens
         self.calls[-1].max_decode_context_len = max_decode_context_len
+        self.calls[-1].gqa_length_plan = gqa_length_plan
+        self.calls[-1].nax_split_hint = nax_split_hint
+        self.calls[-1].nax_prefill_split_hint = nax_prefill_split_hint
+        return mx.zeros_like(_query)
 
 
-class _PreMmPrefixOps:
-    """Ops of a native build that predates mm_prefix: no probe, no keyword."""
+class _PreMmPrefixOps(_PagedOpsCapsOff):
+    """Old native signature: reports no new capability and rejects new keywords."""
 
     def __init__(self) -> None:
         self._spy = _PagedRoutingOpsSpy()
@@ -707,14 +755,53 @@ class _PreMmPrefixOps:
     def reshape_and_cache(self, *args):
         return self._spy.reshape_and_cache(*args)
 
-    def paged_attention_primitive(self, *args, window_seqlen_q=1, sinks=None):
-        self._spy.paged_attention_primitive(
-            *args, window_seqlen_q=window_seqlen_q, sinks=sinks
+    def paged_attention_primitive(
+        self,
+        *args,
+        window_seqlen_q=1,
+        sinks=None,
+        num_decode_requests=-1,
+    ):
+        return self._spy.paged_attention_primitive(
+            *args,
+            window_seqlen_q=window_seqlen_q,
+            sinks=sinks,
+            num_decode_requests=num_decode_requests,
         )
 
 
 class TestSDPAForward:
     """Tests for ``sdpa_forward`` runtime argument propagation."""
+
+    @pytest.mark.parametrize("cache_dtype", [mx.bfloat16, mx.float16])
+    def test_output_projection_receives_the_query_dtype(
+        self, cache_dtype: mx.Dtype
+    ) -> None:
+        """A float16 checkpoint with a bfloat16 cache must hand o_proj the
+        float16 query dtype: MLX promotes a bfloat16/float16 mix to a float32
+        residual stream."""
+        inner = _make_inner(dtype=mx.float16)
+        projected: list[mx.Dtype] = []
+
+        def o_proj(out: mx.array) -> mx.array:
+            projected.append(out.dtype)
+            return out
+
+        inner.o_proj = o_proj
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=cache_dtype,
+        )
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        with patch.object(sdpa_mod, "get_ops", return_value=_PagedRoutingOpsSpy()):
+            output, _ = sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert projected == [mx.float16]
+        assert output.dtype == mx.float16
 
     def test_deepseek_num_kv_heads_naming_reaches_kernel(self) -> None:
         """DeepSeek exposes ``num_kv_heads``, not ``num_key_value_heads``."""
@@ -741,7 +828,7 @@ class TestSDPAForward:
         )
         captured: dict[str, int | float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _keys,
@@ -761,9 +848,10 @@ class TestSDPAForward:
                 scale,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["num_kv_heads"] = num_kv_heads
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
@@ -787,6 +875,205 @@ class TestSDPAForward:
         assert values.shape == (1, 2, 2, 4)
         assert captured["num_kv_heads"] == 2
         assert captured["scale"] == 0.5
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    def test_gqa_policy_reaches_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, disabled: bool
+    ) -> None:
+        """The environment escape hatch and scheduler decode count reach native code."""
+        from vllm_metal import envs
+
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        read_env = MagicMock(
+            wraps=envs.environment_variables["VLLM_METAL_DISABLE_GQA_DECODE"]
+        )
+        monkeypatch.setitem(
+            envs.environment_variables, "VLLM_METAL_DISABLE_GQA_DECODE", read_env
+        )
+        spy = _PagedRoutingOpsSpy()
+        capability_query = MagicMock(wraps=spy.paged_attention_capabilities)
+        monkeypatch.setattr(spy, "paged_attention_capabilities", capability_query)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=1,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        ctx = _make_ctx(_SEQ_LEN)
+        ctx.num_decode_requests = 1
+        x = mx.ones((_BATCH, _SEQ_LEN, _HIDDEN), dtype=mx.float16)
+        zeros = mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM), dtype=mx.float16)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(not disabled)))
+            sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            assert spy.calls[-1].gqa_disabled is disabled
+            assert read_env.call_count == 1
+            assert capability_query.call_count == 1
+            next_ctx = _make_ctx(_SEQ_LEN)
+            next_ctx.num_decode_requests = 1
+            sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
+        assert read_env.call_count == 2
+        assert capability_query.call_count == 2
+        assert spy.calls[-1].gqa_disabled is not disabled
+        assert spy.calls[-1].num_decode_requests == 1
+
+    @pytest.mark.parametrize("disabled", [False, True])
+    @pytest.mark.parametrize("capability", ["none", "plan", "mixed_plan"])
+    @pytest.mark.parametrize("kind", ["decode", "mixed", "expanded_verify"])
+    def test_gqa_batch_metadata_is_only_forwarded_for_ordinary_decode(
+        self, monkeypatch, disabled, capability, kind
+    ) -> None:
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", str(int(disabled)))
+        if kind == "decode":
+            decode, prefill = [([[0]], 1), ([[1]], 3)], []
+        elif kind == "mixed":
+            decode = [([[0]], 1), ([[1]], 3)]
+            prefill = [([[2]], 1, 0)]
+        else:
+            decode, prefill = [([[0]], 1, 2), ([[1]], 3, 2)], []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        assert ctx is not None and ctx.num_decode_requests == 2
+        if kind == "mixed":
+            assert ctx.num_decode_tokens == 2 and len(ctx.context_lens) == 3
+        elif kind == "expanded_verify":
+            assert ctx.num_decode_tokens == 4
+        spy = _PagedRoutingOpsSpy()
+        query = MagicMock(
+            return_value={
+                "gqa_decode": True,
+                "gqa_disable": True,
+                "decode_routing_metadata": True,
+                "gqa_length_plan": capability in ("plan", "mixed_plan"),
+                "gqa_mixed_decode_plan": capability == "mixed_plan",
+            }
+        )
+        monkeypatch.setattr(spy, "paged_attention_capabilities", query)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        # Ordinary decode rows: the whole decode batch, or (with the mixed
+        # capability) the leading decode rows of a mixed batch.
+        planned = capability in ("plan", "mixed_plan")
+        eligible = not disabled and (
+            kind == "decode" or (kind == "mixed" and capability == "mixed_plan")
+        )
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for _layer in range(3):
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+            plan = spy.calls[-1].gqa_length_plan
+            assert plan == ((2, 4) if eligible and planned else None)
+            assert len(spy.length_plans) == int(eligible and planned)
+            query.assert_called_once_with()
+            if eligible and planned and kind == "decode":
+                # A new forward has new lengths and must not reuse the old plan.
+                prepare_grouped([([[1]], 4), ([[0]], 2)], [], (8,))
+                next_ctx = get_context()
+                sdpa_forward(inner, x, next_ctx, cache, layer_idx=0)
+                assert spy.length_plans == [(2, 4), (5, 3)]
+                assert spy.calls[-1].gqa_length_plan is not plan
+            if eligible and planned and kind == "mixed":
+                # Later forwards change decode membership, order and lengths;
+                # each plans only its own leading decode rows, once per forward.
+                forwards = [
+                    ([([[2]], 6), ([[0]], 2), ([[1]], 4)], [([[1]], 2, 0)], (7, 3, 5)),
+                    ([([[1]], 3)], [([[0]], 1, 0), ([[2]], 2, 1)], (4,)),
+                ]
+                expected = [(2, 4)]
+                for next_decode, next_prefill, next_plan in forwards:
+                    prepare_grouped(next_decode, next_prefill, (8,))
+                    next_ctx = get_context()
+                    tokens = len(next_ctx.slot_mapping)
+                    next_x = mx.ones((1, tokens, _HIDDEN), mx.float16)
+                    for _layer in range(2):
+                        sdpa_forward(inner, next_x, next_ctx, cache, layer_idx=0)
+                    expected.append(next_plan)
+                    assert spy.length_plans == expected
+                    assert spy.calls[-1].gqa_length_plan == next_plan
+                    assert spy.calls[-1].num_decode_requests == len(next_plan)
+
+    @pytest.mark.parametrize(
+        "supported,kind",
+        [
+            ("subset", "decode"),
+            ("subset", "prefill"),
+            ("subset", "mixed"),
+            ("subset", "expanded_verify"),
+            ("whole", "mixed"),
+            ("none", "mixed"),
+        ],
+    )
+    def test_nax_hints_follow_batch_shape_and_native_capabilities(
+        self, monkeypatch, supported, kind
+    ) -> None:
+        decode = [([[0] * 65], 511), ([[1] * 65], 511)] if kind != "prefill" else []
+        if kind == "expanded_verify":
+            decode = [([[0] * 65], 511, 2), ([[1] * 65], 511, 2)]
+        prefill = [([[2] * 32], 256, 0)] if kind != "decode" else []
+        prepare_grouped(decode, prefill, (8,))
+        ctx = get_context()
+        # Disabling GQA does not disable native mixed-batch separation.
+        ctx.gqa_disabled = True
+        spy = _PagedRoutingOpsSpy()
+        caps = {
+            **spy.paged_attention_capabilities(),
+            "nax_split_hint": supported != "none",
+            "nax_prefill_split_hint": supported == "subset",
+        }
+        monkeypatch.setattr(spy, "paged_attention_capabilities", lambda: caps)
+        work = MagicMock(wraps=sdpa_mod.nax_tile_work)
+        monkeypatch.setattr(sdpa_mod, "nax_tile_work", work)
+        inner = _make_inner()
+        inner.o_proj = lambda out: out
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=_N_KV_HEADS,
+            head_dim=_HEAD_DIM,
+            num_blocks=3,
+            block_size=8,
+            dtype=mx.float16,
+        )
+        total = len(ctx.slot_mapping)
+        x = mx.ones((1, total, _HIDDEN), mx.float16)
+        zeros = mx.zeros((1, total, _N_HEADS * _HEAD_DIM), mx.float16)
+        subset = supported == "subset" and kind == "mixed"
+        windows = (-1, 128, -1, 128) if subset else (-1,)
+        with (
+            patch.object(sdpa_mod, "get_ops", return_value=spy),
+            patch.object(sdpa_mod, "truncate_padded_output", return_value=zeros),
+        ):
+            for window in windows:
+                cache.sliding_window_per_layer[0] = window
+                sdpa_forward(inner, x, ctx, cache, layer_idx=0)
+        forwarded = supported != "none" and kind != "decode"
+        # The full prefill blocks split on their own; decode partial tiles
+        # keep the whole mixed batch unsplit, including at window 128.
+        whole_hint = int(kind == "prefill")
+        assert spy.calls[-1].nax_split_hint == (whole_hint if forwarded else -1)
+        assert spy.calls[-1].nax_prefill_split_hint == (1 if subset else -1)
+        # Matching layers reuse each whole/subset plan for their window.
+        assert work.call_count == len(set(windows)) * (int(forwarded) + int(subset))
 
     def test_mixed_batch_routes_slots_and_page_tables_by_layer_group(self) -> None:
         """Full and sliding layers consume their scheduler-group metadata."""
@@ -915,7 +1202,7 @@ class TestSDPAForward:
 
         captured: dict[str, int | float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -935,9 +1222,10 @@ class TestSDPAForward:
                 scale,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["num_kv_heads"] = num_kv_heads
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -998,7 +1286,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, object] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -1019,9 +1307,10 @@ class TestSDPAForward:
                 *_args,
                 sinks=None,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["scale"] = scale
                 captured["sinks"] = sinks
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1043,6 +1332,46 @@ class TestSDPAForward:
         assert isinstance(sinks, mx.array)
         assert sinks.dtype == mx.float32
 
+        # The widened tensor is memoized off the module, so a later forward
+        # hands the kernel the same float32 array while the parameter keeps
+        # its checkpoint dtype.
+        first_sinks = sinks
+        with (
+            patch.object(
+                sdpa_mod,
+                "prepare_sdpa_qkv",
+                return_value=(queries, keys, values, None, (keys, values)),
+            ),
+            patch.object(sdpa_mod, "get_ops", return_value=_FakeOps()),
+            patch.object(
+                sdpa_mod,
+                "truncate_padded_output",
+                return_value=mx.zeros((_BATCH, _SEQ_LEN, _N_HEADS * _HEAD_DIM)),
+            ),
+        ):
+            sdpa_forward(inner, x, _make_ctx(_SEQ_LEN), cache, layer_idx=0)
+
+        assert inner.sinks is fp16_sinks
+        assert captured["sinks"] is first_sinks
+
+    def test_float32_sinks_cache_stays_off_the_parameter_tree(self) -> None:
+        class _Attention(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.sinks = mx.arange(_N_HEADS, dtype=mx.bfloat16)
+
+        inner = _Attention()
+        first = sdpa_mod._float32_sinks(inner)
+
+        assert first is not None and first.dtype == mx.float32
+        assert sdpa_mod._float32_sinks(inner) is first
+        parameters = dict(tree_flatten(inner.parameters()))
+        assert parameters.keys() == {"sinks"}
+        assert parameters["sinks"].dtype == mx.bfloat16
+
+        inner.sinks = mx.zeros((_N_HEADS,), dtype=mx.bfloat16)
+        assert sdpa_mod._float32_sinks(inner) is not first
+
     def _run_capturing_softcap(self, inner: SimpleNamespace) -> float:
         """Drive ``sdpa_forward`` and return the softcap the kernel received."""
         cache = MetalPagedKVCache(
@@ -1060,7 +1389,7 @@ class TestSDPAForward:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self,
                 _key,
@@ -1081,8 +1410,9 @@ class TestSDPAForward:
                 softcap,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["softcap"] = softcap
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1153,7 +1483,7 @@ class TestSDPAForward:
         shared_v = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, mx.array] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def paged_attention_primitive(
                 self,
                 _query,
@@ -1161,9 +1491,10 @@ class TestSDPAForward:
                 value_cache,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["key_cache"] = key_cache
                 captured["value_cache"] = value_cache
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1213,7 +1544,7 @@ class TestSDPAForward:
         values = mx.zeros((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, mx.array] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def paged_attention_primitive(
                 self,
                 _query,
@@ -1221,9 +1552,10 @@ class TestSDPAForward:
                 value_cache,
                 *_args,
                 **_kwargs,
-            ) -> None:
+            ) -> mx.array:
                 captured["key_cache"] = key_cache
                 captured["value_cache"] = value_cache
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1295,6 +1627,7 @@ class TestBidirectionalDispatch:
         repeat: int = 1,
         dtype: mx.Dtype = mx.float16,
         ops: object | None = None,
+        window_at_block_start: bool = False,
     ):
         cache = self._cache(dtype)
         # One decode row (17 cached tokens) and a 2-row prefill at positions 0..1.
@@ -1303,6 +1636,7 @@ class TestBidirectionalDispatch:
         assert ctx is not None
         ctx.segment_bidi_ranges = ranges
         ctx.bidi_layer_kinds = kinds
+        ctx.bidi_window_at_block_start = window_at_block_start
         inner = SimpleNamespace(
             n_heads=_N_HEADS,
             n_kv_heads=_N_KV_HEADS,
@@ -1373,6 +1707,19 @@ class TestBidirectionalDispatch:
         _, spy, _ = self._run(frozenset({"full"}), ranges, 1)
         assert spy.calls[-1].mm_prefix_ranges is None
 
+    def test_block_anchored_window_recomputes_sliding_layers_only(self) -> None:
+        """DiffusionGemma's canvas: the kernel windows per row, so sliding
+        layers recompute; full layers have no window and keep the kernel."""
+        kinds, ranges = frozenset({"sliding", "full"}), [None, [(0, 2)]]
+        bidi, spy, ctx = self._run(kinds, ranges, 1, window_at_block_start=True)
+        assert bidi.call_count == 1
+        assert bidi.call_args.kwargs["window"] == 1024
+        assert spy.calls[-1].mm_prefix_ranges is None
+        assert ctx.mm_prefix_rows_built is False
+        bidi, spy, _ = self._run(kinds, ranges, 0, window_at_block_start=True)
+        assert bidi.call_count == 0
+        assert spy.calls[-1].mm_prefix_ranges.tolist() == [[-1, -1], [0, 1], [0, 1]]
+
     def test_float32_cache_falls_back_to_recompute(self) -> None:
         """The tiled kernel has no float32 instantiation (the recompute path)."""
         bidi, spy, ctx = self._run(
@@ -1389,12 +1736,36 @@ class TestBidirectionalDispatch:
         assert bidi.call_count == 1
         assert spy.calls[-1].mm_prefix_ranges is None
 
-    def test_ops_predating_mm_prefix_serve_the_recompute(self) -> None:
+    @pytest.mark.parametrize("disable_env", [None, "0", "1"])
+    def test_ops_predating_mm_prefix_serve_the_recompute(
+        self, monkeypatch, disable_env
+    ) -> None:
         # No probe and no keyword: the image rows still reach the recompute.
-        bidi, _, _ = self._run(
+        if disable_env is None:
+            monkeypatch.delenv("VLLM_METAL_DISABLE_GQA_DECODE", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", disable_env)
+        bidi, spy, _ = self._run(
             frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=_PreMmPrefixOps()
         )
         assert bidi.call_count == 1
+        assert spy.calls[-1].gqa_disabled is False
+
+    def test_unknown_gqa_native_cannot_silently_ignore_disable(self, monkeypatch):
+        monkeypatch.setenv("VLLM_METAL_DISABLE_GQA_DECODE", "1")
+        ops = _PreMmPrefixOps()
+        # A GQA build without disable support must fail, not drop the switch.
+        monkeypatch.setattr(
+            ops,
+            "paged_attention_capabilities",
+            lambda: {
+                "gqa_decode": True,
+                "gqa_disable": False,
+                "decode_routing_metadata": False,
+            },
+        )
+        with pytest.raises(RuntimeError, match="rebuild.*native extension"):
+            self._run(frozenset({"sliding"}), [None, [(0, 2)]], 1, ops=ops)
 
     def test_unknown_path_value_raises(self) -> None:
         with pytest.raises(ValueError, match="VLLM_METAL_MM_PREFIX_PATH"):
@@ -1535,7 +1906,7 @@ class TestPhiAttention:
 
         captured: dict[str, float] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(
                 self, _key, _value, key_cache, value_cache, _slot_mapping
             ):
@@ -1545,6 +1916,7 @@ class TestPhiAttention:
                 self, _query, _key_cache, _value_cache, _num_kv_heads, scale, *_a, **_k
             ):
                 captured["scale"] = scale
+                return mx.zeros_like(_query)
 
         with (
             patch.object(
@@ -1610,7 +1982,7 @@ class TestNarrowHeadKernelRead:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, object] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(self, key, _value, key_cache, value_cache, _slots):
                 captured["scatter_width"] = int(key.shape[-1])
                 return key_cache, value_cache
@@ -1672,7 +2044,7 @@ class TestNarrowHeadKernelRead:
         values = mx.ones((_BATCH, _N_KV_HEADS, _SEQ_LEN, _HEAD_DIM))
         captured: dict[str, int] = {}
 
-        class _FakeOps:
+        class _FakeOps(_PagedOpsCapsOff):
             def reshape_and_cache(self, key, _value, key_cache, value_cache, _slots):
                 captured["scatter_width"] = int(key.shape[-1])
                 return key_cache, value_cache

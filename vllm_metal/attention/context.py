@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 from mlx_lm.models.base import create_causal_mask
 
+from vllm_metal import envs
+
 if TYPE_CHECKING:
     from vllm_metal.attention.impls.mla import MLAForwardMetadata
 
@@ -98,6 +100,13 @@ class PagedAttentionContext:
     segment_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
     # Layer kinds ("sliding", "full") on which the ranges apply; empty = never.
     bidi_layer_kinds: frozenset[str] = frozenset()
+    # Anchor the sliding window at each block's first position rather than at
+    # each query row: every row of a block sees the same ``window - 1`` keys
+    # before the block plus the whole block (DiffusionGemma's decoder canvas).
+    # ``False`` keeps Gemma 4 vision's per-row ``(causal OR block) AND window``.
+    # The tiled kernel only applies the per-row rule, so sliding layers take
+    # the recompute path when this is set.
+    bidi_window_at_block_start: bool = False
     # Set by the first layer that handled image-block rows this forward
     # (either path), so the info line is emitted once per forward.
     bidi_logged: bool = False
@@ -121,6 +130,8 @@ class PagedAttentionContext:
     # ``slot_mapping`` / ``block_tables`` above mirror group zero for the
     # legacy single-group path.
     kv_groups: tuple[PagedKVGroupContext, ...] | None = None
+    # Fixed at worker startup and deducted before scheduler KV allocation.
+    tq_prefill_workspace_bytes: int = 0
     # Kernel-format metadata memo, keyed by (KV group index, cache block
     # size).  The context lives for exactly one forward pass, so entries
     # never go stale; every layer of a group reuses the first layer's
@@ -132,6 +143,21 @@ class PagedAttentionContext:
     # MLA kernel-format metadata memo (``impls.mla.MLAForwardMetadata``);
     # same one-forward lifetime as ``kernel_metadata_cache``.
     mla_metadata: MLAForwardMetadata | None = None
+    # Snapshot once per forward, rather than reading the environment in every
+    # layer. A subsequent forward sees updates to the operational kill switch.
+    gqa_disabled: bool = field(
+        default_factory=lambda: envs.VLLM_METAL_DISABLE_GQA_DECODE
+    )
+    # Public native ABI capabilities, queried once for this forward's layers.
+    paged_native_capabilities: dict[str, bool] | None = None
+    # Immutable native length statistics, shared by all KV groups/layers.
+    gqa_length_plan: Any = None
+    # NAX tile counts keyed by (sliding window, first sequence), so whole
+    # batches and prefill subsets are shared only by matching layers.
+    nax_tile_work: Any = None
+    # Per-row Llama 4 query scale memo keyed by (beta, original_max); every
+    # scaled layer of this forward shares it (``impls.sdpa.llama4_query_scale``).
+    llama4_query_scales: dict[tuple[float, int], Any] = field(default_factory=dict)
 
 
 def set_context(ctx: PagedAttentionContext) -> None:
@@ -200,6 +226,8 @@ def prepare_grouped(
     prefill_requests: Sequence[tuple[Sequence[Sequence[int]], int, int]],
     block_sizes: Sequence[int],
     merge_verify_windows: bool = False,
+    *,
+    tq_prefill_workspace_bytes: int = 0,
 ) -> None:
     """Compute metadata for every scheduler KV-cache group in one forward pass.
 
@@ -228,6 +256,8 @@ def prepare_grouped(
             hybrids admit only one-row decode segments, and heads past
             PA_WINDOW_MAX_HEAD_SIZE would leave the decode kernel for
             the tiled one.
+        tq_prefill_workspace_bytes: allowance already reserved by the worker
+            before KV allocation. Defaults to zero, disabling materialization.
     """
     group_slot_mappings: list[list[int]] = [[] for _ in block_sizes]
     group_block_tables: list[list[list[int]]] = [[] for _ in block_sizes]
@@ -319,6 +349,7 @@ def prepare_grouped(
             # or NAX on M5), never the verification-window kernel.
             verify_window_q=1 if prefill_requests else max_decode_window,
             kv_groups=kv_groups,
+            tq_prefill_workspace_bytes=tq_prefill_workspace_bytes,
         )
     )
 
@@ -329,6 +360,7 @@ def prepare_unified(
     block_size: int,
     *,
     merge_verify_windows: bool = False,
+    tq_prefill_workspace_bytes: int = 0,
 ) -> None:
     """Prepare one legacy KV-cache group through :func:`prepare_grouped`."""
     grouped_decode: list[
@@ -351,4 +383,5 @@ def prepare_unified(
         grouped_prefill,
         (block_size,),
         merge_verify_windows=merge_verify_windows,
+        tq_prefill_workspace_bytes=tq_prefill_workspace_bytes,
     )

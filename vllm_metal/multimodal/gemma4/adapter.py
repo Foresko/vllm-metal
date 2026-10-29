@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gemma 4 multimodal adapter: vision sidecar on the mlx_lm text backbone.
+"""Gemma 4 multimodal adapter: encoder sidecar on the mlx_lm text backbone.
 
 The language model is the mlx_lm ``gemma4.Model`` that vllm-metal serves
-for text; ``vision_tower`` and ``embed_vision`` come from
-:class:`Gemma4VisionSidecar`.  mlx_lm multiplies ``input_embeddings`` by
-``embed_scale`` inside its forward, so this adapter hands the runner *raw*
-token embeddings and image features pre-divided by that scale: after the
-model's multiplication the text carries its usual scale and the image rows
-are back at the values ``embed_vision`` produced, exactly like
-``mlx_vlm.Model.get_input_embeddings``.
+for text; ``vision_tower`` and ``embed_vision`` (plus ``audio_tower`` and
+``embed_audio`` on E2B/E4B) come from :class:`Gemma4VisionSidecar`.  Video
+frames are images to the same vision tower, as in vLLM and HF.  mlx_lm
+multiplies ``input_embeddings`` by ``embed_scale`` inside its forward, so this
+adapter hands the runner *raw* token embeddings and image/video/audio features
+pre-divided by that scale: after the model's multiplication the text carries
+its usual scale and the encoder rows are back at the values the embedders
+produced, exactly like ``mlx_vlm.Model.get_input_embeddings``.
 """
 
 from __future__ import annotations
@@ -26,7 +27,11 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.gemma4.sidecar import Gemma4VisionSidecar
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.multimodal.text_backbone import (
+    resolve_backbone_embed_tokens,
+    resolve_text_backbone,
+)
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 logger = init_logger(__name__)
 
@@ -42,7 +47,7 @@ def _factor_near_sqrt(n: int) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class Gemma4VisionEncodeResult:
-    """Projected image embeddings for one feature, pre-divided by embed_scale."""
+    """Projected image/video/audio embeddings for one feature, pre-divided by embed_scale."""
 
     hidden_states: mx.array
     deepstack_visual_embeds: Sequence[mx.array] | None = None
@@ -83,6 +88,9 @@ class Gemma4MultimodalAdapter:
         self._embed_scale_rounded = float(
             mx.array(float(backbone.embed_scale), dtype=embed_dtype).item()
         )
+        self._pad_token_id = int(
+            getattr(getattr(backbone, "config", None), "pad_token_id", 0) or 0
+        )
 
     @classmethod
     def from_loaded(
@@ -111,18 +119,8 @@ class Gemma4MultimodalAdapter:
                 f"{bidirectional_attention!r} is not supported (only 'vision' or None)"
             )
         language_model = getattr(text_model, "language_model", None)
-        backbone = getattr(language_model, "model", None)
-        if backbone is None:
-            raise RuntimeError(
-                "text_model.language_model.model missing; expected the mlx_lm "
-                "Gemma4TextModel (mlx-lm version drift detected)."
-            )
-        embed_tokens = getattr(backbone, "embed_tokens", None)
-        if embed_tokens is None or not callable(embed_tokens):
-            raise RuntimeError(
-                "Gemma4TextModel.embed_tokens missing or not callable; "
-                "mlx-lm version drift detected."
-            )
+        backbone = resolve_text_backbone(language_model, owner="mlx-lm")
+        embed_tokens = resolve_backbone_embed_tokens(backbone, owner="mlx-lm")
         if not hasattr(backbone, "embed_scale"):
             raise RuntimeError(
                 "Gemma4TextModel.embed_scale missing; mlx-lm version drift detected."
@@ -152,35 +150,87 @@ class Gemma4MultimodalAdapter:
     ) -> list[Gemma4VisionEncodeResult]:
         outputs: list[Gemma4VisionEncodeResult] = []
         for feature in features:
-            self._validate_image_feature(feature, require_data=True)
+            self._validate_feature(feature, require_data=True)
             assert feature.data is not None
-            # Encode at the tower's own dtype instead of passing the
-            # processor's float32 array straight through the way mlx-vlm
-            # does: the tower runs in its weight dtype either way, so the
-            # wider input is dropped at the first projection, and for the
-            # [0, 1] pixels the processor derives from uint8 the cast costs
-            # at most half a source quantum.
-            pixel_values = self._as_mlx(feature.data["pixel_values"].data).astype(
-                self._sidecar.pixel_dtype
-            )
-            pixel_position_ids = self._as_mlx(feature.data["pixel_position_ids"].data)
-            projected = self._sidecar.embed_vision(
-                self._sidecar.vision_tower(pixel_values, pixel_position_ids)
-            )
+            if feature.modality == "audio":
+                projected = self._encode_audio(feature.data)
+            elif feature.modality == "video":
+                projected = self._encode_video(feature.data)
+            else:
+                projected = self._encode_image(feature.data)
             if projected.ndim == 3:
                 projected = projected[0]
             expected = feature.mm_position.get_num_embeds()
+            if feature.modality == "audio" and int(projected.shape[0]) > expected:
+                # vLLM's processor caps a clip's placeholders at the model's
+                # longest audio (30 s) and only warns; like vLLM's GPU runner,
+                # keep the first rows of a longer clip.
+                projected = projected[:expected]
             if int(projected.shape[0]) != expected:
                 raise ValueError(
-                    f"Feature {feature.identifier!r}: vision tower produced "
-                    f"{int(projected.shape[0])} rows for {expected} placeholder "
-                    "embeddings; processor and pooler disagree on this image."
+                    f"Feature {feature.identifier!r}: {feature.modality} tower "
+                    f"produced {int(projected.shape[0])} rows for {expected} "
+                    "placeholder embeddings; the processor and the encoder "
+                    f"disagree on this {feature.modality}."
                 )
             scaled = (projected.astype(mx.float32) / self._embed_scale_rounded).astype(
                 self._embed_dtype
             )
             outputs.append(Gemma4VisionEncodeResult(hidden_states=scaled))
         return outputs
+
+    def _encode_image(self, data: MultiModalKwargsItem) -> mx.array:
+        # Encode at the tower's own dtype instead of passing the processor's
+        # float32 array straight through the way mlx-vlm does: the tower runs
+        # in its weight dtype either way, so the wider input is dropped at the
+        # first projection, and for the [0, 1] pixels the processor derives
+        # from uint8 the cast costs at most half a source quantum.
+        pixel_values = self._as_mlx(data["pixel_values"].data).astype(
+            self._sidecar.pixel_dtype
+        )
+        pixel_position_ids = self._as_mlx(data["pixel_position_ids"].data)
+        return self._sidecar.embed_vision(
+            self._sidecar.vision_tower(pixel_values, pixel_position_ids)
+        )
+
+    def _encode_video(self, data: MultiModalKwargsItem) -> mx.array:
+        """Encode a video's frames through the image tower, a few at a time.
+
+        vLLM stores one video as ``(frames, patches, patch_dim)`` pixels with
+        ``-1`` position ids on padding patches; mlx-vlm's tower drops those
+        and returns ``(1, valid_rows, D)`` across the frames it is given, in
+        frame order.  The frames go in as the processor's float32, like
+        mlx-vlm: on 70-token frames that keeps the rows within a few bf16
+        ulps of mlx-vlm, while a cast to the tower dtype moves rows by up to
+        a third of their range.  A float32 patch costs the tower about twice
+        the activation memory of the bf16 image :meth:`profile_features`
+        profiles, so each chunk holds at most half of ``max_patches`` (two
+        70-token frames) and is evaluated before the next one; a 32-frame
+        video then peaks below the profiled image encode.
+        """
+        pixel_values = self._as_mlx(data["pixel_values_videos"].data)
+        pixel_position_ids = self._as_mlx(data["pixel_position_ids_videos"].data)
+        tower = self._sidecar.vision_tower
+        frames, patches = int(pixel_values.shape[0]), int(pixel_values.shape[1])
+        per_chunk = max(1, int(tower.max_patches) // (2 * max(patches, 1)))
+        rows: list[mx.array] = []
+        for start in range(0, frames, per_chunk):
+            end = min(start + per_chunk, frames)
+            chunk = self._sidecar.embed_vision(
+                tower(pixel_values[start:end], pixel_position_ids[start:end])
+            )
+            mx.eval(chunk)
+            rows.append(chunk[0] if chunk.ndim == 3 else chunk)
+        return mx.concatenate(rows, axis=0)
+
+    def _encode_audio(self, data: MultiModalKwargsItem) -> mx.array:
+        # vLLM's processor stores each clip unpadded with a True-is-valid
+        # mask; the mlx-vlm encoder takes True-is-padding.  The mel features
+        # go in as the processor's float32, like mlx-vlm.
+        mel = self._as_mlx(data["input_features_padded"].data)[None]
+        valid = self._as_mlx(data["input_features_mask"].data).astype(mx.bool_)[None]
+        encodings, _ = self._sidecar.audio_tower(mel, ~valid)
+        return self._sidecar.embed_audio(encodings)
 
     def get_mrope_input_positions(
         self,
@@ -189,7 +239,7 @@ class Gemma4MultimodalAdapter:
     ) -> tuple[mx.array, int]:
         """Plain sequential positions, broadcast to the ``(3, 1, L)`` M-RoPE shape."""
         for feature in mm_features:
-            self._validate_image_feature(feature, require_data=False)
+            self._validate_feature(feature, require_data=False)
         seq_len = len(input_tokens)
         if seq_len == 0:
             return mx.zeros((3, 1, 0), dtype=mx.int32), 0
@@ -208,16 +258,46 @@ class Gemma4MultimodalAdapter:
     ) -> Any:
         """Run the mlx_lm model on runner-built embeddings.
 
-        ``position_ids`` and ``visual_pos_masks`` are unused: RoPE comes from
-        the paged context and Gemma 4 has no deepstack residuals.
+        ``position_ids`` is unused: RoPE comes from the paged context.
         """
+        del position_ids
+        input_ids = self._lm_input_ids(
+            input_ids, visual_pos_masks, deepstack_visual_embeds
+        )
+        return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
+
+    def call_lm_hidden_states(
+        self,
+        input_ids: mx.array,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> mx.array:
+        """:meth:`call_lm` without the output head: the backbone's final hidden states."""
+        del position_ids
+        input_ids = self._lm_input_ids(
+            input_ids, visual_pos_masks, deepstack_visual_embeds
+        )
+        return self._backbone(input_ids, cache=cache, input_embeddings=inputs_embeds)
+
+    def _lm_input_ids(
+        self,
+        input_ids: mx.array,
+        visual_pos_masks: Any | None,
+        deepstack_visual_embeds: Any | None,
+    ) -> mx.array:
         if deepstack_visual_embeds is not None:
             raise RuntimeError(
                 "Gemma 4 has no deepstack residuals; refusing to drop "
                 "deepstack_visual_embeds silently."
             )
-        del position_ids, visual_pos_masks
-        return self._text_model(input_ids, cache=cache, input_embeddings=inputs_embeds)
+        if visual_pos_masks is None:
+            return input_ids
+        # HF looks up per-layer inputs (E2B/E4B) with pad ids at image positions.
+        return mx.where(visual_pos_masks, self._pad_token_id, input_ids)
 
     def profile_features(self) -> list[MultiModalFeatureSpec]:
         """One maximal image feature for ``profile_run``, sized from the loaded tower.
@@ -270,19 +350,21 @@ class Gemma4MultimodalAdapter:
             )
         ]
 
-    @staticmethod
-    def _validate_image_feature(
-        feature: MultiModalFeatureSpec, *, require_data: bool
+    def _validate_feature(
+        self, feature: MultiModalFeatureSpec, *, require_data: bool
     ) -> None:
-        if feature.modality != "image":
+        has_audio = self._sidecar.audio_tower is not None
+        supported = ("image", "video", "audio") if has_audio else ("image", "video")
+        if feature.modality not in supported:
             raise ValueError(
-                f"Feature {feature.identifier!r}: Gemma 4 adapter only supports "
-                f"image features; got modality={feature.modality!r}."
+                f"Feature {feature.identifier!r}: Gemma 4 adapter supports "
+                f"{', '.join(supported)} features on this checkpoint; got "
+                f"modality={feature.modality!r}."
             )
         if require_data and feature.data is None:
             raise ValueError(
                 f"Feature {feature.identifier!r}: feature.data is required for "
-                "vision encoding."
+                f"{feature.modality} encoding."
             )
 
     @staticmethod

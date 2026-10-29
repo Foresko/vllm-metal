@@ -455,6 +455,7 @@ def _gemma4_text_fast_prefill_call(
         offsets=meta.offsets,
         cu_seqlens=meta.cu_seqlens,
         kv_groups=reduced_kv_groups,
+        tq_prefill_workspace_bytes=ctx.tq_prefill_workspace_bytes,
     )
 
     set_context(reduced_ctx)

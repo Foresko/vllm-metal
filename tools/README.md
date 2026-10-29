@@ -95,3 +95,24 @@ vllm bench serve --backend vllm --base-url http://127.0.0.1:8000 \
   --num-prompts 100 --request-rate 10 --max-concurrency 32 \
   --temperature 0 --top-p 1.0 --top-k -1 --ignore-eos --seed 0
 ```
+
+## DiffusionGemma serving benchmark
+
+`diffusion_bench.py` times whole requests against a running DiffusionGemma
+server and reports median and max latency and aggregate completion tokens/s.
+Use it instead of the server's periodic "Avg prompt/generation throughput" log
+lines, which average over a 10 s window and make a single short request look
+slow. Each prompt gets an untimed warmup first, which absorbs MLX kernel
+compilation and lazy weight loading.
+
+```bash
+PYTHONPATH=$PWD vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --diffusion-config '{"canvas_length": 32}'
+
+python tools/diffusion_bench.py
+python tools/diffusion_bench.py --concurrency 1 4 --repeats 3 --json bench.json
+```
+
+Tokens/s depends on how much of each 32-token canvas the answer uses: a short
+reply still costs a full canvas, so compare the `long` prompt across runs, not
+`short`.

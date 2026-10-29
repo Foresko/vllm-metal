@@ -29,7 +29,6 @@ interpreter.  Required on Metal because:
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 
 import pytest
@@ -121,13 +120,5 @@ def _run_prefix_cache_correctness() -> None:
 
 
 @pytest.mark.slow
-def test_prefix_cache_hit_path_correctness() -> None:
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_run_prefix_cache_correctness)
-    proc.start()
-    proc.join()
-    if proc.exitcode != 0:
-        raise AssertionError(
-            f"Prefix-cache e2e test failed in spawned child "
-            f"(exit code: {proc.exitcode})"
-        )
+def test_prefix_cache_hit_path_correctness(run_in_spawn_process) -> None:
+    run_in_spawn_process(_run_prefix_cache_correctness)

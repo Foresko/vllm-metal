@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compare greedy paged serving with the environment's native mlx-lm.
+"""Compare greedy serving with mlx-lm.
 
-Generate one native reference, then reuse one HTTP server for individual
-and batched prompt requests. Both backends use the same checkpoint and input IDs.
+Generate one native reference, then compare individual and batched requests.
+Speculative modes observe target verification in isolated engine workers;
+ordinary parity uses HTTP serving. Both use the same checkpoint and input IDs.
 See docs/tools.md or --help for usage.
 """
 
@@ -20,17 +21,24 @@ import tempfile
 import time
 import urllib.request
 from contextlib import contextmanager, redirect_stdout, suppress
-from itertools import zip_longest
 from pathlib import Path
 
 if __package__:
     from .parity_prompts import PROMPTS
+    from .parity_utils import compare_results as compare_results
+    from .parity_utils import parity_report
 else:
     from parity_prompts import PROMPTS
+    from parity_utils import compare_results as compare_results
+    from parity_utils import parity_report
 
 
 def mlx_generate(
-    model_path: str, prompts: list[str], max_tokens: int, top_k: int | None = None
+    model_path: str,
+    prompts: list[str],
+    max_tokens: int,
+    top_k: int | None = None,
+    trust_remote_code: bool = False,
 ) -> list[dict]:
     import mlx.core as mx
     import numpy as np
@@ -38,10 +46,17 @@ def mlx_generate(
     from mlx_lm.generate import generate_step
     from mlx_lm.sample_utils import make_sampler
 
-    from vllm_metal.compat import _patch_transformers_exaone4_config
+    from vllm_metal.compat import (
+        _patch_mlx_lm_minicpm4_model_type,
+        _patch_transformers_exaone4_config,
+    )
 
     _patch_transformers_exaone4_config()
-    model, tokenizer = load(model_path)
+    _patch_mlx_lm_minicpm4_model_type()
+    # Mirror the server, which passes the setting to the tokenizer only.
+    model, tokenizer = load(
+        model_path, tokenizer_config={"trust_remote_code": trust_remote_code}
+    )
     results = []
     for prompt in prompts:
         input_ids = tokenizer.encode(prompt)
@@ -90,6 +105,8 @@ def serving(
     gpu_memory_utilization: float,
     log_path: Path,
     env: dict,
+    additional_config: str | None = None,
+    trust_remote_code: bool = False,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -117,7 +134,9 @@ def serving(
                 "--no-enable-prefix-caching",
                 "--generation-config",
                 "vllm",
-            ],
+            ]
+            + (["--trust-remote-code"] if trust_remote_code else [])
+            + (["--additional-config", additional_config] if additional_config else []),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -158,6 +177,8 @@ def check_parity(
     batch_sizes: tuple[int, ...] = (1, 2),
     output_dir: Path | None = None,
     gpu_memory_utilization: float = 0.65,
+    additional_config: str | None = None,
+    trust_remote_code: bool = False,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -175,6 +196,8 @@ def check_parity(
         model = snapshot_download(model)
     model = str(Path(model).resolve())
     env = os.environ.copy()
+    if env.get("VLLM_METAL_BACKEND", "mlx") == "mps":
+        env["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         filter(None, [str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")])
     )
@@ -182,7 +205,7 @@ def check_parity(
     env.setdefault("GLOO_SOCKET_IFNAME", "lo0")
     reference_path = output_dir / "reference.json"
     reference_path.write_text(json.dumps(prompts))
-    print("Generating native MLX reference...", flush=True)
+    print("Generating native mlx-lm reference...", flush=True)
     with (output_dir / "reference.log").open("w") as log:
         subprocess.run(
             [
@@ -195,7 +218,8 @@ def check_parity(
                 "--generate-reference",
                 str(reference_path),
             ]
-            + (["--top-k", str(top_k)] if top_k is not None else []),
+            + (["--top-k", str(top_k)] if top_k is not None else [])
+            + (["--trust-remote-code"] if trust_remote_code else []),
             check=True,
             env=env,
             stdout=log,
@@ -212,24 +236,27 @@ def check_parity(
         gpu_memory_utilization,
         output_dir / "serve.log",
         env,
+        additional_config,
+        trust_remote_code,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
             outputs = http_generate(base_url, model, reference, max_tokens, top_k, size)
             log_path = output_dir / f"batch-{size}.log"
             with log_path.open("w") as log, redirect_stdout(log):
-                matched = compare_results(
+                comparison = parity_report(
                     reference, outputs, max_tokens=max_tokens, top_k=top_k
                 )
             report = log_path.read_text()
             print(report, end="")
-            counts = [
-                sum(line.startswith(status + " ") for line in report.splitlines())
-                for status in ("EXACT", "TOP_K_MATCH", "FAIL")
-            ]
+            counts = comparison["counts"]
+            matched = comparison["passed"]
+            (output_dir / f"batch-{size}.json").write_text(
+                json.dumps({"outputs": outputs, "comparison": comparison}, indent=2)
+            )
             with summary.open("a") as output:
                 print(
-                    f"| {size} | {counts[0]} | {counts[1]} | {counts[2]} | {int(not matched)} |",
+                    f"| {size} | {counts['EXACT']} | {counts['TOP_K_MATCH']} | {counts['FAIL']} | {int(not matched)} |",
                     file=output,
                 )
             passed &= matched
@@ -315,73 +342,11 @@ def http_result(choice: dict, top_k: int | None) -> dict:
     return {"tokens": tokens, "text": choice["text"], "top_logprobs": top_logprobs}
 
 
-def compare_results(
-    reference: list[dict],
-    outputs: list[dict],
-    *,
-    max_tokens: int,
-    top_k: int | None = None,
-) -> bool:
-    """Compare exact tokens or mutual top-k membership at the first divergence."""
-    passed = True
-    for ref, got in zip(reference, outputs, strict=True):
-        mismatch = next(
-            (
-                i
-                for i, (a, b) in enumerate(zip_longest(ref["tokens"], got["tokens"]))
-                if a != b
-            ),
-            None,
-        )
-        complete = len(ref["tokens"]) == len(got["tokens"]) == max_tokens
-        exact = complete and mismatch is None
-        compatible = False
-        if complete and mismatch is not None and top_k is not None:
-            # vLLM can include the sampled token outside its requested top-k.
-            ref_top, got_top = (
-                {
-                    c["id"]: c
-                    for c in row["top_logprobs"][mismatch]
-                    if c["rank"] is not None and c["rank"] <= top_k
-                }
-                for row in (ref, got)
-            )
-            ref_token, got_token = ref["tokens"][mismatch], got["tokens"][mismatch]
-            compatible = ref_token in got_top and got_token in ref_top
-        passed &= exact or compatible
-        status = "EXACT" if exact else "TOP_K_MATCH" if compatible else "FAIL"
-        print(f"{status} {ref['prompt']!r}")
-        if not exact:
-            if mismatch is None:
-                print(f"  Expected {max_tokens} tokens, got {len(ref['tokens'])}")
-            else:
-                print(f"  First differing token (0-based): {mismatch}")
-            print(f"  mlx-lm: {ref['tokens']}\n          {ref['text']!r}")
-            print(f"  metal:  {got['tokens']}\n          {got['text']!r}")
-            if complete and mismatch is not None and top_k is not None:
-                candidates = (ref["tokens"][mismatch], got["tokens"][mismatch])
-                for label, top in (("mlx-lm", ref_top), ("metal", got_top)):
-                    for token in candidates:
-                        entry = top.get(token)
-                        if entry is None:
-                            print(f"  {label}: token {token} is outside top-{top_k}")
-                        else:
-                            print(
-                                f"  {label}: token {token} {entry['text']!r}, "
-                                f"rank {entry['rank']}, logprob {entry['logprob']:.6f}"
-                            )
-                print(
-                    f"  Matching prefix length: {mismatch}; "
-                    "remaining continuation not compared."
-                )
-    return passed
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--model", required=True)
     parser.add_argument(
         "--prompt",
         action="append",
@@ -391,14 +356,14 @@ def main() -> None:
     parser.add_argument(
         "--top-k",
         type=int,
-        help="Accept mutual top-k membership at the first divergence",
+        help="Accept mutual top-k membership at the first divergence (default: 5 with --method, exact otherwise)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         nargs="+",
         default=[1, 2],
-        help="Prompts per HTTP request (default: 1 2)",
+        help="Prompts per request batch (default: 1 2)",
     )
     parser.add_argument(
         "--output-dir",
@@ -411,17 +376,76 @@ def main() -> None:
         default=0.65,
         help="KV budget fraction passed to the vLLM server (default: 0.65)",
     )
+    parser.add_argument(
+        "--method",
+        choices=["dflash", "dspark", "draft_model"],
+        help="Compare speculative serving with native MLX and target-only serving",
+    )
+    parser.add_argument("--draft", help="Draft checkpoint for --method")
+    parser.add_argument("--num-draft-tokens", type=int, default=3)
+    parser.add_argument("--dspark-draft-topk", type=int)
+    parser.add_argument("--dspark-draft-quantization", choices=["q4"])
+    parser.add_argument("--draft-schedule", type=json.loads)
+    parser.add_argument(
+        "--audit-continuations",
+        action="store_true",
+        help="With --method, strictly replay every emitted prefix through native MLX",
+    )
+    parser.add_argument(
+        "--worker",
+        choices=["native", "target", "dflash", "dspark", "draft_model", "replay"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom code from the checkpoint, for both backends",
+    )
+    parser.add_argument(
+        "--additional-config",
+        help="JSON passed to vllm serve --additional-config (serving side only)",
+    )
     parser.add_argument("--generate-reference", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.max_tokens < 1:
         parser.error("--max-tokens must be positive")
     if args.top_k is not None and args.top_k < 1:
         parser.error("--top-k must be positive")
-    if min(args.batch_size) < 1:
-        parser.error("--batch-size values must be positive")
+    if min(args.batch_size) < 1 or len(set(args.batch_size)) != len(args.batch_size):
+        parser.error("--batch-size values must be positive and unique")
+    if args.method is not None:
+        if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
+            parser.error("--method requires the MLX backend")
+        if args.generate_reference:
+            parser.error("--generate-reference cannot be combined with --method")
+        if args.trust_remote_code:
+            parser.error("--trust-remote-code cannot be combined with --method")
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tools import speculative_parity
+
+        args.target = args.model
+        args.top_k = 5 if args.top_k is None else args.top_k
+        if args.output_dir is None:
+            args.output_dir = Path(tempfile.mkdtemp(prefix="metal-parity-")) / "results"
+        args.output_dir = args.output_dir.resolve()
+        speculative_parity.validate_args(args, parser)
+        print(f"Artifacts: {args.output_dir}", flush=True)
+        raise SystemExit(0 if speculative_parity.run(args) else 1)
+    if (
+        args.draft
+        or args.dspark_draft_topk is not None
+        or args.dspark_draft_quantization is not None
+        or args.draft_schedule is not None
+        or args.audit_continuations
+        or args.worker
+        or args.num_draft_tokens != 3
+    ):
+        parser.error("Draft and continuation-audit options require --method")
     if args.generate_reference:
         prompts = json.loads(args.generate_reference.read_text())
-        reference = mlx_generate(args.model, prompts, args.max_tokens, args.top_k)
+        reference = mlx_generate(
+            args.model, prompts, args.max_tokens, args.top_k, args.trust_remote_code
+        )
         args.generate_reference.write_text(json.dumps(reference))
         return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
@@ -433,6 +457,8 @@ def main() -> None:
         tuple(args.batch_size),
         args.output_dir,
         args.gpu_memory_utilization,
+        args.additional_config,
+        args.trust_remote_code,
     )
     raise SystemExit(0 if passed else 1)
 

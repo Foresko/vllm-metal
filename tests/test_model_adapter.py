@@ -108,6 +108,57 @@ class TestShouldForceTextBackbone:
         assert adapter.should_force_text_backbone(hf_config) is True
         assert adapter.build_multimodal_adapter(object(), hf_config) is None
 
+    def test_unquantized_muse_glimmer_keeps_text_backbone(self) -> None:
+        # No multimodal adapter, so a native load would let image requests
+        # reach the runner and raise there, whatever the quantization.
+        hf_config = SimpleNamespace(
+            model_type="muse_glimmer",
+            architectures=["MuseGlimmerForConditionalGeneration"],
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is True
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
+
+    @pytest.mark.parametrize(
+        ("text_type", "expected"),
+        [
+            # mlx_lm loads these text models, and there is no mistral3 adapter.
+            ("mistral", True),
+            ("ministral3", True),
+            # Mistral 4 text is MLA, which mlx_lm's mistral3 wrapper can't load.
+            ("mistral4", False),
+        ],
+    )
+    def test_mistral3_uses_text_backbone_for_mlx_lm_text_models(
+        self, text_type: str, expected: bool
+    ) -> None:
+        hf_config = SimpleNamespace(
+            model_type="mistral3",
+            architectures=["Mistral3ForConditionalGeneration"],
+            quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+            text_config=SimpleNamespace(model_type=text_type),
+        )
+        adapter = DefaultModelAdapter()
+        assert adapter.should_force_text_backbone(hf_config) is expected
+        assert adapter.build_multimodal_adapter(object(), hf_config) is None
+
+    def test_mistral3_without_text_config_keeps_native_path(self) -> None:
+        hf_config = SimpleNamespace(
+            model_type="mistral3", architectures=["Mistral3ForConditionalGeneration"]
+        )
+        assert DefaultModelAdapter().should_force_text_backbone(hf_config) is False
+
+    def test_multimodal_native_mode_keeps_mistral3_native(self, monkeypatch) -> None:
+        monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
+        reset_config()
+
+        hf_config = SimpleNamespace(
+            model_type="mistral3",
+            architectures=["Mistral3ForConditionalGeneration"],
+            text_config=SimpleNamespace(model_type="mistral"),
+        )
+        assert DefaultModelAdapter().should_force_text_backbone(hf_config) is False
+
     @pytest.mark.parametrize(
         ("model_type", "architecture", "vision_config"),
         [
@@ -570,11 +621,28 @@ class TestNormalizeModelConfig:
 
     def test_clears_multimodal_config_for_qwen35_fp8_in_auto_mode(self) -> None:
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=SimpleNamespace(language_model_only=False),
             hf_config=SimpleNamespace(
                 model_type="qwen3_5",
                 architectures=["Qwen3_5ForConditionalGeneration"],
                 quantization_config={"quant_method": "fp8"},
+            ),
+        )
+
+        DefaultModelAdapter().normalize_model_config(model_config)
+
+        assert model_config.multimodal_config is None
+
+    def test_clears_multimodal_config_for_mistral3_in_auto_mode(self) -> None:
+        # The frontend then rejects image input with a 400.
+        model_config = SimpleNamespace(
+            quantization=None,
+            multimodal_config=SimpleNamespace(language_model_only=False),
+            hf_config=SimpleNamespace(
+                model_type="mistral3",
+                architectures=["Mistral3ForConditionalGeneration"],
+                text_config=SimpleNamespace(model_type="mistral"),
             ),
         )
 
@@ -595,6 +663,7 @@ class TestNormalizeModelConfig:
         # pinned mlx-vlm floor, so auto mode must leave their config alone.
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(
                 model_type=model_type,
@@ -610,6 +679,7 @@ class TestNormalizeModelConfig:
     def test_preserves_multimodal_config_for_other_models(self) -> None:
         sentinel = SimpleNamespace(language_model_only=False)
         model_config = SimpleNamespace(
+            quantization=None,
             multimodal_config=sentinel,
             hf_config=SimpleNamespace(model_type="qwen3_vl", architectures=[]),
         )
@@ -713,6 +783,22 @@ class TestIntermediateForward:
             adapter.intermediate_forward(SimpleNamespace(), mx.array([[5]]))
 
 
+class _Qwen35BackboneStub:
+    """Headless ``language_model.model`` callable — the adapter binds it at load."""
+
+    def __init__(self) -> None:
+        self.embed_tokens = lambda input_ids: input_ids
+
+    def __call__(
+        self,
+        inputs: object,
+        inputs_embeds: object | None = None,
+        cache: object | None = None,
+        position_ids: object | None = None,
+    ) -> None:
+        return None
+
+
 class _Qwen35LanguageModelStub:
     """Mirrors mlx_vlm 0.4.x ``LanguageModel.__call__`` so signature sniffing works.
 
@@ -722,7 +808,7 @@ class _Qwen35LanguageModelStub:
     """
 
     def __init__(self) -> None:
-        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+        self.model = _Qwen35BackboneStub()
 
     def __call__(
         self,
@@ -737,7 +823,7 @@ class _Qwen35LanguageModelStub:
 
 class _PaddleOCRLanguageModelStub:
     def __init__(self) -> None:
-        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids)
+        self.model = _Qwen35BackboneStub()
 
     def __call__(
         self,
@@ -748,6 +834,14 @@ class _PaddleOCRLanguageModelStub:
         mask: object | None = None,
     ) -> None:
         return None
+
+
+# Every Qwen3-VL family hf_config carries the video frame token ids.
+_QWEN3_VL_FRAME_TOKEN_IDS = {
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+}
 
 
 class TestBuildMultimodalAdapter:
@@ -761,7 +855,7 @@ class TestBuildMultimodalAdapter:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        hf_config = SimpleNamespace(model_type="qwen3_5")
+        hf_config = SimpleNamespace(model_type="qwen3_5", **_QWEN3_VL_FRAME_TOKEN_IDS)
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 
@@ -779,6 +873,7 @@ class TestBuildMultimodalAdapter:
         hf_config = SimpleNamespace(
             model_type="custom",
             architectures=["Qwen3VLForConditionalGeneration"],
+            **_QWEN3_VL_FRAME_TOKEN_IDS,
         )
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
@@ -1254,7 +1349,6 @@ def _gemma4_model_config(
     tmp_path: Path,
     *,
     per_layer_inputs: int = 0,
-    quantization: str | None = None,
     quantization_config: dict | None = None,
     model: str | None = None,
     limit_per_prompt: dict | None = None,
@@ -1264,7 +1358,7 @@ def _gemma4_model_config(
         revision=None,
         trust_remote_code=False,
         mm_processor_kwargs=None,
-        quantization=quantization,
+        quantization=None,
         multimodal_config=SimpleNamespace(
             language_model_only=False,
             limit_per_prompt={} if limit_per_prompt is None else limit_per_prompt,
@@ -1292,14 +1386,24 @@ def _sidecar_ready(monkeypatch: pytest.MonkeyPatch):
 
 
 class TestMultimodalBackboneMode:
+    @pytest.mark.parametrize("per_layer_inputs", [0, 256])
     @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
     def test_gemma4_with_everything_present_is_text_sidecar(
-        self, tmp_path: Path, _sidecar_ready, model_type: str
+        self, tmp_path: Path, _sidecar_ready, model_type: str, per_layer_inputs: int
     ) -> None:
-        config = _gemma4_model_config(tmp_path)
+        config = _gemma4_model_config(tmp_path, per_layer_inputs=per_layer_inputs)
         config.hf_config.model_type = model_type
         mode = DefaultModelAdapter().multimodal_backbone_mode(config)
         assert mode == "text_sidecar"
+
+    def test_gguf_skips_a_ready_vision_sidecar(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        # A .gguf never holds the vision tower, so the sidecar must not load.
+        config = _gemma4_model_config(tmp_path)
+        config.quantization = "gguf"
+        mode = DefaultModelAdapter().multimodal_backbone_mode(config)
+        assert mode == "text_only"
 
     def test_language_model_only_wins_over_native_mode(
         self, tmp_path: Path, monkeypatch
@@ -1366,10 +1470,8 @@ class TestMultimodalBackboneMode:
         ("kwargs", "speculative", "reason"),
         [
             ({}, object(), "speculative decoding"),
-            ({"quantization": "gguf"}, None, "safetensors"),
             ({"quantization_config": {"quant_method": "awq"}}, None, "safetensors"),
             ({"model": "mlx-community/not-local"}, None, "local checkpoint directory"),
-            ({"per_layer_inputs": 256}, None, "per-layer inputs"),
         ],
     )
     def test_fallback_reasons(
@@ -1551,25 +1653,48 @@ class TestNormalizeModelConfigSidecar:
         assert config.multimodal_config is sentinel
         limits = config.multimodal_config.limit_per_prompt
         assert limits["image"].count == 4
-        assert (
-            isinstance(limits["video"], VideoDummyOptions)
-            and limits["video"].count == 0
-        )
+        assert "video" not in limits
         assert (
             isinstance(limits["audio"], AudioDummyOptions)
             and limits["audio"].count == 0
         )
 
+    def test_prefix_lm_checkpoint_refuses_video(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(tmp_path)
+        config.is_mm_prefix_lm = True
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert (
+            isinstance(limits["video"], VideoDummyOptions)
+            and limits["video"].count == 0
+        )
+
+    def test_audio_stays_enabled_with_an_audio_encoder(
+        self, tmp_path: Path, _sidecar_ready
+    ) -> None:
+        config = _gemma4_model_config(tmp_path)
+        config.hf_config.audio_config = SimpleNamespace(hidden_size=1024)
+
+        DefaultModelAdapter().normalize_model_config(config)
+
+        limits = config.multimodal_config.limit_per_prompt
+        assert "audio" not in limits
+        assert "video" not in limits
+
     def test_restriction_is_idempotent_and_warns_on_override(
         self, tmp_path: Path, _sidecar_ready, caplog
     ) -> None:
         config = _gemma4_model_config(
-            tmp_path, limit_per_prompt={"video": VideoDummyOptions(count=2)}
+            tmp_path, limit_per_prompt={"audio": AudioDummyOptions(count=2)}
         )
         with caplog.at_level("WARNING"):
             DefaultModelAdapter().normalize_model_config(config)
             DefaultModelAdapter().normalize_model_config(config)
-        assert config.multimodal_config.limit_per_prompt["video"].count == 0
+        assert config.multimodal_config.limit_per_prompt["audio"].count == 0
         assert caplog.text.count("overriding") == 1
 
     def test_text_only_clears_config(self, tmp_path: Path, _sidecar_ready) -> None:

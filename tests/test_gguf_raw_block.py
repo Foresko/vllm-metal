@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the raw-block GGUF tensor and its Q6_K Metal kernels.
+"""Tests for the raw-block GGUF tensor and its Q2_K/Q3_K/Q6_K Metal kernels.
 
-Q6_K fixtures are built as raw blocks field-by-field because gguf-py cannot
-quantize K-quants; ``gguf.quants.dequantize`` stays the authoritative oracle
-for what the blocks mean.
+K-quant fixtures are built as raw blocks field-by-field because gguf-py
+cannot quantize K-quants; ``gguf.quants.dequantize`` stays the authoritative
+oracle for what the blocks mean.
 """
 
 from __future__ import annotations
@@ -18,6 +18,12 @@ from tests.gguf_kquant_fixtures import build_kquant_blocks  # noqa: E402
 from vllm_metal.gguf.raw_block import GGUFRawBlockTensor  # noqa: E402
 
 GGMLQuantizationType = gguf.GGMLQuantizationType
+
+_RAW_QTYPES = [
+    GGMLQuantizationType.Q2_K,
+    GGMLQuantizationType.Q3_K,
+    GGMLQuantizationType.Q6_K,
+]
 
 
 def _spy_matmul_paths(monkeypatch) -> dict:
@@ -39,29 +45,40 @@ def _spy_matmul_paths(monkeypatch) -> dict:
     return calls
 
 
-def _make_q6k_tensor(rows: int = 16, cols: int = 512) -> tuple:
-    raw = build_kquant_blocks(rows, cols, GGMLQuantizationType.Q6_K)
-    qt = GGUFRawBlockTensor.from_raw_blocks(
-        raw, (rows, cols), GGMLQuantizationType.Q6_K
-    )
-    oracle = gguf.quants.dequantize(raw, GGMLQuantizationType.Q6_K).astype(np.float32)
+def _make_raw_tensor(
+    rows: int = 16,
+    cols: int = 512,
+    qtype: gguf.GGMLQuantizationType = GGMLQuantizationType.Q6_K,
+) -> tuple:
+    raw = build_kquant_blocks(rows, cols, qtype)
+    qt = GGUFRawBlockTensor.from_raw_blocks(raw, (rows, cols), qtype)
+    oracle = gguf.quants.dequantize(raw, qtype).astype(np.float32)
     return qt, oracle
 
 
-def test_contract_matches_logical_shape():
-    qt, _ = _make_q6k_tensor(rows=16, cols=512)
+@pytest.mark.parametrize(
+    ("qtype", "bits", "block_bytes"),
+    [
+        (GGMLQuantizationType.Q2_K, 2, 84),
+        (GGMLQuantizationType.Q3_K, 3, 110),
+        (GGMLQuantizationType.Q6_K, 6, 210),
+    ],
+)
+def test_contract_matches_logical_shape(qtype, bits, block_bytes):
+    qt, _ = _make_raw_tensor(rows=16, cols=512, qtype=qtype)
 
-    assert qt.qweight_type == GGMLQuantizationType.Q6_K
+    assert qt.qweight_type == qtype
     assert qt.logical_shape == (16, 512)
     assert qt.out_features == 16
     assert qt.in_features == 512
-    assert qt.bits == 6
+    assert qt.bits == bits
     assert qt.qweight.dtype == mx.uint8
-    assert qt.packed_shape == (16, 512 // 256 * 210)
+    assert qt.packed_shape == (16, 512 // 256 * block_bytes)
 
 
-def test_dequantize_matches_oracle_bit_exact():
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_dequantize_matches_oracle_bit_exact(qtype):
+    qt, oracle = _make_raw_tensor(qtype=qtype)
 
     out = qt.embedding(mx.arange(qt.out_features), output_dtype=mx.float32)
     mx.eval(out)
@@ -69,10 +86,11 @@ def test_dequantize_matches_oracle_bit_exact():
     assert np.array_equal(np.array(out), oracle)
 
 
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
 @pytest.mark.parametrize("batch", [1, 3, 8])
-def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch):
+def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch, qtype):
     # 17 superblocks give every thread a group and some threads a second one.
-    qt, oracle = _make_q6k_tensor(cols=17 * 256)
+    qt, oracle = _make_raw_tensor(cols=17 * 256, qtype=qtype)
     calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((batch, qt.in_features)).astype(mx.float32)
 
@@ -90,8 +108,9 @@ def test_matmul_qmv_path_matches_dense_oracle_f32(monkeypatch, batch):
     )
 
 
-def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch):
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch, qtype):
+    qt, oracle = _make_raw_tensor(qtype=qtype)
     calls = _spy_matmul_paths(monkeypatch)
     x = mx.random.normal((32, qt.in_features)).astype(mx.float32)
 
@@ -108,7 +127,7 @@ def test_matmul_gemm_path_matches_dense_oracle_f32(monkeypatch):
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
 def test_matmul_gemm_path_dequantizes_in_activation_dtype(monkeypatch, dtype):
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
     real_dequantize = GGUFRawBlockTensor._dequantize_rows
     dense_dtypes = []
 
@@ -131,8 +150,9 @@ def test_matmul_gemm_path_dequantizes_in_activation_dtype(monkeypatch, dtype):
 @pytest.mark.parametrize(
     ("dtype", "rel_tol"), [(mx.float16, 4e-3), (mx.bfloat16, 8e-3)]
 )
-def test_matmul_low_precision_matches_dense_oracle(dtype, rel_tol, batch):
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_matmul_low_precision_matches_dense_oracle(dtype, rel_tol, batch, qtype):
+    qt, oracle = _make_raw_tensor(qtype=qtype)
     x = mx.random.normal((batch, qt.in_features)).astype(dtype)
 
     out = qt.matmul(x)
@@ -153,7 +173,7 @@ def test_matmul_low_precision_matches_dense_oracle(dtype, rel_tol, batch):
 
 
 def test_matmul_preserves_leading_shape():
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
     x = mx.random.normal((2, 3, qt.in_features)).astype(mx.float16)
 
     out = qt.matmul(x)
@@ -165,7 +185,7 @@ def test_matmul_preserves_leading_shape():
 
 
 def test_matmul_empty_batch():
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
 
     out = qt.matmul(mx.zeros((0, qt.in_features), dtype=mx.float16))
 
@@ -173,8 +193,9 @@ def test_matmul_empty_batch():
     assert out.dtype == mx.float16
 
 
-def test_embedding_matches_oracle_rows_exactly():
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_embedding_matches_oracle_rows_exactly(qtype):
+    qt, oracle = _make_raw_tensor(qtype=qtype)
     ids = mx.array([[0, 5], [15, 0]], dtype=mx.int32)
 
     out = qt.embedding(ids, output_dtype=mx.float32)
@@ -185,7 +206,7 @@ def test_embedding_matches_oracle_rows_exactly():
 
 
 def test_embedding_empty_ids():
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
 
     out = qt.embedding(mx.zeros((0,), dtype=mx.int32), output_dtype=mx.float16)
 
@@ -193,8 +214,9 @@ def test_embedding_empty_ids():
     assert out.dtype == mx.float16
 
 
-def test_permute_rows_matches_permuted_oracle():
-    qt, oracle = _make_q6k_tensor()
+@pytest.mark.parametrize("qtype", _RAW_QTYPES)
+def test_permute_rows_matches_permuted_oracle(qtype):
+    qt, oracle = _make_raw_tensor(qtype=qtype)
     perm = np.random.default_rng(5).permutation(qt.out_features)
 
     permuted = qt.permute_rows(mx.array(perm))
@@ -205,7 +227,7 @@ def test_permute_rows_matches_permuted_oracle():
 
 
 def test_permute_rows_rejects_bad_index():
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
 
     with pytest.raises(ValueError, match="must be a permutation"):
         qt.permute_rows(mx.zeros((qt.out_features,), dtype=mx.int32))
@@ -214,7 +236,7 @@ def test_permute_rows_rejects_bad_index():
 def test_rejects_non_raw_kernel_qtype():
     raw = build_kquant_blocks(16, 512, GGMLQuantizationType.Q6_K)
 
-    with pytest.raises(ValueError, match="Raw-kernel qtypes: Q6_K"):
+    with pytest.raises(ValueError, match=r"Raw-kernel qtypes: Q2_K, Q3_K, Q6_K"):
         GGUFRawBlockTensor.from_raw_blocks(raw, (16, 512), GGMLQuantizationType.Q4_K)
 
 
@@ -260,7 +282,7 @@ def test_from_raw_blocks_rejects_non_uint8_payload():
 
 
 def test_matmul_rejects_wrong_last_dim():
-    qt, _ = _make_q6k_tensor()
+    qt, _ = _make_raw_tensor()
     # 4x256 would silently reshape into 2x512 without the guard.
     x = mx.random.normal((4, qt.in_features // 2)).astype(mx.float32)
 

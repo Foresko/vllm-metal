@@ -20,6 +20,10 @@ using namespace metal;
 typedef bfloat bfloat16_t;
 
 constant bool nax_use_sinks [[function_constant(40)]];
+// Host-selected per launch (see dispatch_paged_attention_nax): true runs the
+// split loop that skips bounds checks on complete KV tiles of full Q blocks;
+// false runs the original single guarded loop.
+constant bool nax_split_full [[function_constant(41)]];
 
 template <typename T>
 using nax_frag8 = metal::vec<T, 8>;
@@ -54,8 +58,6 @@ METAL_FUNC void nax_mma(thread nax_frag8<CT>& Cn0, thread nax_frag8<CT>& Cn1,
   mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
   auto ct_a = op.template get_left_input_cooperative_tensor<AT, BT, CT>();
   auto ct_b = op.template get_right_input_cooperative_tensor<AT, BT, CT>();
-  // Metal 4.1 makes decltype of a local explicitly `thread`, which MPP's
-  // operand traits reject; stripping it is a no-op under Metal 4.0.
   auto ct_c = op.template get_destination_cooperative_tensor<
       metal::remove_addrspace_t<decltype(ct_a)>,
       metal::remove_addrspace_t<decltype(ct_b)>, CT>();
@@ -98,7 +100,226 @@ METAL_FUNC void nax_row_reduce(const thread nax_frag8<float>& f,
   }
 }
 
-template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
+// One 32-token KV tile of the online-softmax loop.  GUARDED=false is only
+// called for tiles whose 32 KV tokens are all < seq_len, by a threadgroup whose
+// 64 Q rows are all valid: its body has no q_ok/kv_ok selects and its mask is
+// the causal (and optional sliding-window) compare alone.  GUARDED=true is the
+// general path, used for the boundary tile and for partial Q blocks.  On the
+// tiles GUARDED=false sees, every guard of the general path is true, so both
+// paths compute identical values.
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, bool GUARDED, int VALUE_SIZE>
+METAL_FUNC void nax_kv_tile(
+    const int tile_start,
+    const thread metal::array<const device T *, 2> &q_row,
+    const thread bool *q_ok,
+    device const T *k_cache,
+    device const T *v_cache,
+    device const int *block_tables,
+    const long bt_row,
+    const int kv_block_stride,
+    const long kv_token_stride,
+    const int kv_head_idx,
+    const int kv_head_stride,
+    const int seq_len,
+    const short fm,
+    const short fn,
+    const int row_lim,
+    const int q_abs_sg,
+    const int min_q_abs_sg,
+    const float scale_log2,
+    const float softcapping,
+    const int sliding_window,
+    thread nax_frag8<float> *Otile,
+    thread float *max_score,
+    thread float *sum_score) {
+  constexpr int TILE_KV = 32;
+  constexpr int TD = HEAD_SIZE / 16;
+  constexpr int VD = VALUE_SIZE / 16;
+  using T4 = metal::vec<T, 4>;
+
+  // Resolve the tile's 4 half-bases (one block lookup each) and fold in
+  // this lane's row, so the load loops are pure `ptr + constant` vec4s.
+  const device T *k_row[4];
+  const device T *v_row[4];
+  bool kv_ok[4];
+#pragma clang loop unroll(full)
+  for (short h = 0; h < 4; h++) {
+    const int tok = tile_start + h * 8;
+    long off = 0;
+    short rows = 8;
+    if (!GUARDED || tok < seq_len) {
+      const long pb = long(block_tables[bt_row + tok / BLOCK_SIZE]);
+      off = pb * long(kv_block_stride)
+          + long(tok % BLOCK_SIZE) * kv_token_stride
+          + kv_head_idx * long(kv_head_stride);
+      if (GUARDED) rows = short(min(8, seq_len - tok));
+    } else {
+      rows = 0;
+    }
+    const long lane_off = off + fm * kv_token_stride + fn;
+    k_row[h] = k_cache + lane_off;
+    v_row[h] = v_cache + lane_off;
+    kv_ok[h] = !GUARDED || fm < rows;
+  }
+
+  // S = Q K^T.  Q is re-read per KV tile to reduce register pressure.
+  nax_frag8<float> S0 = nax_frag8<float>(0.0f);
+  nax_frag8<float> S1 = nax_frag8<float>(0.0f);
+#pragma clang loop unroll_count(4)
+  for (short id = 0; id < TD; id++) {
+    nax_frag8<T> Qf, K0, K1;
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+      T4 qv, k0, k1;
+      if (GUARDED) {
+        qv = q_ok[i] ? *(const device T4 *)(q_row[i] + id * 16) : T4(T(0));
+        // K frag 0 rows 0-15 = halves {0,1}; frag 1 rows 16-31 = {2,3}.
+        k0 = kv_ok[i] ? *(const device T4 *)(k_row[i] + id * 16) : T4(T(0));
+        k1 = kv_ok[2 + i]
+            ? *(const device T4 *)(k_row[2 + i] + id * 16) : T4(T(0));
+      } else {
+        qv = *(const device T4 *)(q_row[i] + id * 16);
+        k0 = *(const device T4 *)(k_row[i] + id * 16);
+        k1 = *(const device T4 *)(k_row[2 + i] + id * 16);
+      }
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+        Qf[i * 4 + j] = qv[j];
+        K0[i * 4 + j] = k0[j];
+        K1[i * 4 + j] = k1[j];
+      }
+    }
+    nax_mma<float, T, T, true>(S0, S1, Qf, K0, K1);
+  }
+
+  // Scale + softcap + mask.  Fast path when the whole tile is strictly
+  // causal-past for every row this SG owns and needs no other masking.
+  const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_sg
+      && softcapping <= 0.0f
+      && sliding_window < 0
+      && (!GUARDED
+          || ((tile_start + TILE_KV) <= seq_len && row_lim >= 16));
+  if (tile_no_mask) {
+#pragma clang loop unroll(full)
+    for (short e = 0; e < 8; e++) {
+      S0[e] *= scale_log2;
+      S1[e] *= scale_log2;
+    }
+  } else {
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+      const int q_abs = q_abs_sg + fm + i * 8;
+      const bool row_masked = GUARDED && (fm + i * 8) >= row_lim;
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+#pragma clang loop unroll(full)
+        for (short f = 0; f < 2; f++) {
+          const int kv_pos = tile_start + f * 16 + fn + j;
+          float s = (f == 0 ? S0[i * 4 + j] : S1[i * 4 + j]) * scale_log2;
+          if (softcapping > 0.0f) {
+            const float s_orig = s / M_LOG2E_F;
+            s = softcapping * precise::tanh(s_orig / softcapping)
+                * M_LOG2E_F;
+          }
+          bool masked = kv_pos > q_abs;
+          if (GUARDED) masked = masked || row_masked || (kv_pos >= seq_len);
+          if (sliding_window >= 0)
+            masked = masked || (kv_pos < q_abs + 1 - sliding_window);
+          const float v = masked ? NAX_FINITE_MIN : s;
+          if (f == 0) S0[i * 4 + j] = v; else S1[i * 4 + j] = v;
+        }
+      }
+    }
+  }
+
+  // Online softmax, finite-sentinel form: masked logits are NAX_FINITE_MIN
+  // and exp gets a zero select.  The select is what keeps rows whose
+  // sliding window has not opened yet exact; their running max is still
+  // the sentinel, and exp2(s - max) would otherwise be exp2(0) = 1.
+  float new_max[2] = {max_score[0], max_score[1]};
+  nax_row_reduce<NaxMaxOp>(S0, new_max);
+  nax_row_reduce<NaxMaxOp>(S1, new_max);
+
+  float factor[2];
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    factor[i] = fast::exp2(max_score[i] - new_max[i]);
+    max_score[i] = new_max[i];
+  }
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+    for (short j = 0; j < 4; j++) {
+      const float s0 = S0[i * 4 + j];
+      const float s1 = S1[i * 4 + j];
+      S0[i * 4 + j] =
+          (s0 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s0 - new_max[i]);
+      S1[i * 4 + j] =
+          (s1 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s1 - new_max[i]);
+    }
+  }
+
+  float row_sum[2] = {0.0f, 0.0f};
+  nax_row_reduce<NaxSumOp>(S0, row_sum);
+  nax_row_reduce<NaxSumOp>(S1, row_sum);
+#pragma clang loop unroll(full)
+  for (short i = 0; i < 2; i++) {
+    sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
+  }
+#pragma clang loop unroll(full)
+  for (short d = 0; d < VD; d++) {
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+      for (short j = 0; j < 4; j++) {
+        Otile[d][i * 4 + j] *= factor[i];
+      }
+    }
+  }
+
+  simdgroup_barrier(mem_flags::mem_none);
+
+  // O += P @ V.  P is fp32 in registers, but the matmul2d descriptor is
+  // relaxed_precision (required by the register layout nax_coord() mirrors),
+  // so the tensor unit truncates it -- unlike pagedattention_tiled.metal,
+  // which keeps P fp32 through the MMA and is precision-neutral by contract.
+  // That divergence is what tools/nax_prefill_parity.py bounds.
+  // V is re-read per d-pair like MLX; the bases are already resolved.
+#pragma clang loop unroll(full)
+  for (short id = 0; id < VD; id += 2) {
+    if (VD >= 8 && id == VD / 2) {
+      // Keep the scheduling barrier at the midpoint of the output slice.
+      threadgroup_barrier(mem_flags::mem_none);
+    }
+#pragma clang loop unroll(full)
+    for (short f = 0; f < 2; f++) {
+      nax_frag8<T> V0, V1;
+#pragma clang loop unroll(full)
+      for (short i = 0; i < 2; i++) {
+        const short h = 2 * f + i;
+        T4 v0, v1;
+        if (GUARDED) {
+          v0 = kv_ok[h]
+              ? *(const device T4 *)(v_row[h] + id * 16) : T4(T(0));
+          v1 = kv_ok[h]
+              ? *(const device T4 *)(v_row[h] + (id + 1) * 16) : T4(T(0));
+        } else {
+          v0 = *(const device T4 *)(v_row[h] + id * 16);
+          v1 = *(const device T4 *)(v_row[h] + (id + 1) * 16);
+        }
+#pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          V0[i * 4 + j] = v0[j];
+          V1[i * 4 + j] = v1[j];
+        }
+      }
+      nax_mma<float, float, T, false>(
+          Otile[id], Otile[id + 1], (f == 0 ? S0 : S1), V0, V1);
+    }
+  }
+}
+
+template <typename T, int HEAD_SIZE, int BLOCK_SIZE, int VALUE_SIZE = HEAD_SIZE>
 [[kernel, max_total_threads_per_threadgroup(128)]] void paged_attention_nax(
     device T *out [[buffer(2)]],
     device const T *q [[buffer(3)]],
@@ -118,6 +339,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     device const int *cu_seqlens_q [[buffer(19)]],
     const constant int &num_seqs [[buffer(20)]],
     const constant int &sliding_window [[buffer(21)]],
+    const constant int &q_block_offset [[buffer(30)]],
     uint3 tgp [[threadgroup_position_in_grid]],
     uint3 tgpg [[threadgroups_per_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]])
@@ -125,12 +347,17 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   constexpr int BQ = 64;       // 16 rows per simdgroup x 4 simdgroups
   constexpr int TILE_KV = 32;  // 2 K fragments of 16 tokens
   constexpr int TD = HEAD_SIZE / 16;
+  constexpr int VD = VALUE_SIZE / 16;
   static_assert(HEAD_SIZE % 16 == 0, "HEAD_SIZE must be a multiple of 16");
+  static_assert(VALUE_SIZE % 32 == 0 && HEAD_SIZE % VALUE_SIZE == 0,
+                "value slices must partition the head into 32-column tiles");
   static_assert(BLOCK_SIZE % 8 == 0,
                 "an 8-token fragment half must never cross a block boundary");
 
   const int head_idx = int(tgp.x);
-  const int q_block_global_idx = int(tgp.y);
+  // Mixed batches dispatch only the prefill suffix; the host skips the
+  // q-blocks of the leading decode rows (same contract as the tiled kernel).
+  const int q_block_global_idx = int(tgp.y) + q_block_offset;
   const int num_heads = int(tgpg.x);
   const int sg = int(sg_idx);
 
@@ -168,10 +395,15 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   // guards preserve those wide loads at partial-tile boundaries.
   using T4 = metal::vec<T, 4>;
 
+  // D512's split pipeline assigns each z-plane 256 output columns. QK and
+  // softmax are repeated, but each lane holds half as many O accumulators.
+  const int value_offset = VALUE_SIZE == HEAD_SIZE ? 0 : int(tgp.z) * VALUE_SIZE;
+  v_cache += value_offset;
+
   const device T *q_base = q
       + long(q_seq_start + q_pos_start + sg * 16) * q_stride
       + head_idx * HEAD_SIZE;
-  const device T *q_row[2];
+  metal::array<const device T *, 2> q_row;
   bool q_ok[2];
 #pragma clang loop unroll(full)
   for (short i = 0; i < 2; i++) {
@@ -191,9 +423,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     max_score[0] = NAX_FINITE_MIN; max_score[1] = NAX_FINITE_MIN;
   }
 
-  nax_frag8<float> Otile[TD];
+  nax_frag8<float> Otile[VD];
 #pragma clang loop unroll(full)
-  for (short d = 0; d < TD; d++) Otile[d] = nax_frag8<float>(0.0f);
+  for (short d = 0; d < VD; d++) Otile[d] = nax_frag8<float>(0.0f);
 
   const float scale_log2 = scale * M_LOG2E_F;
   const int min_q_abs_sg = context_len + q_pos_start + sg * 16;
@@ -206,177 +438,208 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   }
   const int num_kv_tiles = (seq_len + TILE_KV - 1) / TILE_KV;
 
-  for (int kb = kb_start; kb < num_kv_tiles; kb++) {
-    const int tile_start = kb * TILE_KV;
-    if (tile_start > context_len + q_pos_start + valid_q - 1) break;
+  if (nax_split_full) {
+    // Tiles past the last valid Q row's causal position are fully masked.
+    const int kb_end = min(num_kv_tiles,
+                           (context_len + q_pos_start + valid_q - 1) / TILE_KV
+                               + 1);
+    // Keep both loop bounds uniform across the threadgroup: nax_kv_tile has a
+    // threadgroup barrier. Partial Q blocks run all tiles through the guarded
+    // loop; full Q blocks only need it for the final partial KV tile.
+    const int kb_full_end = valid_q == BQ
+        ? max(kb_start, min(kb_end, seq_len / TILE_KV)) : kb_start;
+    const int q_abs_sg = context_len + q_pos_start + sg * 16;
 
-    // Resolve the tile's 4 half-bases (one block lookup each) and fold in
-    // this lane's row, so the load loops are pure `ptr + constant` vec4s.
-    const device T *k_row[4];
-    const device T *v_row[4];
-    bool kv_ok[4];
-#pragma clang loop unroll(full)
-    for (short h = 0; h < 4; h++) {
-      const int tok = tile_start + h * 8;
-      long off = 0;
-      short rows = 0;
-      if (tok < seq_len) {
-        const long pb = long(block_tables[bt_row + tok / BLOCK_SIZE]);
-        off = pb * long(kv_block_stride)
-            + long(tok % BLOCK_SIZE) * kv_token_stride
-            + kv_head_idx * long(kv_head_stride);
-        rows = short(min(8, seq_len - tok));
-      }
-      const long lane_off = off + fm * kv_token_stride + fn;
-      k_row[h] = k_cache + lane_off;
-      v_row[h] = v_cache + lane_off;
-      kv_ok[h] = fm < rows;
+    for (int kb = kb_start; kb < kb_full_end; kb++) {
+      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, false, VALUE_SIZE>(
+          kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
+          kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
+          seq_len, fm, fn, row_lim, q_abs_sg, min_q_abs_sg, scale_log2,
+          softcapping, sliding_window, Otile, max_score, sum_score);
     }
+    for (int kb = kb_full_end; kb < kb_end; kb++) {
+      nax_kv_tile<T, HEAD_SIZE, BLOCK_SIZE, true, VALUE_SIZE>(
+          kb * TILE_KV, q_row, q_ok, k_cache, v_cache, block_tables, bt_row,
+          kv_block_stride, kv_token_stride, kv_head_idx, kv_head_stride,
+          seq_len, fm, fn, row_lim, q_abs_sg, min_q_abs_sg, scale_log2,
+          softcapping, sliding_window, Otile, max_score, sum_score);
+    }
+  } else {
+    // Original loop structure, in its own pipeline: sharing a kernel body
+    // with the split loop regressed short/partial launches through codegen
+    // alone, and keeping this loop restored their measured performance.
+    // Do not dedupe or merge this into nax_kv_tile<..., true>.
+    for (int kb = kb_start; kb < num_kv_tiles; kb++) {
+      const int tile_start = kb * TILE_KV;
+      if (tile_start > context_len + q_pos_start + valid_q - 1) break;
 
-    // Q is re-read per KV tile to reduce register pressure.
-    nax_frag8<float> S0 = nax_frag8<float>(0.0f);
-    nax_frag8<float> S1 = nax_frag8<float>(0.0f);
+      // Resolve the tile's 4 half-bases (one block lookup each) and fold in
+      // this lane's row, so the load loops are pure `ptr + constant` vec4s.
+      const device T *k_row[4];
+      const device T *v_row[4];
+      bool kv_ok[4];
+#pragma clang loop unroll(full)
+      for (short h = 0; h < 4; h++) {
+        const int tok = tile_start + h * 8;
+        long off = 0;
+        short rows = 0;
+        if (tok < seq_len) {
+          const long pb = long(block_tables[bt_row + tok / BLOCK_SIZE]);
+          off = pb * long(kv_block_stride)
+              + long(tok % BLOCK_SIZE) * kv_token_stride
+              + kv_head_idx * long(kv_head_stride);
+          rows = short(min(8, seq_len - tok));
+        }
+        const long lane_off = off + fm * kv_token_stride + fn;
+        k_row[h] = k_cache + lane_off;
+        v_row[h] = v_cache + lane_off;
+        kv_ok[h] = fm < rows;
+      }
+
+      // Q is re-read per KV tile to reduce register pressure.
+      nax_frag8<float> S0 = nax_frag8<float>(0.0f);
+      nax_frag8<float> S1 = nax_frag8<float>(0.0f);
 #pragma clang loop unroll_count(4)
-    for (short id = 0; id < TD; id++) {
-      nax_frag8<T> Qf, K0, K1;
-#pragma clang loop unroll(full)
-      for (short i = 0; i < 2; i++) {
-        const T4 qv = q_ok[i]
-            ? *(const device T4 *)(q_row[i] + id * 16) : T4(T(0));
-        // K frag 0 rows 0-15 = halves {0,1}; frag 1 rows 16-31 = {2,3}.
-        const T4 k0 = kv_ok[i]
-            ? *(const device T4 *)(k_row[i] + id * 16) : T4(T(0));
-        const T4 k1 = kv_ok[2 + i]
-            ? *(const device T4 *)(k_row[2 + i] + id * 16) : T4(T(0));
-#pragma clang loop unroll(full)
-        for (short j = 0; j < 4; j++) {
-          Qf[i * 4 + j] = qv[j];
-          K0[i * 4 + j] = k0[j];
-          K1[i * 4 + j] = k1[j];
-        }
-      }
-      nax_mma<float, T, T, true>(S0, S1, Qf, K0, K1);
-    }
-
-    // Scale + softcap + mask.  Fast path when the whole tile is strictly
-    // causal-past for every row this SG owns and needs no other masking.
-    const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_sg
-        && (tile_start + TILE_KV) <= seq_len
-        && softcapping <= 0.0f
-        && sliding_window < 0
-        && row_lim >= 16;
-    if (tile_no_mask) {
-#pragma clang loop unroll(full)
-      for (short e = 0; e < 8; e++) {
-        S0[e] *= scale_log2;
-        S1[e] *= scale_log2;
-      }
-    } else {
-#pragma clang loop unroll(full)
-      for (short i = 0; i < 2; i++) {
-        const int q_abs = context_len + q_pos_start + sg * 16 + fm + i * 8;
-        const bool row_masked = (fm + i * 8) >= row_lim;
-#pragma clang loop unroll(full)
-        for (short j = 0; j < 4; j++) {
-#pragma clang loop unroll(full)
-          for (short f = 0; f < 2; f++) {
-            const int kv_pos = tile_start + f * 16 + fn + j;
-            float s = (f == 0 ? S0[i * 4 + j] : S1[i * 4 + j]) * scale_log2;
-            if (softcapping > 0.0f) {
-              const float s_orig = s / M_LOG2E_F;
-              s = softcapping * precise::tanh(s_orig / softcapping)
-                  * M_LOG2E_F;
-            }
-            bool masked = row_masked
-                || (kv_pos > q_abs)
-                || (kv_pos >= seq_len);
-            if (sliding_window >= 0)
-              masked = masked || (kv_pos < q_abs + 1 - sliding_window);
-            const float v = masked ? NAX_FINITE_MIN : s;
-            if (f == 0) S0[i * 4 + j] = v; else S1[i * 4 + j] = v;
-          }
-        }
-      }
-    }
-
-    // Online softmax, finite-sentinel form: masked logits are NAX_FINITE_MIN
-    // and exp gets a zero select.  The select is what keeps rows whose
-    // sliding window has not opened yet exact; their running max is still
-    // the sentinel, and exp2(s - max) would otherwise be exp2(0) = 1.
-    float new_max[2] = {max_score[0], max_score[1]};
-    nax_row_reduce<NaxMaxOp>(S0, new_max);
-    nax_row_reduce<NaxMaxOp>(S1, new_max);
-
-    float factor[2];
-#pragma clang loop unroll(full)
-    for (short i = 0; i < 2; i++) {
-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
-      max_score[i] = new_max[i];
-    }
-#pragma clang loop unroll(full)
-    for (short i = 0; i < 2; i++) {
-#pragma clang loop unroll(full)
-      for (short j = 0; j < 4; j++) {
-        const float s0 = S0[i * 4 + j];
-        const float s1 = S1[i * 4 + j];
-        S0[i * 4 + j] =
-            (s0 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s0 - new_max[i]);
-        S1[i * 4 + j] =
-            (s1 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s1 - new_max[i]);
-      }
-    }
-
-    float row_sum[2] = {0.0f, 0.0f};
-    nax_row_reduce<NaxSumOp>(S0, row_sum);
-    nax_row_reduce<NaxSumOp>(S1, row_sum);
-#pragma clang loop unroll(full)
-    for (short i = 0; i < 2; i++) {
-      sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
-    }
-#pragma clang loop unroll(full)
-    for (short d = 0; d < TD; d++) {
-#pragma clang loop unroll(full)
-      for (short i = 0; i < 2; i++) {
-#pragma clang loop unroll(full)
-        for (short j = 0; j < 4; j++) {
-          Otile[d][i * 4 + j] *= factor[i];
-        }
-      }
-    }
-
-    simdgroup_barrier(mem_flags::mem_none);
-
-    // O += P @ V.  P is fp32 in registers, but the matmul2d descriptor is
-    // relaxed_precision (required by the register layout nax_coord() mirrors),
-    // so the tensor unit truncates it -- unlike pagedattention_tiled.metal,
-    // which keeps P fp32 through the MMA and is precision-neutral by contract.
-    // That divergence is what tools/nax_prefill_parity.py bounds.
-    // V is re-read per d-pair like MLX; the bases are already resolved.
-#pragma clang loop unroll(full)
-    for (short id = 0; id < TD; id += 2) {
-      if (TD >= 8 && id == TD / 2) {
-        // At TD=8 this is the MLX hd=128 scheduling barrier verbatim. The
-        // vLLM hd=256/512 extensions use the same midpoint split at TD=16/32.
-        threadgroup_barrier(mem_flags::mem_none);
-      }
-#pragma clang loop unroll(full)
-      for (short f = 0; f < 2; f++) {
-        nax_frag8<T> V0, V1;
+      for (short id = 0; id < TD; id++) {
+        nax_frag8<T> Qf, K0, K1;
 #pragma clang loop unroll(full)
         for (short i = 0; i < 2; i++) {
-          const short h = 2 * f + i;
-          const T4 v0 = kv_ok[h]
-              ? *(const device T4 *)(v_row[h] + id * 16) : T4(T(0));
-          const T4 v1 = kv_ok[h]
-              ? *(const device T4 *)(v_row[h] + (id + 1) * 16) : T4(T(0));
+          const T4 qv = q_ok[i]
+              ? *(const device T4 *)(q_row[i] + id * 16) : T4(T(0));
+          // K frag 0 rows 0-15 = halves {0,1}; frag 1 rows 16-31 = {2,3}.
+          const T4 k0 = kv_ok[i]
+              ? *(const device T4 *)(k_row[i] + id * 16) : T4(T(0));
+          const T4 k1 = kv_ok[2 + i]
+              ? *(const device T4 *)(k_row[2 + i] + id * 16) : T4(T(0));
 #pragma clang loop unroll(full)
           for (short j = 0; j < 4; j++) {
-            V0[i * 4 + j] = v0[j];
-            V1[i * 4 + j] = v1[j];
+            Qf[i * 4 + j] = qv[j];
+            K0[i * 4 + j] = k0[j];
+            K1[i * 4 + j] = k1[j];
           }
         }
-        nax_mma<float, float, T, false>(
-            Otile[id], Otile[id + 1], (f == 0 ? S0 : S1), V0, V1);
+        nax_mma<float, T, T, true>(S0, S1, Qf, K0, K1);
+      }
+
+      // Scale + softcap + mask.  Fast path when the whole tile is strictly
+      // causal-past for every row this SG owns and needs no other masking.
+      const bool tile_no_mask = (tile_start + TILE_KV - 1) < min_q_abs_sg
+          && (tile_start + TILE_KV) <= seq_len
+          && softcapping <= 0.0f
+          && sliding_window < 0
+          && row_lim >= 16;
+      if (tile_no_mask) {
+#pragma clang loop unroll(full)
+        for (short e = 0; e < 8; e++) {
+          S0[e] *= scale_log2;
+          S1[e] *= scale_log2;
+        }
+      } else {
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+          const int q_abs = context_len + q_pos_start + sg * 16 + fm + i * 8;
+          const bool row_masked = (fm + i * 8) >= row_lim;
+#pragma clang loop unroll(full)
+          for (short j = 0; j < 4; j++) {
+#pragma clang loop unroll(full)
+            for (short f = 0; f < 2; f++) {
+              const int kv_pos = tile_start + f * 16 + fn + j;
+              float s = (f == 0 ? S0[i * 4 + j] : S1[i * 4 + j]) * scale_log2;
+              if (softcapping > 0.0f) {
+                const float s_orig = s / M_LOG2E_F;
+                s = softcapping * precise::tanh(s_orig / softcapping)
+                    * M_LOG2E_F;
+              }
+              bool masked = row_masked
+                  || (kv_pos > q_abs)
+                  || (kv_pos >= seq_len);
+              if (sliding_window >= 0)
+                masked = masked || (kv_pos < q_abs + 1 - sliding_window);
+              const float v = masked ? NAX_FINITE_MIN : s;
+              if (f == 0) S0[i * 4 + j] = v; else S1[i * 4 + j] = v;
+            }
+          }
+        }
+      }
+
+      // Online softmax, finite-sentinel form: masked logits are NAX_FINITE_MIN
+      // and exp gets a zero select.  The select is what keeps rows whose
+      // sliding window has not opened yet exact; their running max is still
+      // the sentinel, and exp2(s - max) would otherwise be exp2(0) = 1.
+      float new_max[2] = {max_score[0], max_score[1]};
+      nax_row_reduce<NaxMaxOp>(S0, new_max);
+      nax_row_reduce<NaxMaxOp>(S1, new_max);
+
+      float factor[2];
+#pragma clang loop unroll(full)
+      for (short i = 0; i < 2; i++) {
+        factor[i] = fast::exp2(max_score[i] - new_max[i]);
+        max_score[i] = new_max[i];
+      }
+#pragma clang loop unroll(full)
+      for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++) {
+          const float s0 = S0[i * 4 + j];
+          const float s1 = S1[i * 4 + j];
+          S0[i * 4 + j] =
+              (s0 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s0 - new_max[i]);
+          S1[i * 4 + j] =
+              (s1 == NAX_FINITE_MIN) ? 0.0f : fast::exp2(s1 - new_max[i]);
+        }
+      }
+
+      float row_sum[2] = {0.0f, 0.0f};
+      nax_row_reduce<NaxSumOp>(S0, row_sum);
+      nax_row_reduce<NaxSumOp>(S1, row_sum);
+#pragma clang loop unroll(full)
+      for (short i = 0; i < 2; i++) {
+        sum_score[i] = sum_score[i] * factor[i] + row_sum[i];
+      }
+#pragma clang loop unroll(full)
+      for (short d = 0; d < VD; d++) {
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+#pragma clang loop unroll(full)
+          for (short j = 0; j < 4; j++) {
+            Otile[d][i * 4 + j] *= factor[i];
+          }
+        }
+      }
+
+      simdgroup_barrier(mem_flags::mem_none);
+
+      // O += P @ V.  P is fp32 in registers, but the matmul2d descriptor is
+      // relaxed_precision (required by the register layout nax_coord() mirrors),
+      // so the tensor unit truncates it -- unlike pagedattention_tiled.metal,
+      // which keeps P fp32 through the MMA and is precision-neutral by contract.
+      // That divergence is what tools/nax_prefill_parity.py bounds.
+      // V is re-read per d-pair like MLX; the bases are already resolved.
+#pragma clang loop unroll(full)
+      for (short id = 0; id < VD; id += 2) {
+        if (VD >= 8 && id == VD / 2) {
+          // Keep the scheduling barrier at the midpoint of the output slice.
+          threadgroup_barrier(mem_flags::mem_none);
+        }
+#pragma clang loop unroll(full)
+        for (short f = 0; f < 2; f++) {
+          nax_frag8<T> V0, V1;
+#pragma clang loop unroll(full)
+          for (short i = 0; i < 2; i++) {
+            const short h = 2 * f + i;
+            const T4 v0 = kv_ok[h]
+                ? *(const device T4 *)(v_row[h] + id * 16) : T4(T(0));
+            const T4 v1 = kv_ok[h]
+                ? *(const device T4 *)(v_row[h] + (id + 1) * 16) : T4(T(0));
+#pragma clang loop unroll(full)
+            for (short j = 0; j < 4; j++) {
+              V0[i * 4 + j] = v0[j];
+              V1[i * 4 + j] = v1[j];
+            }
+          }
+          nax_mma<float, float, T, false>(
+              Otile[id], Otile[id + 1], (f == 0 ? S0 : S1), V0, V1);
+        }
       }
     }
   }
@@ -385,7 +648,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   threadgroup_barrier(mem_flags::mem_none);
   device T *out_base = out
       + long(q_seq_start + q_pos_start + sg * 16) * q_stride
-      + head_idx * HEAD_SIZE;
+      + head_idx * HEAD_SIZE + value_offset;
 #pragma clang loop unroll(full)
   for (short i = 0; i < 2; i++) {
     if (q_ok[i]) {
@@ -393,7 +656,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       const float rcp = 1.0f / (sum_score[i] + 1e-6f);
       device T *out_row = out_base + (fm + i * 8) * q_stride + fn;
 #pragma clang loop unroll(full)
-      for (short d = 0; d < TD; d++) {
+      for (short d = 0; d < VD; d++) {
         T4 ov;
 #pragma clang loop unroll(full)
         for (short j = 0; j < 4; j++) {
@@ -405,10 +668,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   }
 }
 
-#define instantiate_paged_attention_nax(type, head_size, block_size)          \
+#define instantiate_paged_attention_nax_impl(type, head_size, block_size, value_size, suffix)          \
   template [[host_name("paged_attention_nax_" #type                          \
-                       "_hs" #head_size "_bs" #block_size)]]                 \
-  [[kernel]] void paged_attention_nax<type, head_size, block_size>(          \
+                       "_hs" #head_size "_bs" #block_size suffix)]]                 \
+  [[kernel]] void paged_attention_nax<type, head_size, block_size, value_size>(          \
       device type *out [[buffer(2)]],                                        \
       device const type *q [[buffer(3)]],                                    \
       device const type *k_cache [[buffer(4)]],                              \
@@ -427,9 +690,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       device const int *cu_seqlens_q [[buffer(19)]],                         \
       const constant int &num_seqs [[buffer(20)]],                           \
       const constant int &sliding_window [[buffer(21)]],                     \
+      const constant int &q_block_offset [[buffer(30)]],                     \
       uint3 tgp [[threadgroup_position_in_grid]],                            \
       uint3 tgpg [[threadgroups_per_grid]],                                  \
       uint sg_idx [[simdgroup_index_in_threadgroup]]);
+
+#define instantiate_paged_attention_nax(type, head_size, block_size) \
+  instantiate_paged_attention_nax_impl(type, head_size, block_size, head_size, "")
 
 #define instantiate_paged_attention_nax_all(type)                            \
   instantiate_paged_attention_nax(type, 64, 8);                              \
@@ -450,3 +717,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 
 instantiate_paged_attention_nax_all(half);
 instantiate_paged_attention_nax_all(bfloat16_t);
+
+#define instantiate_paged_attention_nax_d512(type) \
+  instantiate_paged_attention_nax_impl(type, 512, 8, 256, "_v256"); \
+  instantiate_paged_attention_nax_impl(type, 512, 16, 256, "_v256"); \
+  instantiate_paged_attention_nax_impl(type, 512, 32, 256, "_v256");
+
+instantiate_paged_attention_nax_d512(half);
+instantiate_paged_attention_nax_d512(bfloat16_t);

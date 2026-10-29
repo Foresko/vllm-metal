@@ -21,9 +21,10 @@ from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.quant.awq_loader import AWQQuantLoader
+from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
@@ -55,8 +56,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def load_stt_model(model_name: str) -> Any:
-    """Load an STT model.
+def load_stt_model(model_name: str, dtype: torch.dtype) -> Any:
+    """Load an STT model in the serving ``dtype``.
 
     Returns the loaded STT model. The caller (``STTModelRunner``) builds the
     per-model runtime adapter and wires it onto the runner.
@@ -66,7 +67,7 @@ def load_stt_model(model_name: str) -> Any:
     from vllm_metal.stt.loader import load_model as stt_load_model
 
     logger.info("Loading STT model: %s", model_name)
-    model = stt_load_model(model_name)
+    model = stt_load_model(model_name, TORCH_TO_MLX_DTYPE[dtype])
     logger.info("STT model loaded in %.2fs: %s", time.time() - start_time, model_name)
     return model
 
@@ -392,6 +393,13 @@ class ModelLifecycle:
             else AWQQuantLoader.for_model(model_name, revision=revision)
         )
 
+        expert_cache_bytes = get_config().moe_expert_cache_bytes
+        if expert_cache_bytes and (is_gguf or is_vlm or awq_loader is not None):
+            raise NotImplementedError(
+                "MoE expert offloading supports mlx-lm text checkpoints only, "
+                "not GGUF, AWQ, or multimodal models."
+            )
+
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
@@ -421,9 +429,13 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
-                lazy=lazy_weights,
+                lazy=lazy_weights or bool(expert_cache_bytes),
                 revision=revision,
             )
+            if expert_cache_bytes:
+                self._runner._expert_store = ExpertStore.install(
+                    model, model_name, revision, expert_cache_bytes
+                )
 
         loaded_from = (
             gguf_source.weights_path if gguf_source is not None else model_name
@@ -631,6 +643,17 @@ class ModelLifecycle:
                 if ssm != torch.float32 and not (model_config.dtype == conv == ssm):
                     raise ValueError(
                         "GDN requires matching model/cache dtypes or "
+                        "--mamba-ssm-cache-dtype float32."
+                    )
+                # Verify scans round state only at the span end; low-precision
+                # decode rounds after every token, producing a different state.
+                if (
+                    self._runner.vllm_config.speculative_config is not None
+                    and ssm != torch.float32
+                ):
+                    raise NotImplementedError(
+                        "Speculative decoding on hybrid GDN targets requires "
+                        "float32 recurrent state; pass "
                         "--mamba-ssm-cache-dtype float32."
                     )
             self._runner.hybrid_runtime_plan = plan

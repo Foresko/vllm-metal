@@ -502,7 +502,7 @@ def test_unsupported_kv_lora_rank_raises() -> None:
     context_lens = mx.array([1], dtype=mx.uint32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
 
-    with pytest.raises(RuntimeError, match="kv_lora_rank=512"):
+    with pytest.raises(RuntimeError, match="no instantiation for kv_lora_rank=16"):
         out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -663,7 +663,7 @@ def test_g_unsupported_raises() -> None:
     context_lens = mx.array([1], dtype=mx.uint32)
     cu_seqlens_q = mx.array([0, 1], dtype=mx.int32)
 
-    with pytest.raises(RuntimeError, match=r"heads_per_tg must be in \{1, 2\}"):
+    with pytest.raises(RuntimeError, match="heads_per_tg=4"):
         out = metal_mla_paged_attention(
             q_nope=q_nope,
             q_pe=q_pe,

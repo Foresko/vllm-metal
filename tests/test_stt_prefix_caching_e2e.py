@@ -19,7 +19,6 @@ The LLM body runs in a spawned child process, as in
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 
 import pytest
@@ -106,13 +105,5 @@ def _run_repeated_transcription() -> None:
 
 @pytest.mark.slow
 @pytest.mark.network
-def test_repeated_transcription_is_served_from_its_audio() -> None:
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_run_repeated_transcription)
-    proc.start()
-    proc.join()
-    if proc.exitcode != 0:
-        raise AssertionError(
-            f"Repeated-transcription e2e test failed in spawned child "
-            f"(exit code: {proc.exitcode})"
-        )
+def test_repeated_transcription_is_served_from_its_audio(run_in_spawn_process) -> None:
+    run_in_spawn_process(_run_repeated_transcription)

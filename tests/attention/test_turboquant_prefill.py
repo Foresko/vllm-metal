@@ -2,15 +2,39 @@
 """Exercise production routing, fused cache writes and native TQ attention."""
 
 import gc
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import mlx.core as mx
 import numpy as np
 import pytest
+import torch
+from vllm.config import VllmConfig
+from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
 
 from tools.benchmark.tq_prefill_case import build_case
-from vllm_metal.attention.caches.turboquant import get_v_centroids, turbo_quant_decode
-from vllm_metal.attention.impls import sdpa
+from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
+from vllm_metal.attention.caches.storage import KVCacheStorage
+from vllm_metal.attention.caches.turboquant import (
+    get_v_centroids,
+    prefill_bytes_per_token,
+    prefill_workspace_bytes,
+    turbo_quant_decode,
+)
+from vllm_metal.attention.context import (
+    PagedAttentionContext,
+    clear_context,
+    get_context,
+    prepare_grouped,
+)
+from vllm_metal.attention.impls import sdpa, turboquant_prefill
+from vllm_metal.attention.impls.turboquant_prefill import (
+    unsupported_reason,
+    workspace_upper_bound,
+)
 from vllm_metal.metal import get_ops
+from vllm_metal.v1.cache_policy import TurboQuantAttentionSpec
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +100,28 @@ def assert_parity(case):
     return output, reference
 
 
+def test_unsupported_reason_covers_each_gate() -> None:
+    """Every rejection arm names what disqualifies the model or layout."""
+    ok = {
+        "dtype": mx.float16,
+        "head_dim": 128,
+        "kernel_block_size": 16,
+        "cache_block_size": 32,
+        "stored_block_size": 32,
+    }
+    assert unsupported_reason(**ok) is None
+    assert "dtype" in unsupported_reason(**{**ok, "dtype": mx.float32})
+    assert "head_dim" in unsupported_reason(**{**ok, "head_dim": 96})
+    # Layout gates: kernel block must be a supported divisor of the cache
+    # block, and the stored layout must match the scheduler's.
+    for bad in (
+        {"kernel_block_size": 64},
+        {"stored_block_size": 16},
+        {"cache_block_size": 33},
+    ):
+        assert "cache layout" in unsupported_reason(**{**ok, **bad})
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize(
     ("k_quant", "v_quant"),
@@ -96,6 +142,7 @@ def test_prefill_quantization_formats(
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
     assert kwargs["window_seqlen_q"] == case.ctx.verify_window_q == 1
+    assert kwargs["nax_split_hint"] == 0  # Two full Q blocks retain the original loop.
     assert args[1].dtype == dtype
     assert args[1].shape == (17, 16, 2, 128)
 
@@ -119,6 +166,7 @@ def test_prefill_strided_translated_pages(
     assert_parity(case)
     args, kwargs = recorded_ops[0]
     assert not kwargs.get("use_turboquant", False)
+    assert kwargs["nax_split_hint"] == 1
     kb = args[9]
     # Only ceil(valid KV / kernel block) pages, even if the scheduler page
     # contains many unused sub-blocks and the input table has spare capacity.
@@ -150,6 +198,15 @@ def test_mixed_batch_routes_and_restores_rows(recorded_ops, prefill_backend):
     # long decode's 4097 tokens nor its rectangular padding is materialized.
     assert prefill[0][1].shape[0] == 24 + 41 - 16
     assert prefill[0][6][0, 0].item() == prefill[0][6][1, 0].item()
+
+
+def test_nax_hint_describes_only_the_dequantized_prefill(recorded_ops):
+    """The compressed short request must not suppress the full prefill blocks."""
+    case = build_case(qlens=(256, 63), context_lens=(257, 2111))
+    assert_parity(case)
+    prefill = [kw for _, kw in recorded_ops if not kw.get("use_turboquant", False)]
+    assert len(prefill) == 1
+    assert prefill[0]["nax_split_hint"] == 1
 
 
 @pytest.mark.parametrize("qlen", [1, 2, 32, 127, 128])
@@ -243,14 +300,14 @@ def test_peak_materialization_fits_reserved_allowance(
     mx.synchronize()
     extra = mx.get_peak_memory() - before
     assert materialized_lengths == [14080]
-    assert extra < sdpa.prefill_workspace_bytes(), extra
+    assert extra < prefill_workspace_bytes(), extra
 
 
 @pytest.mark.parametrize("mib", [0, 1, 16])
 def test_admission_uses_rounded_blocks_at_budget_boundary(monkeypatch, mib):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", str(mib))
     case = build_case()
-    block_bytes = 16 * sdpa.prefill_bytes_per_token(2, 128) + 4
+    block_bytes = 16 * prefill_bytes_per_token(2, 128) + 4
     blocks = mib * 2**20 // block_bytes
     for extra, selected in [(0, mib != 0), (1, False)]:
         case.ctx.context_lens = [max(128, (blocks + extra) * 16)]
@@ -341,6 +398,130 @@ def test_prefill_metadata_reused_only_within_forward(recorded_ops):
     assert next(iter(fresh.tq_prefill_plans.values())) is not plan
 
 
+@pytest.mark.parametrize("block_size", [16, 544])
+def test_hybrid_groups_keep_separate_plans_and_reuse_them_within_group(
+    block_size, prefill_backend
+):
+    """Two SDPA groups interleaved with recurrent state use their own page maps."""
+    case = build_case(block_size=block_size)
+    attention = TurboQuantAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.int8,
+        k_quant="q8_0",
+        v_quant="q3_0",
+    )
+    state = MambaSpec(
+        block_size=block_size,
+        shapes=((2, 4), (1, 4, 32)),
+        dtypes=(torch.float16, torch.float32),
+        page_size_padded=attention.page_size_bytes,
+        mamba_cache_mode="align",
+    )
+    groups = [
+        KVCacheGroupSpec(layer_names=["a0", "a1"], kv_cache_spec=attention),
+        KVCacheGroupSpec(layer_names=["s0", "s1"], kv_cache_spec=state),
+        KVCacheGroupSpec(layer_names=["a2", "a3"], kv_cache_spec=attention),
+    ]
+    pages = (257 + block_size - 1) // block_size
+    count = 2 * pages + 3
+    config = VllmConfig()
+    config.cache_config.kv_cache_layout = "LBNHC"
+    layout = get_kv_cache_config_from_groups(
+        config, groups, count * attention.page_size_bytes * 2
+    )
+    layout.kv_cache_layout = "LBNHC"
+    storage = KVCacheStorage(layout)
+    storage.zero_blocks(list(range(layout.num_blocks)))
+    cache = MetalPagedKVCache.from_upstream(
+        storage, ["a0", "a1", "a2", "a3"], dtype=mx.bfloat16
+    )
+    tables = [list(range(1, 1 + pages)), list(range(pages + 2, 2 * pages + 2))]
+    for layer, group in enumerate([0, 0, 1, 1]):
+        slots = [
+            tables[group][t // block_size] * block_size + t % block_size
+            for t in range(129)
+        ]
+        k = mx.random.normal((129, 2, 128), key=mx.random.key(101 + layer)).astype(
+            mx.bfloat16
+        )
+        v = mx.random.normal(k.shape, key=mx.random.key(201 + layer)).astype(
+            mx.bfloat16
+        )
+        arrays = (
+            cache.key_caches,
+            cache.value_caches,
+            cache.key_scale_caches,
+            cache.value_scale_caches,
+            cache.key_zero_caches,
+        )
+        updated = get_ops().tq_encode(
+            k,
+            v,
+            *(array[layer] for array in arrays),
+            mx.array(slots, mx.int64),
+            get_v_centroids(3),
+            3,
+            8,
+            True,
+        )
+        for array, value in zip(arrays, updated, strict=True):
+            array[layer] = value
+        mx.eval(*updated)
+    allowance = workspace_upper_bound(
+        max_model_len=257,
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        block_size=block_size,
+    )
+    prepare_grouped(
+        [],
+        [(tables, 128, 129)],
+        [block_size, block_size],
+        tq_prefill_workspace_bytes=allowance,
+    )
+    ctx = get_context()
+    assert ctx is not None
+    try:
+        reference = []
+        with patch.object(sdpa, "_turboquant_prefill_plan", return_value=None):
+            for layer in range(3):
+                ctx.kernel_metadata_cache.clear()
+                out = sdpa.sdpa_forward(case.inner, case.x, ctx, cache, layer)[0]
+                mx.eval(out)
+                reference.append(out)
+        ctx.kernel_metadata_cache.clear()
+        first_plan = None
+        for layer in range(3):
+            out = sdpa.sdpa_forward(case.inner, case.x, ctx, cache, layer)[0]
+            mx.eval(out)
+            np.testing.assert_allclose(
+                np.array(out.astype(mx.float32)),
+                np.array(reference[layer].astype(mx.float32)),
+                atol=0.02,
+                rtol=0.03,
+            )
+            group = cache.group_index_for_layer(layer)
+            meta = ctx.kernel_metadata_cache[(group, block_size)]
+            plan = next(iter(meta.tq_prefill_plans.values()))
+            assert plan is not None
+            assert plan.workspace_bytes <= ctx.tq_prefill_workspace_bytes
+            assert set(plan.pool_pages.tolist()) == set(tables[group])
+            if layer == 0:
+                first_plan = plan
+            elif layer == 1:
+                assert plan is first_plan
+            else:
+                assert plan is not first_plan
+        assert len(ctx.kernel_metadata_cache) == 2
+    finally:
+        clear_context()
+
+
 def test_read_existing_cache_stays_read_only(recorded_ops):
     case = build_case(k_quant="q4_0", v_quant="q4_0")
     output = case.forward()
@@ -357,6 +538,32 @@ def test_read_existing_cache_stays_read_only(recorded_ops):
     mx.eval(read_output)
     assert mx.array_equal(output, read_output).item()
     np.testing.assert_array_equal(before, np.array(case.cache._storage.buffers[0]))
+
+
+def test_admission_thresholds_computed_once_per_forward():
+    # The thresholds depend on geometry, format and context, never on the
+    # layer, so one forward computes them once and each layer reuses them.
+    case = build_case(qlens=(128, 128), context_lens=(257, 1153))
+    meta = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+    seen = []
+    original = turboquant_prefill.min_prefill_tokens
+
+    def counting(*args, **kwargs):
+        seen.append(kwargs["context_len"])
+        return original(*args, **kwargs)
+
+    with patch.object(turboquant_prefill, "min_prefill_tokens", counting):
+        for _layer in range(3):
+            sdpa._turboquant_prefill_plan(
+                case.ctx, meta, case.ctx.block_tables, 16, 8, 2, 128
+            )
+        case.ctx.kernel_metadata_cache.clear()
+        fresh = sdpa._kernel_metadata(case.ctx, None, [], case.ctx.block_tables, 16)
+        sdpa._turboquant_prefill_plan(
+            case.ctx, fresh, case.ctx.block_tables, 16, 8, 2, 128
+        )
+
+    assert seen == [257, 1153, 257, 1153]
 
 
 @pytest.mark.parametrize("block_size", [16, 544])
@@ -536,8 +743,10 @@ def test_prefill_plan_rejects_missing_query_lengths():
 @pytest.mark.parametrize("mode", ["", "false", "2", "AUTO"])
 def test_prefill_rejects_invalid_mode(monkeypatch, mode):
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL", mode)
-    with pytest.raises(ValueError, match="VLLM_METAL_TQ_PREFILL must be auto, 0 or 1"):
-        sdpa.prefill_workspace_bytes()
+    with pytest.raises(
+        ValueError, match="VLLM_METAL_TQ_PREFILL must be one of auto, 0, 1"
+    ):
+        prefill_workspace_bytes()
 
 
 @pytest.mark.parametrize("mode", ["0", "auto", "1"])
@@ -551,7 +760,7 @@ def test_prefill_rejects_invalid_workspace_even_when_disabled(
         ValueError,
         match="VLLM_METAL_TQ_PREFILL_MAX_MIB must be auto or a nonnegative integer",
     ):
-        sdpa.prefill_workspace_bytes()
+        prefill_workspace_bytes()
 
 
 @pytest.mark.parametrize(
@@ -567,7 +776,7 @@ def test_auto_workspace_scales_with_device_and_keeps_a_ceiling(
         "device_info",
         lambda: {"max_recommended_working_set_size": working_mib * 2**20},
     )
-    assert sdpa.prefill_workspace_bytes() == expected_mib * 2**20
+    assert prefill_workspace_bytes() == expected_mib * 2**20
 
 
 @pytest.mark.parametrize(
@@ -577,13 +786,13 @@ def test_auto_workspace_scales_with_device_and_keeps_a_ceiling(
 def test_long_context_admission_with_fused_workspace(
     monkeypatch, setting, length, selected
 ):
-    case = build_case()
     monkeypatch.setenv("VLLM_METAL_TQ_PREFILL_MAX_MIB", setting)
     monkeypatch.setattr(
         mx,
         "device_info",
         lambda: {"max_recommended_working_set_size": 53088 * 2**20},
     )
+    case = build_case()
     # Inspect long-context admission without allocating a full KV pool.
     case.ctx.context_lens = [length]
     case.ctx.block_tables = [list(range((length + 15) // 16))]
@@ -593,7 +802,38 @@ def test_long_context_admission_with_fused_workspace(
     )
     assert (plan is not None) == selected
     if plan is not None:
-        assert plan.workspace_bytes <= sdpa.prefill_workspace_bytes()
+        assert plan.workspace_bytes <= prefill_workspace_bytes()
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 544])
+@pytest.mark.parametrize("length", [4097, 131073])
+def test_auto_cap_covers_independent_histories_and_split_routing(block_size, length):
+    # Admission only: the new-query budget is small, but both prefills must
+    # still read their entire independent histories, alongside a decode row.
+    pages = (length + block_size - 1) // block_size
+    tables = [list(range(i * pages, (i + 1) * pages)) for i in range(3)]
+    allowance = workspace_upper_bound(
+        max_model_len=length,
+        max_num_seqs=3,
+        max_num_batched_tokens=257,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        block_size=block_size,
+    )
+    ctx = PagedAttentionContext(
+        slot_mapping=[],
+        block_tables=tables,
+        context_lens=[length] * 3,
+        cu_seqlens=[0, 128, 129, 257],
+        tq_prefill_workspace_bytes=allowance,
+    )
+    meta = sdpa._kernel_metadata(ctx, 0, [], tables, block_size)
+    plan = sdpa._turboquant_prefill_plan(ctx, meta, tables, block_size, 8, 2, 128)
+    assert plan is not None
+    assert plan.prefill.seq_lens.tolist() == [length, length]
+    assert plan.fallback.seq_lens.tolist() == [length]
+    assert plan.workspace_bytes <= allowance
 
 
 def test_materialization_workspace_does_not_accumulate_across_layers(
@@ -610,20 +850,36 @@ def test_materialization_workspace_does_not_accumulate_across_layers(
             x = sdpa.sdpa_forward(case.inner, x, case.ctx, case.cache, 0)[0][..., :32]
         return x
 
-    mx.eval(chain())
-    materialized_lengths.clear()
-    mx.synchronize()
-    mx.clear_cache()
-    before = mx.get_active_memory()
-    mx.reset_peak_memory()
-    result = chain()
-    mx.eval(result)
-    mx.synchronize()
+    def peak(reference):
+        context = (
+            patch.object(sdpa, "_turboquant_prefill_plan", return_value=None)
+            if reference
+            else nullcontext()
+        )
+        with context:
+            mx.eval(chain())
+            materialized_lengths.clear()
+            gc.collect()
+            mx.synchronize()
+            mx.clear_cache()
+            before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            result = chain()
+            mx.eval(result)
+            mx.synchronize()
+            extra = mx.get_peak_memory() - before
+            assert mx.all(mx.isfinite(result)).item()
+            del result
+            return extra
+
+    reference_peak = peak(True)
+    lane_peak = peak(False)
     assert materialized_lengths == [8192] * 8
-    # The reservation must cover consecutive layers without retaining each
-    # layer's temporary K/V until the end of the forward pass.
-    assert mx.get_peak_memory() - before < sdpa.prefill_workspace_bytes()
-    assert mx.all(mx.isfinite(result)).item()
+    meta = next(iter(case.ctx.kernel_metadata_cache.values()))
+    plan = next(iter(meta.tq_prefill_plans.values()))
+    # Match the whole forward's ordinary allocations instead of charging
+    # their platform-dependent peak against the materialization allowance.
+    assert lane_peak - reference_peak < 1.25 * plan.workspace_bytes
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])

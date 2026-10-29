@@ -48,6 +48,46 @@ def test_mask_matches_brute_force(q_lo, n, k_lo, block, window) -> None:
     )
 
 
+def _decoder_reference(block, k_lo, num_keys, window):
+    """mlx_vlm DiffusionGemma ``_make_decoder_masks``: one row for the canvas."""
+    b0, b1 = block
+    k = np.arange(k_lo, k_lo + num_keys)
+    row = ((k >= b0 - (window - 1)) & (k < b0)) | ((k >= b0) & (k < b1))
+    return np.broadcast_to(row, (b1 - b0, num_keys))
+
+
+@pytest.mark.parametrize(
+    "block, window",
+    [
+        ((600, 632), 128),  # committed context longer than the window
+        ((600, 800), 128),  # canvas longer than the window
+        ((20, 52), 128),  # context shorter than the window
+        ((0, 4), 8),  # canvas at position 0
+    ],
+)
+def test_block_anchored_window_matches_the_decoder_mask(block, window) -> None:
+    b0, b1 = block
+    k_lo = max(0, b0 - window + 1)
+    got = build_bidi_mask(
+        b0, b1 - b0, k_lo, b1 - k_lo, block, window, window_at_block_start=True
+    )
+    np.testing.assert_array_equal(
+        got, _decoder_reference(block, k_lo, b1 - k_lo, window)
+    )
+
+
+def test_per_row_window_drops_context_the_decoder_keeps() -> None:
+    """The image-block rule loses ``i`` encoder keys on canvas row ``i``."""
+    block, window = (600, 632), 128
+    k_lo = block[0] - window + 1
+    per_row = build_bidi_mask(600, 32, k_lo, 32 + window - 1, block, window)
+    anchored = build_bidi_mask(
+        600, 32, k_lo, 32 + window - 1, block, window, window_at_block_start=True
+    )
+    assert anchored.all()
+    assert (~per_row).sum(axis=1).tolist() == list(range(32))
+
+
 def test_mask_without_block_is_causal_and_windowed() -> None:
     got = build_bidi_mask(4, 4, 0, 8, (0, 0), 3)
     assert got.tolist() == [
@@ -74,7 +114,7 @@ def test_slot_indices_follow_the_block_table() -> None:
 def test_gather_kv_reads_rows_and_slices_head_dim() -> None:
     cache = mx.arange(3 * 4 * 2 * 6, dtype=mx.float32).reshape(3, 4, 2, 6)
     slots = mx.array([5, 0, 11], dtype=mx.int32)
-    got = gather_kv(cache, slots, 4)
+    got = gather_kv(cache, slots, 4, cache[0].size)
     flat = cache.reshape(-1, 2, 6)
     expected = mx.stack([flat[5], flat[0], flat[11]])[:, :, :4]
     assert got.shape == (3, 2, 4)

@@ -3,6 +3,8 @@
 To run a released build, use the [installation guide](installation.md).
 The setup below is for editing vllm-metal itself.
 
+For the experimental backend, follow the [PyTorch MPS decision contract](pytorch-mps.md).
+
 ## Development setup
 
 On an Apple Silicon Mac, install full
@@ -28,15 +30,14 @@ toolchain if needed. Restart the server after editing Python files.
 
 ## Editing the Metal kernels
 
-When changing `.metal` shaders or `paged_ops.cpp`, enable source builds:
+When changing `.metal` shaders or the Metal ops C++ sources, enable source builds:
 
 ```bash
 VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve <model>
 ```
 
-Restart the process after each edit. This mode rebuilds the C++ extension when
-its inputs change and compiles shaders through MLX; no separate `.metallib`
-build is needed. To refresh the prebuilt artifacts instead, run
+Restart the process after each edit. This mode rebuilds the selected backend's native
+extension and shaders. To refresh both launchers and the shared prebuilt artifacts, run
 `python -m vllm_metal.metal.build`. Stale local artifacts are rejected when
 source mode is disabled.
 
@@ -55,7 +56,7 @@ Model parity runs separately through [scheduled and requested CI](tools.md#sched
 ## Pull requests
 
 - **Model changes:** run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
-- **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results.
+- **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results, following the [macOS benchmarking guide](benchmarking-macos.md) for workload, machine-state and dispatch controls.
 
 Sign off each commit to certify agreement with the [Developer Certificate of
 Origin](https://developercertificate.org/), then push to your fork:
@@ -73,3 +74,6 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 uv pip install -r docs/requirements-docs.txt
 mkdocs serve
 ```
+
+For the Mac-memory guide, edit recipe commands and notes in `recipes/overlays/`.
+Choose and order recommendations in `recipes/featured.yaml`.

@@ -9,7 +9,9 @@ import logging
 import mlx.core as mx
 import numpy as np
 import pytest
+import torch
 
+from vllm_metal.attention.block_tables import build_block_tables
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.bidi_prefill import (
     apply_bidirectional_segments,
@@ -17,8 +19,8 @@ from vllm_metal.attention.impls.bidi_prefill import (
     gather_kv,
     slot_indices,
 )
-from vllm_metal.attention.impls.sdpa import _build_block_tables
 from vllm_metal.metal import get_ops
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 BLOCK = 16
 HEADS, KV_HEADS, HD = 4, 2, 64
@@ -37,8 +39,7 @@ def _setup(seed: int, *, n: int, seq_len: int, num_blocks: int = 128):
 
 
 def _kernel(query, key_cache, value_cache, table, *, n, seq_len, window):
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -51,7 +52,6 @@ def _kernel(query, key_cache, value_cache, table, *, n, seq_len, window):
         BLOCK,
         seq_len,
         window if window is not None else -1,
-        out,
     )
     mx.eval(out)
     return out
@@ -82,8 +82,7 @@ def _kernel_multi(
     query, key_cache, value_cache, table, *, kv_lens, cu_seqlens_q, window
 ):
     """``_kernel`` for a whole batch: per-segment kv lens, query offsets, tables."""
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -96,7 +95,6 @@ def _kernel_multi(
         BLOCK,
         max(kv_lens),
         window if window is not None else -1,
-        out,
     )
     mx.eval(out)
     return out
@@ -140,8 +138,8 @@ def test_assembled_causal_path_matches_kernel(window) -> None:
     q_lo = seq_len - n
     k_lo = max(0, q_lo - window + 1) if window is not None else 0
     slots = slot_indices(table[0], BLOCK, k_lo, seq_len)
-    keys = gather_kv(key_cache, slots, HD)
-    values = gather_kv(value_cache, slots, HD)
+    keys = gather_kv(key_cache, slots, HD, key_cache[0].size)
+    values = gather_kv(value_cache, slots, HD, value_cache[0].size)
     mask = mx.array(build_bidi_mask(q_lo, n, k_lo, seq_len - k_lo, (0, 0), window))
     got = mx.fast.scaled_dot_product_attention(
         query.transpose(1, 0, 2)[None],
@@ -171,6 +169,7 @@ def test_block_rows_are_recomputed_with_the_bidirectional_mask(window) -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -199,6 +198,51 @@ def test_block_rows_are_recomputed_with_the_bidirectional_mask(window) -> None:
     assert ctx.bidi_logged is True
 
 
+@pytest.mark.parametrize("canvas", [32, 200])
+def test_decoder_canvas_window_is_anchored_at_the_block_start(canvas) -> None:
+    """DiffusionGemma: every canvas row sees the last ``window - 1`` committed
+    keys plus the whole canvas, even with a canvas longer than the window.
+
+    The canvas is the whole query, so every row is recomputed and the kernel
+    output underneath is irrelevant.
+    """
+    window, b0 = 128, 400
+    b1 = b0 + canvas
+    n, seq_len = canvas, b1
+    key_cache, value_cache, query, table = _setup(5, n=n, seq_len=seq_len)
+    out = mx.zeros((n, HEADS, HD), dtype=DTYPE)
+    ctx = _ctx(n, seq_len, [(b0, b1)])
+    ctx.bidi_window_at_block_start = True
+    got = apply_bidirectional_segments(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        block_tables=table,
+        block_size=BLOCK,
+        block_stride=key_cache[0].size,
+        cu_seqlens=[0, n],
+        context_lens=[seq_len],
+        ctx=ctx,
+        window=window,
+        scale=HD**-0.5,
+        head_dim=HD,
+        softcap=0.0,
+        sinks=None,
+        turboquant=False,
+    )
+    mx.eval(got)
+    k_lo = b0 - (window - 1)
+    row_table = table[0].tolist()
+    ref = _ref_attention(
+        np.array(query.astype(mx.float32)),
+        _rows(key_cache, row_table, k_lo, b1),
+        _rows(value_cache, row_table, k_lo, b1),
+        np.ones((n, b1 - k_lo), dtype=bool),
+    )
+    np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)
+
+
 def test_block_head_in_context_is_read_from_the_cache() -> None:
     """Prefix-hit shape: the block starts below q_lo, only its tail is recomputed."""
     n, seq_len, window = 64, 300, 128
@@ -214,6 +258,7 @@ def test_block_head_in_context_is_read_from_the_cache() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=_ctx(n, seq_len, [(b0, b1)]),
@@ -251,6 +296,7 @@ def test_ranges_outside_the_queries_leave_the_output_untouched() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -268,12 +314,40 @@ def test_ranges_outside_the_queries_leave_the_output_untouched() -> None:
 def test_gather_follows_hybrid_block_size_translation() -> None:
     """vLLM block 64 → kernel block 32: slots must index the reshaped view."""
     cache64 = mx.random.normal((8, 64, KV_HEADS, HD)).astype(DTYPE)
-    tables, kernel_bs = _build_block_tables([[3, 5]], 64)
+    tables, kernel_bs = build_block_tables([[3, 5]], 64)
     view = cache64.reshape(-1, kernel_bs, KV_HEADS, HD)
-    got = gather_kv(view, slot_indices(tables[0], kernel_bs, 10, 100), HD)
+    got = gather_kv(view, slot_indices(tables[0], kernel_bs, 10, 100), HD, view[0].size)
     expected = mx.stack([cache64[[3, 5][p // 64], p % 64] for p in range(10, 100)])
     mx.eval(got, expected)
     assert mx.array_equal(got, expected)
+
+
+def test_gather_reads_blocks_past_32_bit_offsets() -> None:
+    """A pooled cache region whose strides reach past INT32_MAX elements.
+
+    MLX gathers from such a view with 32-bit offsets; the rows of blocks past
+    the limit came back as garbage, and DiffusionGemma's canvas turned to NaN.
+    """
+    block_size, head_dim, block_stride = 16, 64, 1 << 16
+    num_blocks = (1 << 15) + 2
+    # Uncommitted, as KVCacheStorage allocates it: only written pages are
+    # resident.
+    backing = torch.empty((num_blocks, block_stride), dtype=torch.uint8)
+    cache = get_ops().as_strided(
+        torch_to_mlx(backing),
+        (num_blocks, block_size, 1, head_dim),
+        (block_stride, block_stride // block_size, head_dim, 1),
+        0,
+    )
+    blocks = [1, num_blocks - 1]
+    for value, block in enumerate(blocks, start=1):
+        backing[block] = value
+    slots = slot_indices(mx.array(blocks, dtype=mx.int32), block_size, 0, 32)
+    got = gather_kv(cache, slots, head_dim, block_stride)
+    expected = np.repeat([1, 2], block_size)[:, None, None]
+    np.testing.assert_array_equal(
+        np.array(got), np.broadcast_to(expected, (32, 1, head_dim))
+    )
 
 
 def test_softcap_and_turboquant_are_refused() -> None:
@@ -283,6 +357,7 @@ def test_softcap_and_turboquant_are_refused() -> None:
     common = {
         "block_tables": table,
         "block_size": BLOCK,
+        "block_stride": key_cache[0].size,
         "cu_seqlens": [0, n],
         "context_lens": [seq_len],
         "ctx": _ctx(n, seq_len, [(0, 8)]),
@@ -317,6 +392,7 @@ def test_two_blocks_in_one_segment_are_spliced_in_order() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=ctx,
@@ -371,6 +447,7 @@ def test_narrow_head_dim_rows_are_repadded() -> None:
         value_cache,
         block_tables=table,
         block_size=BLOCK,
+        block_stride=key_cache[0].size,
         cu_seqlens=[0, n],
         context_lens=[seq_len],
         ctx=_ctx(n, seq_len, [(b0, b1)]),
@@ -461,6 +538,7 @@ def test_two_segments_with_blocks_are_spliced_independently() -> None:
             value_cache,
             block_tables=table,
             block_size=BLOCK,
+            block_stride=key_cache[0].size,
             cu_seqlens=cu_seqlens,
             context_lens=context_lens,
             ctx=ctx,
@@ -509,35 +587,50 @@ def test_two_segments_with_blocks_are_spliced_independently() -> None:
 
 
 @pytest.mark.parametrize("magnitude", [1.5, 2.0, 4.0])
+@pytest.mark.parametrize("poisoned_group", [0, 1])
 def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
-    magnitude,
+    magnitude, poisoned_group
 ) -> None:
-    """The KV tile loop starts at the tile holding the window of the
-    threadgroup's first row, so a row far enough behind it sees that whole
-    first tile masked.  Its -INFINITY row max must not clamp the running
-    max to 0: later in-window keys would be weighted by exp2(score) instead
-    of exp2(score - max), collapsing rows whose real scores are far below 0
-    (#876).
+    """A KV tile fully masked for a row must not affect that row's max
+    state or its V output (#876).  The masked V slots carry +/-fp16-max:
+    a leaked weight swings the output far past the reference, while the
+    correct kernel contributes exactly 0.  (inf would poison the
+    *correct* kernel too — the PV MMA computes 0 * inf = NaN for
+    P == 0 elements.)
 
-    64 rows span two 32-row threadgroups (BQ == TILE_KV).  seq_len 216 puts
-    row 0's window start at key 57 == 25 mod 32, so the last 25 rows of each
-    threadgroup see the first scanned tile fully masked.  q = a*ones and
-    k = -a*ones + noise put every in-window scaled score near -8*a*a.
+    One threadgroup's first tile is poisoned per case.  Rows of an earlier
+    threadgroup read those keys inside their window, so their reference is
+    dominated by the poison and a relative tolerance says nothing about
+    them; the tight comparison covers the poisoned group and every group
+    after it.
     """
     n, seq_len, window = 64, 216, 96
+    cfg = get_ops().tile_config(HD)
+    assert cfg is not None
+    bq, tile_kv = cfg
+    assert n == 2 * bq
     row0_win_start = (seq_len - n) + 1 - window
-    assert row0_win_start % 32 == 25
+    assert row0_win_start % tile_kv == 25
     key_cache, value_cache, _, table = _setup(0, n=n, seq_len=seq_len)
     mx.random.seed(3)
     query = (mx.ones((n, HEADS, HD)) * magnitude).astype(DTYPE)
     key_cache = (
         -magnitude * mx.ones(key_cache.shape) + 0.05 * mx.random.normal(key_cache.shape)
     ).astype(DTYPE)
-    mx.eval(query, key_cache)
+    # Keys left of a threadgroup's first row's window start are masked for
+    # every row in the group; poison their V slots.
+    table_row = table[0].tolist()
+    huge = np.finfo(np.float16).max
+    vc = np.array(value_cache)
+    first_row = poisoned_group * bq
+    w0 = row0_win_start + first_row
+    for p in range(w0 - w0 % tile_kv, w0):
+        vc[table_row[p // BLOCK], p % BLOCK] = huge if p % 2 == 0 else -huge
+    value_cache = mx.array(vc)
+    mx.eval(query, key_cache, value_cache)
     got = _kernel(
         query, key_cache, value_cache, table, n=n, seq_len=seq_len, window=window
     )
-    table_row = list(range(1, (seq_len + BLOCK - 1) // BLOCK + 1))
     qi = np.arange(seq_len - n, seq_len)[:, None]
     ki = np.arange(seq_len)[None, :]
     mask = (ki <= qi) & (qi - ki < window)
@@ -547,4 +640,6 @@ def test_tiled_prefill_rows_behind_masked_first_tile_stay_neutral(
         _rows(value_cache, table_row, 0, seq_len),
         mask,
     )
-    np.testing.assert_allclose(np.array(got), ref, atol=1.5e-2, rtol=1e-2)
+    out = np.array(got)
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out[first_row:], ref[first_row:], atol=1.5e-2, rtol=1e-2)

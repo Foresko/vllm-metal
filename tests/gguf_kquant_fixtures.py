@@ -17,12 +17,18 @@ def build_kquant_blocks(
         raise ValueError(f"K-quant rows need a multiple of 256 columns, got {cols}")
     if qtype == QT.Q6_K:
         return _build_q6k(rows, cols, seed)
+    if qtype == QT.Q2_K:
+        return _build_q2k(rows, cols, seed)
+    if qtype == QT.Q3_K:
+        return _build_q3k(rows, cols, seed)
     if qtype in (QT.Q4_K, QT.Q5_K):
         return _build_q45k(rows, cols, qtype, seed)
     raise ValueError(f"no K-quant block builder for {qtype.name}")
 
 
-def _build_q45k(rows: int, cols: int, qtype, seed: int) -> np.ndarray:
+def _build_q45k(
+    rows: int, cols: int, qtype: gguf.GGMLQuantizationType, seed: int
+) -> np.ndarray:
     five_bit = qtype == QT.Q5_K
     rng = np.random.default_rng(seed)
     n = rows * (cols // 256)
@@ -69,4 +75,59 @@ def _build_q6k(rows: int, cols: int, seed: int) -> np.ndarray:
     blocks = np.concatenate(
         [ql, qh, sub_scales.view(np.uint8), d.view(np.uint8)], axis=1
     )
+    return blocks.reshape(rows, -1)
+
+
+def _build_q2k(rows: int, cols: int, seed: int) -> np.ndarray:
+    """Build random 84-byte Q2_K superblocks, one byte row per row.
+
+    Layout: 16 bytes packing each group's 4-bit scale and 4-bit min, 64
+    two-bit code bytes, fp16 ``d``, fp16 ``dmin``.
+    """
+    rng = np.random.default_rng(seed)
+    n = rows * (cols // 256)
+    scales = rng.integers(0, 256, (n, 16), dtype=np.uint8)
+    codes = rng.integers(0, 4, (n, 256), dtype=np.uint8)
+    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    dmin = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    qs = np.zeros((n, 64), np.uint8)
+    for c in (0, 1):
+        for s in range(4):
+            qs[:, c * 32 : (c + 1) * 32] |= codes[
+                :, c * 128 + s * 32 : c * 128 + s * 32 + 32
+            ] << (2 * s)
+    blocks = np.concatenate([scales, qs, d.view(np.uint8), dmin.view(np.uint8)], axis=1)
+    return blocks.reshape(rows, -1)
+
+
+def _build_q3k(rows: int, cols: int, seed: int) -> np.ndarray:
+    """Build random 110-byte Q3_K superblocks, one byte row per row.
+
+    Layout: 32 high-bit bytes ``hmask``, 64 two-bit code bytes, twelve
+    bytes packing sixteen 6-bit sub-scales (stored as ``scale + 32``),
+    fp16 ``d``. The stored 3-bit code is the offset-binary value
+    ``q + 4``: its low 2 bits share Q2_K's ``qs`` packing and bit 2 is
+    element ``e``'s ``hmask`` bit.
+    """
+    rng = np.random.default_rng(seed)
+    n = rows * (cols // 256)
+    d = rng.uniform(2**-10, 2**-4, (n, 1)).astype(np.float16)
+    sc6 = rng.integers(0, 64, (n, 16), dtype=np.uint8)
+    c3 = rng.integers(0, 8, (n, 256), dtype=np.uint8)
+    hmask = np.zeros((n, 32), np.uint8)
+    for j in range(8):
+        hmask |= ((c3[:, j * 32 : (j + 1) * 32] >> 2) & 1) << j
+    qs = np.zeros((n, 64), np.uint8)
+    for c in (0, 1):
+        for s in range(4):
+            qs[:, c * 32 : (c + 1) * 32] |= (
+                c3[:, c * 128 + s * 32 : c * 128 + s * 32 + 32] & 3
+            ) << (2 * s)
+    scales = np.zeros((n, 12), np.uint8)
+    for i in range(8):
+        scales[:, i] = (sc6[:, i] & 0x0F) | ((sc6[:, i + 8] & 0x0F) << 4)
+    for j in range(4):
+        for k in range(4):
+            scales[:, 8 + j] |= ((sc6[:, 4 * k + j] >> 4) & 3) << (2 * k)
+    blocks = np.concatenate([hmask, qs, scales, d.view(np.uint8)], axis=1)
     return blocks.reshape(rows, -1)

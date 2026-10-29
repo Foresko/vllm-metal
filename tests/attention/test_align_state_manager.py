@@ -224,3 +224,23 @@ def test_scheduler_copy_and_zero_preserve_unrelated_compact_updates():
     assert not cache.has_pending_recurrent_state(0)
     mx.eval(*runtime.storage.buffers)
     np.testing.assert_array_equal(np.array(cache.recurrent_states[0][4]), 9)
+
+
+def test_sleep_release_discards_pending_state_and_restore_zeroes_it():
+    runtime = TestHybridAlignRuntime()._make_runtime()
+    initialize_hybrid_runtime(runtime, 8, mamba_cache_mode="align")
+    cache = runtime.state_cache
+    cache.set_pending_recurrent_state(
+        0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+    )
+
+    runtime.release_kv_memory()
+
+    assert not cache.has_pending_recurrent_state(0)
+    assert runtime.state_manager.needs_materialize is False
+
+    runtime.restore_kv_memory()
+    runtime.materialize_pending_state()
+    cache.apply_pending_states()
+    mx.eval(*runtime.storage.buffers)
+    np.testing.assert_array_equal(np.array(cache.recurrent_states[0][3]), 0)

@@ -10,13 +10,12 @@ from unittest.mock import Mock
 import pytest
 
 import vllm_metal.envs as envs
-from vllm_metal.metal import _try_init_nax_library, get_ops
+from vllm_metal.metal import _try_init_nax_library
 
 
 def _ops(*, supported: bool = True, load_error: Exception | None = None):
     return SimpleNamespace(
         nax_supported=Mock(return_value=supported),
-        init_nax_library=Mock(side_effect=load_error),
         init_nax_library_path=Mock(side_effect=load_error),
     )
 
@@ -52,7 +51,6 @@ def test_prebuilt_nax_policy(
     loaded = _try_init_nax_library(
         ops,  # type: ignore[arg-type]
         disabled=disabled,
-        build_from_source=False,
         prebuilt_path=lib,
     )
     assert loaded is expected
@@ -67,40 +65,23 @@ def test_missing_prebuilt_nax_warns_and_keeps_fallback(tmp_path: Path, caplog) -
     assert not _try_init_nax_library(
         ops,  # type: ignore[arg-type]
         disabled=False,
-        build_from_source=False,
         prebuilt_path=missing,
     )
     assert f"prebuilt library is missing at {missing}" in caplog.text
     assert "using the non-NAX fallback" in caplog.text
 
 
-@pytest.mark.parametrize("build_from_source", [False, True])
 def test_optional_load_failure_warns_and_keeps_fallback(
     tmp_path: Path,
-    monkeypatch,
     caplog,
-    build_from_source: bool,
 ) -> None:
     ops = _ops(load_error=RuntimeError("bad optional library"))
     lib = tmp_path / "paged_attention_nax_kern.metallib"
     lib.write_bytes(b"lib")
-    monkeypatch.setattr("vllm_metal.metal._build_nax_source", lambda: "nax source")
 
     assert not _try_init_nax_library(
         ops,  # type: ignore[arg-type]
         disabled=False,
-        build_from_source=build_from_source,
         prebuilt_path=lib,
     )
     assert "using the non-NAX fallback" in caplog.text
-
-
-def test_nax_loads_where_supported() -> None:
-    # The fallback above keeps prefill working, which is exactly why a NAX load
-    # failure on an M5 is otherwise only a log line.
-    if envs.VLLM_METAL_DISABLE_NAX:
-        pytest.skip("VLLM_METAL_DISABLE_NAX is set")
-    ops = get_ops()
-    if not ops.nax_supported():
-        pytest.skip("no NAX tensor units on this machine")
-    assert ops.nax_ready(), "NAX fell back to the tiled kernel; see the log warning"

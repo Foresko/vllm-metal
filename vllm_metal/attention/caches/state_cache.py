@@ -12,6 +12,7 @@ import mlx.core as mx
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
+    from vllm_metal.attention.impls.gdn_spec import GDNSpecVerifyStep
 
 
 @functools.cache
@@ -49,6 +50,10 @@ class PagedStateCache:
         self.pending_conv_slot_ids = [None] * self.num_layers
         self.pending_recurrent_states = [None] * self.num_layers
         self.pending_recurrent_slot_ids = [None] * self.num_layers
+        # Verify-span activations staged for the post-verification state
+        # fixup (speculative decode on hybrid GDN models); None off the
+        # speculative path. Owned by gdn_spec, cleared every step.
+        self.spec_verify_stash: GDNSpecVerifyStep | None = None
 
     def store_conv_state(self, layer_idx: int, array: mx.array) -> None:
         """Store a layer's updated conv pool, keeping pool siblings aliased."""
@@ -326,6 +331,15 @@ class PagedStateCache:
         for layer_idx in range(self.num_layers):
             self.apply_pending_recurrent_state(layer_idx)
 
+    def discard_pending_states(self) -> None:
+        for pending in (
+            self.pending_conv_states,
+            self.pending_conv_slot_ids,
+            self.pending_recurrent_states,
+            self.pending_recurrent_slot_ids,
+        ):
+            pending[:] = [None] * self.num_layers
+
     def apply_pending_states(self, slot_ids: Sequence[int] | None = None) -> None:
         """Flush pending components touching these slots, or all when omitted."""
         slots = None if slot_ids is None else set(slot_ids)
@@ -338,3 +352,82 @@ class PagedStateCache:
                 self.pending_recurrent_slot_ids[layer_idx] or ()
             ):
                 self.apply_pending_recurrent_state(layer_idx)
+
+
+class StateSlotArraysCache:
+    """MLX-LM ``ArraysCache`` view over scheduler-owned state rows."""
+
+    __slots__ = (
+        "_cache_idx",
+        "_conv_states",
+        "_recurrent_state",
+        "_slot_ids",
+        "_state_cache",
+    )
+    # Packed request slices are unpadded, so MLX-LM needs no length metadata.
+    lengths = None
+
+    def __init__(
+        self,
+        state_cache: PagedStateCache,
+        cache_idx: int,
+        slot_ids: mx.array,
+        *,
+        conv_widths: tuple[int, ...] | None = None,
+    ) -> None:
+        if not state_cache.recurrent_states:
+            raise ValueError("ArraysCache requires a recurrent state pool")
+
+        self._state_cache = state_cache
+        self._cache_idx = cache_idx
+        self._slot_ids = slot_ids
+        packed_conv = state_cache.conv_states[cache_idx][slot_ids]
+        if conv_widths is None:
+            self._conv_states = [packed_conv]
+        else:
+            if not conv_widths or any(width <= 0 for width in conv_widths):
+                raise ValueError("conv_widths must contain positive integers")
+            total_width = sum(conv_widths)
+            if total_width != packed_conv.shape[-1]:
+                raise ValueError(
+                    f"conv_widths total {total_width} does not match packed "
+                    f"state width {packed_conv.shape[-1]}"
+                )
+            split_points = []
+            offset = 0
+            for width in conv_widths[:-1]:
+                offset += width
+                split_points.append(offset)
+            self._conv_states = list(mx.split(packed_conv, split_points, axis=-1))
+        self._recurrent_state = state_cache.recurrent_states[cache_idx][slot_ids]
+
+    def __getitem__(self, idx: int) -> mx.array:
+        if 0 <= idx < len(self._conv_states):
+            return self._conv_states[idx]
+        if idx == len(self._conv_states):
+            return self._recurrent_state
+        raise IndexError(idx)
+
+    def __setitem__(self, idx: int, value: mx.array) -> None:
+        if 0 <= idx < len(self._conv_states):
+            self._conv_states[idx] = value
+            return
+        if idx == len(self._conv_states):
+            self._recurrent_state = value
+            return
+        raise IndexError(idx)
+
+    def advance(self, num_tokens: int) -> None:
+        """Only length metadata advances, and packed slices carry none."""
+
+    def flush(self) -> None:
+        """Write the updated cache rows back to their scheduler-owned slots."""
+        conv_state = (
+            self._conv_states[0]
+            if len(self._conv_states) == 1
+            else mx.concatenate(self._conv_states, axis=-1)
+        )
+        self._state_cache.write_conv_rows(self._cache_idx, conv_state, self._slot_ids)
+        self._state_cache.write_recurrent_rows(
+            self._cache_idx, self._recurrent_state, self._slot_ids
+        )

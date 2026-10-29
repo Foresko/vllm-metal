@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the paged attention primitive and scatter-based cache donation.
-
-Covers two of Eric's review concerns on PR #225:
-  1. No test coverage for the primitive path (paged_attention_primitive).
-  2. Buffer donation may silently fail, making scatter-based cache writes
-     O(entire_cache) instead of O(new_tokens).
+"""Tests for the paged attention primitive.
 
 Run with:
     python -m pytest tests/test_primitive_and_donation.py -v -s
@@ -19,7 +14,6 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.metal import get_ops
 
 # ── Shared fixtures ──────────────────────────────────────────────────────────
@@ -82,6 +76,46 @@ def _make_cache_and_inputs(
     }
 
 
+def _run_attention(
+    d,
+    *,
+    decode_rows: int = 0,
+    decode_context: int = 0,
+    max_seq_len: int | None = None,
+    sliding_window: int = -1,
+    sinks: mx.array | None = None,
+    decode_lengths: list[int] | None = None,
+) -> tuple[np.ndarray, str]:
+    ops = get_ops()
+    # sdpa passes a length plan describing the decode rows of a mixed batch.
+    plan = (
+        {}
+        if decode_lengths is None
+        else {"gqa_length_plan": ops.gqa_decode_length_plan(decode_lengths)}
+    )
+    out = ops.paged_attention_primitive(
+        d["query"],
+        d["key_cache"],
+        d["value_cache"],
+        d["num_kv_heads"],
+        d["scale"],
+        0.0,
+        d["block_tables"],
+        d["kv_lens_arr"],
+        d["cu_seqlens_q"],
+        BLOCK_SIZE,
+        d["max_kv_len"] if max_seq_len is None else max_seq_len,
+        sliding_window,
+        sinks=sinks,
+        num_decode_requests=decode_rows,
+        num_decode_tokens=decode_rows,
+        max_decode_context_len=decode_context,
+        **plan,
+    )
+    mx.eval(out)
+    return np.array(out.astype(mx.float32)), ops.last_paged_dispatch()
+
+
 # ── 1. Primitive correctness tests ──────────────────────────────────────────
 
 
@@ -111,8 +145,7 @@ def test_primitive_vs_reference_decode(
     num_decode_requests = len(seq_lens)
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -125,7 +158,6 @@ def test_primitive_vs_reference_decode(
         BLOCK_SIZE,
         d["max_kv_len"],
         sliding_window,
-        out,
         num_decode_requests=num_decode_requests,
         num_decode_tokens=num_decode_requests,
         max_decode_context_len=max(kv_len for _, kv_len in seq_lens),
@@ -192,8 +224,7 @@ def test_primitive_vs_reference_varlen(
     )
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -206,7 +237,6 @@ def test_primitive_vs_reference_varlen(
         BLOCK_SIZE,
         d["max_kv_len"],
         sliding_window,
-        out,
         num_decode_requests=num_decode_requests,
         num_decode_tokens=num_decode_requests,
         max_decode_context_len=max_decode_context_len,
@@ -234,81 +264,242 @@ def test_primitive_vs_reference_varlen(
 
 
 @pytest.mark.parametrize(
-    "decode_context,head_size,split_decode",
+    "decode_lengths,head_size,split_decode",
     [
-        (512, 128, False),
-        (4095, 128, False),
-        (4096, 128, True),
-        (4096, 256, True),
-        (4096, 512, True),
+        # Split once the decode rows' context lengths sum to 512 tokens.
+        ([256], 128, False),
+        ([511], 128, False),
+        ([512], 128, True),
+        # Uneven rows count their exact sum, not rows x longest context.
+        ([256, 64], 128, False),
+        ([447, 64], 128, False),
+        ([448, 64], 128, True),
+        ([256, 256], 128, True),
+        # Many short rows split: they gain the most.
+        ([64] * 33, 128, True),
+        ([4096] + [64] * 32, 128, True),
+        ([4096] + [64] * 32, 256, True),
+        ([4096] + [64] * 32, 512, True),
     ],
 )
-def test_mixed_batch_dispatches_decode_by_context(
-    decode_context: int,
+def test_mixed_batch_splits_decode_by_work(
+    decode_lengths: list[int],
     head_size: int,
     split_decode: bool,
     force_tiled_prefill,
 ) -> None:
-    """Only long decode contexts pay for a separate kernel dispatch."""
-    decode_rows = 33
-    seq_lens = [(1, decode_context)] + [(1, 64)] * (decode_rows - 1) + [(32, 64)]
+    """Enough decode work takes the decode kernel; prefill rows keep tiled bit-for-bit."""
+    decode_rows = len(decode_lengths)
+    decode_context = max(decode_lengths)
+    seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
     mx.random.seed(0)
     d = _make_cache_and_inputs(512, 2, 8, seq_lens, head_size=head_size)
     ops = get_ops()
-
-    def run_attention(
-        query: mx.array,
-        block_tables: mx.array,
-        kv_lens: mx.array,
-        cu_seqlens: mx.array,
-        decode_count: int = 0,
-        max_context: int = 0,
-    ) -> np.ndarray:
-        out = mx.array(0)
-        ops.paged_attention_primitive(
-            query,
-            d["key_cache"],
-            d["value_cache"],
-            d["num_kv_heads"],
-            d["scale"],
-            0.0,
-            block_tables,
-            kv_lens,
-            cu_seqlens,
-            BLOCK_SIZE,
-            d["max_kv_len"],
-            -1,
-            out,
-            num_decode_requests=decode_count,
-            num_decode_tokens=decode_count,
-            max_decode_context_len=max_context,
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        mixed, mixed_family = _run_attention(
+            d,
+            decode_rows=decode_rows,
+            decode_context=decode_context,
+            decode_lengths=decode_lengths,
         )
-        mx.eval(out)
-        return np.array(out)
-
-    mixed = run_attention(
-        d["query"],
-        d["block_tables"],
-        d["kv_lens_arr"],
-        d["cu_seqlens_q"],
-        decode_rows,
-        decode_context,
-    )
-    whole_tiled = run_attention(
-        d["query"], d["block_tables"], d["kv_lens_arr"], d["cu_seqlens_q"]
-    )
-    pure_decode = run_attention(
-        d["query"][:decode_rows],
-        d["block_tables"][:decode_rows],
-        d["kv_lens_arr"][:decode_rows],
-        mx.arange(decode_rows + 1, dtype=mx.int32),
-        decode_rows,
-        decode_context,
-    )
-
-    expected_decode = pure_decode if split_decode else whole_tiled[:decode_rows]
+        # Without decode metadata the batch stays on one tiled dispatch.
+        whole_tiled, whole_family = _run_attention(d)
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+    expected_decode = whole_tiled[:decode_rows]
+    if split_decode:
+        decode = {
+            **d,
+            "query": d["query"][:decode_rows],
+            "block_tables": d["block_tables"][:decode_rows],
+            "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
+            "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
+        }
+        expected_decode, _ = _run_attention(
+            decode,
+            decode_rows=decode_rows,
+            decode_context=decode_context,
+            decode_lengths=decode_lengths,
+        )
+    assert whole_family == "tiled_prefill"
+    assert mixed_family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
     np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
     np.testing.assert_array_equal(mixed[decode_rows:], whole_tiled[decode_rows:])
+
+
+@pytest.mark.parametrize(
+    "decode_lengths,split_decode",
+    [([256, 256], False), ([512, 64], True)],
+)
+def test_mixed_batch_without_length_plan_bounds_work_by_longest_row(
+    decode_lengths: list[int], split_decode: bool, force_tiled_prefill
+) -> None:
+    """Without a length plan the longest row is a lower bound on the decode work."""
+    seq_lens = [(1, length) for length in decode_lengths] + [(32, 64)]
+    mx.random.seed(0)
+    d = _make_cache_and_inputs(512, 2, 8, seq_lens)
+    ops = get_ops()
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        _, family = _run_attention(
+            d, decode_rows=len(decode_lengths), decode_context=max(decode_lengths)
+        )
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+    assert family == ("mixed_prefill_decode" if split_decode else "tiled_prefill")
+
+
+@pytest.mark.parametrize(
+    "decode_rows,decode_context,head_size,dtype,sliding_window,use_sinks",
+    [
+        (1, 4096, 128, mx.float16, -1, False),
+        (9, 16384, 128, mx.bfloat16, -1, False),
+        # Decode prefix lands on and crosses NAX's 64-row q-block boundary.
+        (64, 4096, 128, mx.float16, -1, False),
+        (65, 4096, 256, mx.bfloat16, 100, True),
+        (3, 4096, 64, mx.float16, 100, True),
+        (2, 4096, 512, mx.bfloat16, -1, False),
+        # Many short decode rows leave the NAX tile too.
+        (9, 512, 128, mx.float16, -1, False),
+        # Below the decode-work floor the whole batch stays on NAX.
+        (1, 256, 128, mx.float16, -1, False),
+        # Uneven rows: 256 + 64 stays on NAX; 448 + 64 reaches the floor.
+        (2, 256, 128, mx.float16, -1, False),
+        (2, 448, 128, mx.float16, -1, False),
+    ],
+)
+def test_nax_mixed_batch_splits_decode_prefix(
+    decode_rows: int,
+    decode_context: int,
+    head_size: int,
+    dtype: mx.Dtype,
+    sliding_window: int,
+    use_sinks: bool,
+    nax_prefill,
+) -> None:
+    """Enough decode work leaves the NAX tile; prefill rows keep NAX bit-for-bit."""
+    decode_lengths = [decode_context] + [64] * (decode_rows - 1)
+    split_decode = sum(decode_lengths) >= 512
+    seq_lens = [(1, length) for length in decode_lengths] + [(129, 259), (64, 64)]
+    mx.random.seed(0)
+    num_kv_heads, num_query_heads = 2, 8
+    d = _make_cache_and_inputs(
+        512, num_kv_heads, num_query_heads, seq_lens, head_size=head_size, dtype=dtype
+    )
+    sinks = (
+        (mx.random.normal((num_query_heads,)) * 0.5).astype(mx.float32)
+        if use_sinks
+        else None
+    )
+    if sinks is not None:
+        mx.eval(sinks)
+
+    mixed, mixed_family = _run_attention(
+        d,
+        decode_rows=decode_rows,
+        decode_context=decode_context,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        decode_lengths=decode_lengths,
+    )
+    whole_nax, whole_family = _run_attention(
+        d, sliding_window=sliding_window, sinks=sinks
+    )
+    expected_decode = whole_nax[:decode_rows]
+    if split_decode:
+        decode = {
+            **d,
+            "query": d["query"][:decode_rows],
+            "block_tables": d["block_tables"][:decode_rows],
+            "kv_lens_arr": d["kv_lens_arr"][:decode_rows],
+            "cu_seqlens_q": mx.arange(decode_rows + 1, dtype=mx.int32),
+        }
+        expected_decode, _ = _run_attention(
+            decode,
+            decode_rows=decode_rows,
+            decode_context=decode_context,
+            sliding_window=sliding_window,
+            sinks=sinks,
+            decode_lengths=decode_lengths,
+        )
+
+    assert whole_family == "nax_prefill"
+    assert mixed_family == (
+        "mixed_nax_prefill_decode" if split_decode else "nax_prefill"
+    )
+    np.testing.assert_array_equal(mixed[:decode_rows], expected_decode)
+    np.testing.assert_array_equal(mixed[decode_rows:], whole_nax[decode_rows:])
+
+    if sinks is None:
+        # Independent fp32 reference for every row of the mixed batch.
+        ref = ref_paged_attn(
+            query=d["query"].astype(mx.float32),
+            key_cache=d["key_cache"].astype(mx.float32),
+            value_cache=d["value_cache"].astype(mx.float32),
+            query_lens=d["query_lens"],
+            kv_lens=d["kv_lens"],
+            block_tables=np.array(d["block_tables"]),
+            scale=d["scale"],
+            sliding_window=sliding_window if sliding_window >= 0 else None,
+        )
+        np.testing.assert_allclose(
+            mixed, np.array(ref.astype(mx.float32)), atol=2e-2, rtol=1e-2
+        )
+
+
+@pytest.mark.parametrize("prefill_kernel", ["tiled", "nax"])
+def test_split_decode_prefix_is_bounded_by_decode_context(
+    prefill_kernel: str, request
+) -> None:
+    """An oversized allocation bound must not enlarge the decode split.
+
+    4M tokens would need 8192 P512 partitions and overflow reducer shared
+    memory; the actual 4096-token decode context needs only eight.
+    """
+    if prefill_kernel == "tiled":
+        request.getfixturevalue("force_tiled_prefill")
+        expected_family = "mixed_prefill_decode"
+    else:
+        request.getfixturevalue("nax_prefill")
+        expected_family = "mixed_nax_prefill_decode"
+    allocation_bound = 4 * 1024 * 1024
+    decode_context = 4096
+    mx.random.seed(1061)
+    d = _make_cache_and_inputs(
+        300, 8, 32, [(1, decode_context), (2, 2)], dtype=mx.bfloat16
+    )
+    # Rows may address the whole allocation: pad the table to the bound.
+    used = d["block_tables"].shape[1]
+    d["block_tables"] = mx.concatenate(
+        [
+            d["block_tables"],
+            mx.zeros((2, allocation_bound // BLOCK_SIZE - used), mx.int32),
+        ],
+        axis=1,
+    )
+    mx.eval(d["block_tables"])
+
+    ops = get_ops()
+    previous = ops._set_paged_dispatch_diagnostics(True)
+    try:
+        tight, tight_family = _run_attention(
+            d, decode_rows=1, decode_context=decode_context
+        )
+        oversized, oversized_family = _run_attention(
+            d,
+            decode_rows=1,
+            decode_context=decode_context,
+            max_seq_len=allocation_bound,
+        )
+    finally:
+        mx.synchronize()
+        ops._set_paged_dispatch_diagnostics(previous)
+
+    assert tight_family == oversized_family == expected_family
+    np.testing.assert_array_equal(oversized, tight)
 
 
 @pytest.mark.slow
@@ -330,8 +521,7 @@ def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
     ops = get_ops()
 
     def run(sliding_window: int) -> None:
-        out = mx.array(0)
-        ops.paged_attention_primitive(
+        out = ops.paged_attention_primitive(
             d["query"],
             d["key_cache"],
             d["value_cache"],
@@ -344,7 +534,6 @@ def test_sliding_window_bounds_tiled_prefill_work(force_tiled_prefill) -> None:
             BLOCK_SIZE,
             d["max_kv_len"],
             sliding_window,
-            out,
         )
         mx.eval(out)
 
@@ -382,8 +571,7 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
     d = _make_cache_and_inputs(256, 2, 8, seq_lens, head_size=head_size)
 
     ops = get_ops()
-    out = mx.array(0)
-    ops.paged_attention_primitive(
+    out = ops.paged_attention_primitive(
         d["query"],
         d["key_cache"],
         d["value_cache"],
@@ -396,7 +584,6 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         BLOCK_SIZE,
         d["max_kv_len"],
         -1,  # sliding_window
-        out,
     )
     mx.eval(out)
 
@@ -417,97 +604,4 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         np.array(ref),
         atol=1.5e-2,
         rtol=1e-2,
-    )
-
-
-# ── 2. Buffer donation test ─────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("num_blocks", [128, 256])
-def test_scatter_cache_donation(num_blocks: int) -> None:
-    """Verify that scatter-based cache write reuses the buffer (donation).
-
-    MLX's buffer donation is an optimisation, not a contract.  This test
-    acts as an early-warning: if donation stops happening (due to MLX
-    changes or unexpected reference leaks), the memory delta will spike
-    and the assertion will fail.
-    """
-    num_kv_heads = 4
-    head_dim = HEAD_SIZE
-    num_layers = 1
-    block_size = BLOCK_SIZE
-    dtype = DTYPE
-
-    cache = MetalPagedKVCache(
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        num_blocks=num_blocks,
-        block_size=block_size,
-        dtype=dtype,
-    )
-    # Already eval'd by MetalPagedKVCache.__init__
-
-    cache_nbytes = cache.key_caches[0].nbytes  # size of one K or V cache
-
-    # Simulate a decode step: scatter 3 tokens into random slots
-    num_tokens = 3
-    slot_indices = mx.array(
-        np.random.choice(num_blocks * block_size, size=num_tokens, replace=False),
-        dtype=mx.int64,
-    )
-    new_k = mx.random.normal(shape=(num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    new_v = mx.random.normal(shape=(num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    mx.eval(slot_indices, new_k, new_v)
-
-    # Warm up: run multiple rounds so the MLX memory pool stabilises.
-    # IMPORTANT: delete all locals afterwards — any stray reference to the
-    # old cache array bumps use_count and defeats buffer donation.
-    for _ in range(5):
-        _fk = cache.key_caches[0].reshape(-1, num_kv_heads, head_dim)
-        _fk[slot_indices] = new_k
-        _wk = _fk.reshape(cache.key_caches[0].shape)
-        cache.key_caches[0] = _wk
-        _fv = cache.value_caches[0].reshape(-1, num_kv_heads, head_dim)
-        _fv[slot_indices] = new_v
-        _wv = _fv.reshape(cache.value_caches[0].shape)
-        cache.value_caches[0] = _wv
-        mx.eval(cache.key_caches[0], cache.value_caches[0])
-        del _fk, _wk, _fv, _wv
-
-    # ── Measure at steady state (average of several rounds) ──
-    total_delta = 0
-    num_rounds = 5
-    for _ in range(num_rounds):
-        mem_before = mx.get_active_memory()
-
-        # K cache scatter + rebind
-        flat_k = cache.key_caches[0].reshape(-1, num_kv_heads, head_dim)
-        flat_k[slot_indices] = new_k
-        new_k_cache = flat_k.reshape(cache.key_caches[0].shape)
-        cache.key_caches[0] = new_k_cache
-
-        # V cache scatter + rebind
-        flat_v = cache.value_caches[0].reshape(-1, num_kv_heads, head_dim)
-        flat_v[slot_indices] = new_v
-        new_v_cache = flat_v.reshape(cache.value_caches[0].shape)
-        cache.value_caches[0] = new_v_cache
-
-        mx.eval(cache.key_caches[0], cache.value_caches[0])
-
-        mem_after = mx.get_active_memory()
-        total_delta += mem_after - mem_before
-        del flat_k, new_k_cache, flat_v, new_v_cache
-
-    avg_delta = total_delta / num_rounds
-
-    # If donation works: avg_delta ≈ 0 (buffers reused in-place).
-    # If donation fails: avg_delta ≈ 2 * cache_nbytes (full copy for K + V).
-    # Allow generous headroom (one full cache) for pool fluctuations.
-    threshold = cache_nbytes
-    assert avg_delta < threshold, (
-        f"Buffer donation likely failed: avg memory growth {avg_delta:,.0f} "
-        f"bytes/round over {num_rounds} rounds, "
-        f"but each cache is only {cache_nbytes:,} bytes. "
-        f"Expected near-zero growth with donation."
     )

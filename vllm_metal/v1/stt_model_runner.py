@@ -70,7 +70,7 @@ class STTModelRunner:
                 self.model_config.model, revision=self.model_config.revision
             )
         )
-        model = load_stt_model(model_name)
+        model = load_stt_model(model_name, self.model_config.dtype)
         self.model = model
         self.tokenizer = None
         self._stt_runtime_adapter = model.create_runtime_adapter(model_name)

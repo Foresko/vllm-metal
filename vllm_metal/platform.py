@@ -11,10 +11,15 @@ import torch
 from vllm.platforms.interface import Platform, PlatformEnum
 
 import vllm_metal.envs as envs
-from vllm_metal.config import get_config
+from vllm_metal.config import (
+    DSPARK_DRAFT_QUANTIZATION_KEY,
+    DSPARK_DRAFT_QUANTIZATION_Q4,
+    get_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -104,6 +109,12 @@ class MetalPlatform(Platform):
     # recomputes instead of sticking (#585 shape via a second engine).
     _mb_default_installed: ClassVar[str | None] = None
 
+    # Whether the configured model is a block-diffusion LM, whose runner has
+    # its own sampler; set by check_and_update_config for validate_request.
+    _serves_diffusion: ClassVar[bool] = False
+    # Its served canvas_length, recorded by _check_diffusion_config.
+    _diffusion_canvas_length: ClassVar[int | None] = None
+
     # --- Ray distributed executor support (Phase 1) ---
     # Advertise the Apple GPU as a custom Ray resource named "mlx".  Because this
     # is not "GPU", vLLM's Ray executor uses the generic
@@ -125,6 +136,27 @@ class MetalPlatform(Platform):
     _dp_ray_hook_registered: bool = False
 
     @classmethod
+    def import_ir_kernels(cls) -> None:
+        super().import_ir_kernels()
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        if envs.VLLM_METAL_BACKEND != "mps":
+            return super().get_default_ir_op_priority(vllm_config)
+
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        return IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=["torch_mps", "native"],
+            fused_add_rms_norm=["torch_mps", "native"],
+        )
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """Get the name of the Metal device.
 
@@ -141,6 +173,15 @@ class MetalPlatform(Platform):
             return f"Apple Silicon ({device})"
         except ImportError:
             return "Apple Silicon (MLX not available)"
+
+    @classmethod
+    def get_current_memory_usage(cls, device=None) -> float:
+        if envs.VLLM_METAL_BACKEND == "mps":
+            import torch
+
+            torch.mps.synchronize()
+            return torch.mps.current_allocated_memory()
+        return super().get_current_memory_usage(device)
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -191,6 +232,13 @@ class MetalPlatform(Platform):
             return bool(mx.metal.is_available())
         except (ImportError, AttributeError, RuntimeError):
             return False
+
+    @classmethod
+    def log_warnings(cls) -> None:
+        """Mirror vLLM's logging onto vllm_metal once vLLM has configured it."""
+        from vllm_metal import _configure_logging
+
+        _configure_logging()
 
     @classmethod
     def get_device_count(cls) -> int:
@@ -271,8 +319,22 @@ class MetalPlatform(Platform):
         # Keep this import out of module scope: platform discovery imports this
         # module before vLLM finishes selecting the active platform.
         from vllm.exceptions import VLLMValidationError
+        from vllm.pooling_params import PoolingParams
         from vllm.sampling_params import SamplingParams
 
+        from vllm_metal.v1.pooling.options import unsupported_pooling_option
+
+        # The model runner also rejects these, but by then an exception is
+        # fatal to the engine; reject them here so the request gets a 400.
+        if isinstance(params, PoolingParams):
+            option = unsupported_pooling_option(params)
+            if option is not None:
+                parameter, description = option
+                raise VLLMValidationError(
+                    f"Metal pooling does not support {description}.",
+                    parameter=parameter,
+                )
+            return
         if not isinstance(params, SamplingParams):
             return
 
@@ -281,9 +343,35 @@ class MetalPlatform(Platform):
             for name, enabled in (
                 ("logit_bias", bool(params.logit_bias)),
                 ("min_tokens", params.min_tokens > 0),
+                (
+                    "thinking_token_budget",
+                    getattr(params, "thinking_token_budget", None) is not None,
+                ),
             )
             if enabled
         ]
+        if envs.VLLM_METAL_BACKEND == "mps":
+            unsupported_controls += [
+                name
+                for name, enabled in (
+                    ("temperature", params.temperature != 0),
+                    ("presence_penalty", params.presence_penalty != 0),
+                    ("frequency_penalty", params.frequency_penalty != 0),
+                    ("repetition_penalty", params.repetition_penalty != 1),
+                    ("allowed_token_ids", bool(params.allowed_token_ids)),
+                    ("bad_words", bool(params.bad_words)),
+                )
+                if enabled
+            ]
+            unsupported_controls += [
+                name
+                for name in (
+                    "logprob_token_ids",
+                    "prompt_logprobs",
+                    "structured_outputs",
+                )
+                if getattr(params, name, None) is not None
+            ]
         if unsupported_controls:
             controls = ", ".join(unsupported_controls)
             raise VLLMValidationError(
@@ -291,6 +379,37 @@ class MetalPlatform(Platform):
                 f"vLLM logits processors ({controls}).",
                 parameter=unsupported_controls[0],
             )
+        # Upstream's diffusion sampler applies top_k/top_p to the canvas; the
+        # Metal one does not, so refuse them rather than ignore them.
+        if cls._serves_diffusion:
+            if params.logprobs == -1:
+                raise VLLMValidationError(
+                    "logprobs=-1 is not supported for diffusion models on Metal.",
+                    parameter="logprobs",
+                )
+            for name, enabled in (
+                ("prompt_logprobs", params.prompt_logprobs is not None),
+                (
+                    "prompt_logprob_token_ids",
+                    params.prompt_logprob_token_ids is not None,
+                ),
+                ("top_k", params.top_k > 0),
+                ("top_p", params.top_p < 1.0),
+            ):
+                if enabled:
+                    raise VLLMValidationError(
+                        f"{name} is not supported for diffusion models on Metal yet.",
+                        parameter=name,
+                    )
+            # DiffusionGemmaRuntime always denoises the served canvas, and since
+            # vllm#59107 vLLM no longer refuses a smaller one without async scheduling.
+            width = (params.extra_args or {}).get("diffusion_canvas_length")
+            if width is not None and width < cls._diffusion_canvas_length:
+                raise VLLMValidationError(
+                    "A diffusion_canvas_length smaller than the served canvas is "
+                    "not supported for diffusion models on Metal.",
+                    parameter="diffusion_canvas_length",
+                )
 
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
@@ -404,6 +523,8 @@ class MetalPlatform(Platform):
         Args:
             vllm_config: vLLM configuration object
         """
+        envs.validate_environment()
+
         from vllm_metal.compat import ensure_vllm_bytelevel_tokenizer_patch
 
         # Retry after vLLM is fully imported, before serving tokenizers are built.
@@ -413,20 +534,43 @@ class MetalPlatform(Platform):
 
         # Runs before VllmConfig validates the runner choice, so an explicit
         # request fails with the Metal constraint, not upstream's Triton check.
-        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
+        if vllm_envs.VLLM_USE_V2_MODEL_RUNNER and envs.VLLM_METAL_BACKEND != "mps":
             raise NotImplementedError(
                 "VLLM_USE_V2_MODEL_RUNNER=1 is not supported on Metal: "
                 "MetalWorker implements the V1 model runner contract. Unset it "
                 "(vllm-metal defaults it to 0)."
             )
 
+        # vLLM leaves AuxOutput validation to out-of-tree platforms, and
+        # MetalModelRunner produces no auxiliary outputs.
+        if vllm_config.aux_output_config.enabled:
+            raise NotImplementedError(
+                "--enable-return-routed-experts is not supported on Metal: "
+                "MetalModelRunner does not return routed experts."
+            )
+
         config = get_config()
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
+        add = vllm_config.additional_config
+        if isinstance(add, dict) and DSPARK_DRAFT_QUANTIZATION_KEY in add:
+            if add[DSPARK_DRAFT_QUANTIZATION_KEY] != DSPARK_DRAFT_QUANTIZATION_Q4:
+                raise ValueError(
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} must be "
+                    f"{DSPARK_DRAFT_QUANTIZATION_Q4!r}, got "
+                    f"{add[DSPARK_DRAFT_QUANTIZATION_KEY]!r}"
+                )
+            if (
+                vllm_config.speculative_config is None
+                or vllm_config.speculative_config.method != "dspark"
+            ):
+                raise ValueError(
+                    f"{DSPARK_DRAFT_QUANTIZATION_KEY} requires method='dspark'"
+                )
+
         # Apply TurboQuant config from --additional-config
         # Example: --additional-config '{"turboquant": true, "k_quant": "q4_0"}'
-        add = vllm_config.additional_config
         if isinstance(add, dict) and add.get("turboquant"):
             config.turboquant = True
             config.k_quant = add.get("k_quant", "q8_0")
@@ -437,11 +581,27 @@ class MetalPlatform(Platform):
                 f"k_quant={config.k_quant}, v_quant={config.v_quant}"
             )
 
+        config.apply_moe_expert_offload(add)
+
         logger.debug("Metal config: %s", config)
 
+        backend = envs.VLLM_METAL_BACKEND
+        if model_config is not None and model_config.enable_sleep_mode:
+            cls._check_sleep_mode_config(vllm_config, backend)
+        if config.moe_expert_cache_bytes:
+            cls._check_moe_expert_offload_config(vllm_config, backend)
+
         # Set worker class for Metal
+        if backend == "mps":
+            from vllm_metal.pytorch_backend.worker import configure_mps
+
+            configure_mps(vllm_config)
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
+            parallel_config.worker_cls = (
+                "vllm_metal.pytorch_backend.worker.MPSWorker"
+                if backend == "mps"
+                else "vllm_metal.v1.worker.MetalWorker"
+            )
 
         # Resolve the executor backend. vLLM's ParallelConfig already defaults an
         # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
@@ -527,10 +687,14 @@ class MetalPlatform(Platform):
                     "--additional-config '{\"turboquant\": true}'."
                 )
 
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method == "dspark":
+            from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
+
+            enable_dspark_for_metal_runner()
         # Upstream skips verify_equal_vocab_size_if_draft_model() when this is set,
         # so a draft model with a different vocabulary reaches the proposer, which
         # verifies draft ids against the target vocabulary with no mapping.
-        speculative_config = vllm_config.speculative_config
         if (
             speculative_config is not None
             and speculative_config.use_heterogeneous_vocab
@@ -559,7 +723,7 @@ class MetalPlatform(Platform):
                 "1 + num_speculative_tokens, or leave it unset."
             )
 
-        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
+        # Metal proposers hand drafts back
         # to the scheduler synchronously via take_draft_token_ids(), so async
         # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
         # async scheduling for draft-model SD (vllm#48341); restore the working
@@ -574,25 +738,48 @@ class MetalPlatform(Platform):
                 "scheduling; disabled async_scheduling."
             )
 
+        cls._serves_diffusion = model_config is not None and getattr(
+            model_config, "is_diffusion", False
+        )
+        if cls._serves_diffusion:
+            cls._check_diffusion_config(vllm_config)
+
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
-            if cache_config.mamba_cache_mode == "all":
-                # Before the downgrades below, which overwrite the mode: an
-                # explicit --mamba-cache-mode all must fail fast on every path.
-                raise NotImplementedError(
-                    "mamba_cache_mode='all' is not supported for hybrid "
-                    "models on Metal (nor upstream, which falls back to "
-                    "'align' for models without SupportsMambaPrefixCaching). "
-                    "Use align mode: --enable-prefix-caching resolves to it."
-                )
-            if cache_config.enable_prefix_caching:
-                from vllm_metal.attention.runtime.factory import (
-                    state_family_for_model_type,
-                )
+            from vllm_metal.attention.runtime.factory import (
+                state_family_for_model_type,
+            )
 
-                state_family = state_family_for_model_type(
-                    model_config.hf_text_config.model_type
-                )
+            state_family = state_family_for_model_type(
+                model_config.hf_text_config.model_type
+            )
+            if vllm_config.speculative_config is not None:
+                spec_method = vllm_config.speculative_config.method
+                if spec_method != "ngram" or state_family.label != "gdn":
+                    # The verify-span staging and acceptance rollback live in
+                    # the GDN state wrapper only; other hybrid state families
+                    # (mamba2, KDA, shortconv) would silently corrupt their
+                    # recurrent state on a partial accept, and the other
+                    # speculators are not validated on any hybrid target.
+                    # Reject at config time rather than at the first verify
+                    # forward.
+                    raise NotImplementedError(
+                        "Speculative decoding on hybrid models on Metal is "
+                        "implemented for the ngram method on GDN-family "
+                        "targets only; this configuration pairs method "
+                        f"{spec_method!r} with the {state_family.label!r} "
+                        "state family."
+                    )
+                if not envs.VLLM_METAL_GDN_LAZY_KERNELS:
+                    # Hybrid GDN verification runs multi-token spans through
+                    # the variable-length lazy scan kernels; the eager path
+                    # only implements single-row decode.
+                    raise NotImplementedError(
+                        "ngram speculative decoding on hybrid GDN targets "
+                        "requires the lazy GDN kernels "
+                        "(VLLM_METAL_GDN_LAZY_KERNELS=0 disables them)."
+                    )
+            if cache_config.enable_prefix_caching:
                 if (
                     cache_config.mamba_cache_mode
                     not in state_family.supported_cache_modes
@@ -603,16 +790,12 @@ class MetalPlatform(Platform):
                         f"mamba_cache_mode {state_family.supported_cache_modes}, "
                         f"not {cache_config.mamba_cache_mode!r}",
                     )
-            if (
-                cache_config.enable_prefix_caching
-                and vllm_config.speculative_config is not None
-            ):
-                cls._disable_hybrid_prefix_caching(
-                    vllm_config,
-                    "draft-state rollback across mamba state blocks "
-                    "(num_speculative_blocks) is not implemented for "
-                    "speculative decoding",
-                )
+                # ngram+GDN is the one hybrid speculative configuration that
+                # keeps align-mode prefix caching: verification stages GDN
+                # state per verify span and caps drafts at the state-block
+                # boundary (gdn_spec), keeping align-mode checkpoints exact.
+                # Every other hybrid+speculative combination was rejected
+                # above, so no APC downgrade for speculators remains here.
 
         # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
         # own worker process and the inter-stage activations cross the
@@ -728,6 +911,10 @@ class MetalPlatform(Platform):
             # rejections (multimodal, STT) further below, so an unsupported DP
             # config fails fast before any ray.init side effect.
 
+        from vllm_metal.v1.kv_offload.config import configure_kv_offloading
+
+        configure_kv_offloading(vllm_config)
+
         scheduler_config = vllm_config.scheduler_config
 
         # Pipeline parallelism relays each sampled token to the first stage via the
@@ -787,12 +974,10 @@ class MetalPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
             )
 
-        # Disable cascade attention (not supported), then let the adapter
-        # apply any model-specific normalisations (e.g. clearing
+        # Let the adapter apply any model-specific normalisations (e.g. clearing
         # ``multimodal_config`` for model types served on the text-only
         # backbone — see ``DefaultModelAdapter.normalize_model_config``).
         if model_config is not None:
-            model_config.disable_cascade_attn = True
             from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
             DefaultModelAdapter().normalize_model_config(
@@ -803,7 +988,15 @@ class MetalPlatform(Platform):
             # architectures) that only genuinely multimodal checkpoints carry;
             # skip it for text-only models so a bare hf_config doesn't crash
             # config-time checks that never touch vision at all.
-            if getattr(model_config, "multimodal_config", None) is not None:
+            if model_config.multimodal_config is not None:
+                if model_config.multimodal_config.is_multimodal_pruning_enabled():
+                    raise NotImplementedError(
+                        "Video token pruning is not supported on Metal. "
+                        "Remove --video-pruning-rate."
+                    )
+                # MLX vision towers take the processor's normalized pixels;
+                # vLLM's device-side normalization only runs in its own models.
+                model_config.multimodal_config.mm_device_do_normalize = False
                 mode = DefaultModelAdapter().multimodal_backbone_mode(
                     model_config, speculative_config=vllm_config.speculative_config
                 )
@@ -877,6 +1070,13 @@ class MetalPlatform(Platform):
                 "pipeline_parallel_size=1 or an MLX-LM safetensors checkpoint."
             )
 
+        # LoRA cannot wrap the GGUFLinear layers the GGUF loader installs.
+        if vllm_config.lora_config is not None and model_config.quantization == "gguf":
+            raise NotImplementedError(
+                "Metal does not support LoRA with GGUF checkpoints; remove "
+                "--enable-lora or use an MLX-LM safetensors checkpoint."
+            )
+
         # Data parallelism passed every admission guard above (including the
         # multimodal and STT rejections). Only now — after all fail-fasts, before
         # the engine connects — register the Apple-GPU worker patch at the Ray job
@@ -898,6 +1098,137 @@ class MetalPlatform(Platform):
             f"{available_mem / 1e9:.1f}GB available"
         )
 
+    @classmethod
+    def _check_moe_expert_offload_config(
+        cls, vllm_config: "VllmConfig", backend: str
+    ) -> None:
+        """Expert offloading streams weights into mlx-lm's SwitchGLU layers of
+        one in-process generation model. Features that reshape those layers or
+        split the model are not covered, and the PyTorch MPS runner loads no
+        mlx-lm model.
+        """
+        if backend != "mlx":
+            raise NotImplementedError(
+                "MoE expert offloading is supported on the MLX backend only "
+                f"(VLLM_METAL_BACKEND={backend!r})."
+            )
+        unsupported = None
+        if vllm_config.model_config.runner_type != "generate":
+            unsupported = f"runner type {vllm_config.model_config.runner_type!r}"
+        elif vllm_config.parallel_config.pipeline_parallel_size > 1:
+            unsupported = "pipeline parallelism"
+        elif vllm_config.lora_config is not None:
+            unsupported = "LoRA"
+        elif vllm_config.speculative_config is not None:
+            unsupported = "speculative decoding"
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"MoE expert offloading does not support {unsupported} on Metal."
+            )
+
+    @classmethod
+    def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:
+        """Sleep mode re-creates the MLX runner's shared KV storage in place.
+        Drafters that keep their own caches or arrays derived from it are not
+        covered, and the PyTorch MPS runner has no such storage.
+        """
+        if backend != "mlx":
+            raise NotImplementedError(
+                "Sleep mode is supported on the MLX backend only "
+                f"(VLLM_METAL_BACKEND={backend!r})."
+            )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method != "ngram":
+            raise NotImplementedError(
+                "Sleep mode on Metal supports only n-gram speculative decoding, "
+                f"got method={speculative_config.method!r}."
+            )
+
+    @classmethod
+    def _check_diffusion_config(cls, vllm_config: "VllmConfig") -> None:
+        """Constrain a block-diffusion LM to what ``DiffusionGemmaRuntime`` serves.
+
+        The canvas travels as draft tokens (``num_speculative_tokens ==
+        canvas_length``) and each step's new canvas reaches the scheduler
+        through ``take_draft_token_ids()``, which only the synchronous engine
+        loop calls; async scheduling would schedule placeholder drafts.
+        """
+        from vllm_metal.compat import ensure_vllm_v1_diffusion_guard_patch
+        from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
+
+        model_type = vllm_config.model_config.hf_config.model_type
+        if model_type not in SUPPORTED_DIFFUSION_MODEL_TYPES:
+            raise NotImplementedError(
+                f"Diffusion model type {model_type!r} is not supported on Metal "
+                f"(supported: {sorted(SUPPORTED_DIFFUSION_MODEL_TYPES)})."
+            )
+        diffusion_config = vllm_config.diffusion_config
+        if diffusion_config is None or diffusion_config.canvas_length is None:
+            raise ValueError(
+                "Diffusion models on Metal require --diffusion-config with a "
+                "canvas_length, e.g. --diffusion-config '{\"canvas_length\": 32}'."
+            )
+        cls._diffusion_canvas_length = diffusion_config.canvas_length
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "Speculative decoding is not supported with diffusion models."
+            )
+        # The scheduler clips every denoising step to the threshold, so a
+        # lower one would denoise a shorter canvas than configured.
+        threshold = vllm_config.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < diffusion_config.canvas_length:
+            raise NotImplementedError(
+                "Diffusion models on Metal do not support "
+                f"--long-prefill-token-threshold ({threshold}) below the "
+                f"canvas_length ({diffusion_config.canvas_length}); raise it "
+                "or leave it unset."
+            )
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "Pipeline parallelism is not supported with diffusion models on Metal."
+            )
+        if vllm_config.lora_config is not None:
+            raise NotImplementedError(
+                "LoRA is not supported with diffusion models on Metal."
+            )
+        # The decoder's bidirectional canvas needs the mm_prefix kernel or the
+        # recompute, and neither reads a TurboQuant cache: the first denoising
+        # step would fail the engine step.
+        if get_config().turboquant:
+            raise NotImplementedError(
+                "TurboQuant KV cache is not supported with diffusion models on "
+                'Metal; drop "turboquant" from --additional-config.'
+            )
+        # The diffusion runtime is text-only. Zero modality limits turn an
+        # image/video request into a per-request validation error instead of an
+        # encoder input that would fail the whole engine step. Not
+        # language_model_only: that routes the load to the mlx_lm text
+        # backbone, which has no DiffusionGemma.
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None:
+            from vllm.config.multimodal import (
+                AudioDummyOptions,
+                ImageDummyOptions,
+                VideoDummyOptions,
+            )
+
+            multimodal_config.limit_per_prompt.update(
+                image=ImageDummyOptions(count=0),
+                video=VideoDummyOptions(count=0),
+                audio=AudioDummyOptions(count=0),
+            )
+            logger.warning(
+                "Diffusion models on Metal are text-only; image, video and "
+                "audio inputs are refused."
+            )
+        if vllm_config.scheduler_config.async_scheduling:
+            vllm_config.scheduler_config.async_scheduling = False
+            logger.warning(
+                "Diffusion models on Metal require synchronous scheduling; "
+                "disabled async_scheduling."
+            )
+        ensure_vllm_v1_diffusion_guard_patch()
+
     @staticmethod
     def _disable_hybrid_prefix_caching(vllm_config: "VllmConfig", reason: str) -> None:
         """Downgrade default-on prefix caching for a hybrid model.
@@ -911,11 +1242,9 @@ class MetalPlatform(Platform):
         else-branch would have, instead of failing a default launch.
         """
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_mamba_block_size:
-            # --mamba-block-size requires prefix caching (upstream's
-            # validate_mamba_block_size rejects it once APC is off), so the
-            # user's two explicit choices conflict; fail with the Metal
-            # constraint before upstream's misleading error fires.
+        # With prefix caching on, vLLM fills an unset mamba_block_size with
+        # block_size before this hook, so any other value is the user's.
+        if cache_config.mamba_block_size != cache_config.block_size:
             raise NotImplementedError(
                 "Prefix caching for hybrid models on Metal cannot serve "
                 f"this configuration ({reason}), and --mamba-block-size "
@@ -941,20 +1270,20 @@ class MetalPlatform(Platform):
         return True
 
     @classmethod
-    def _find_non_ssm_backend(
+    def _find_non_ssm_backends(
         cls, vllm_config: "VllmConfig"
-    ) -> "type[AttentionBackend] | None":
-        """Return a Metal-specific backend for block_size calculation.
+    ) -> "list[type[AttentionBackend]]":
+        """Return the Metal-specific backend for block_size calculation.
 
         Since MLX models don't populate static_forward_context, the default
-        Platform._find_non_ssm_backend (which walks attention layers via
+        Platform._find_non_ssm_backends (which walks attention layers via
         get_layers_from_vllm_config) returns nothing. We override to return
         the synthetic MetalBackend, which advertises Metal's MultipleOf(16)
         kernel alignment to the framework's hybrid-block-size math.
         """
         from vllm_metal.attention.synthetic_backend import MetalBackend
 
-        return MetalBackend
+        return [MetalBackend]
 
     @classmethod
     def _default_mb_per_buffer(cls, vllm_config: "VllmConfig") -> None:
@@ -996,7 +1325,7 @@ class MetalPlatform(Platform):
         """Update block_size for Metal platform.
 
         Delegates to vLLM's base implementation, which reads the Metal kernel
-        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backend`
+        alignment (MultipleOf(16)) from our :meth:`_find_non_ssm_backends`
         override. Adds a one-time warning when paged attention is enabled for
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
@@ -1038,12 +1367,12 @@ class MetalPlatform(Platform):
                 "  This is a logical transformation — physical memory is unchanged."
             )
 
-        # Delegate the rest to upstream. With our ``_find_non_ssm_backend``
-        # returning :class:`MetalBackend` (which advertises ``MultipleOf(16)``),
+        # Delegate the rest to upstream. With our ``_find_non_ssm_backends``
+        # returning ``[MetalBackend]`` (which advertises ``MultipleOf(16)``),
         # vLLM's Phase 1 picks a kernel-aligned default of 16 for non-hybrid
         # models (matching the kernel sweet spot), and Phase 2
         # (``_align_hybrid_block_size``) handles hybrid alignment. The kernel
-        # layer (``_pick_kernel_block_size``) validates the final
+        # layer (``pick_kernel_block_size``) validates the final
         # ``block_size`` at request time.
         cache_config = vllm_config.cache_config
         user_block_size = (
@@ -1107,8 +1436,7 @@ class MetalPlatform(Platform):
             v_quant=v_quant,
         )
 
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
-        assert backend_cls is not None
+        backend_cls = cls._find_non_ssm_backends(vllm_config)[0]
         backend_block_alignment_size = min(
             s.base if isinstance(s, MultipleOf) else s
             for s in backend_cls.get_supported_kernel_block_sizes()
@@ -1162,6 +1490,8 @@ class MetalPlatform(Platform):
         """Get the attention backend class for Metal."""
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+        if envs.VLLM_METAL_BACKEND == "mps":
+            return "vllm_metal.pytorch_backend.attention.MPSAttentionBackend"
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info(f"Cannot use {selected_backend} backend on Metal/MLX.")
         if attn_selector_config.use_mla:
@@ -1173,6 +1503,10 @@ class MetalPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on Metal/MLX.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
+
+    @classmethod
+    def is_sleep_mode_available(cls) -> bool:
+        return True
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:

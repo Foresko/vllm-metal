@@ -6,18 +6,35 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
+from vllm.model_executor.models.utils import WeightsMapper
 
 if TYPE_CHECKING:
     from vllm.config.lora import LoRAConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LoRALayerWeightsMLX", "LoadedLoRA", "load_peft_adapter"]
+__all__ = [
+    "LoRALayerWeightsMLX",
+    "LoadedLoRA",
+    "default_weights_mapper",
+    "load_peft_adapter",
+]
+
+
+def default_weights_mapper(model: Any) -> WeightsMapper:
+    """Land HF ``*ForConditionalGeneration`` adapter names on the wrapped tree.
+
+    PEFT names the text modules ``model.language_model.<x>``. mlx_lm's VLM
+    wrappers hold them at ``language_model.model.<x>``; a text sub-model or a
+    text-only model holds them at ``model.<x>``.
+    """
+    inner = "language_model.model." if hasattr(model, "language_model") else "model."
+    return WeightsMapper(orig_to_new_prefix={"model.language_model.": inner})
 
 
 @dataclass(frozen=True)
@@ -42,6 +59,7 @@ def load_peft_adapter(
     lora_id: int,
     max_position_embeddings: int | None = None,
     lora_config: LoRAConfig | None = None,
+    weights_mapper: WeightsMapper | None = None,
 ) -> LoadedLoRA:
     adapter_path = Path(adapter_path)
     if not adapter_path.is_dir():
@@ -64,7 +82,7 @@ def load_peft_adapter(
     pairs: dict[str, dict[str, mx.array]] = {}
     for name, tensor in raw.items():
         try:
-            module, is_a = parse_fine_tuned_lora_name(name)
+            module, is_a = parse_fine_tuned_lora_name(name, weights_mapper)
         except ValueError:
             logger.debug("Skipping unrecognized LoRA tensor: %s", name)
             continue

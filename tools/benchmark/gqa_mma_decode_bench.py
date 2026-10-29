@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Microbenchmark: GQA-packed vs per-token paged decode attention.
+"""Microbenchmark: GQA MMA vs per-token paged decode attention.
 
 One layer.  For every (context, batch, path, partition size) it times a
 strictly serial chain of paged_attention_primitive calls -- each call's query
@@ -14,7 +14,7 @@ keeps one warm copy.  --idle-url waits for `vllm:num_requests_running 0` on
 that worker before every measurement (the GPU may be shared with serving).
 
 Example (Gemma 4 full-attention layer):
-  python tools/gqa_decode_bench.py --heads 16 --kv-heads 2 --head-dim 512 \
+  python tools/benchmark/gqa_mma_decode_bench.py --heads 16 --kv-heads 2 --head-dim 512 \
       --contexts 1024,8192,16384,32768,65536 --batches 1,4,16,64,128 \
       --paths per_token,gqa --partitions auto,0,256,512 --cold-mb 512 \
       --idle-url http://127.0.0.1:8101/metrics --json /tmp/bench.json
@@ -88,19 +88,19 @@ def _inputs(
 
 def _set_path(path: str, partition: str) -> None:
     ops = get_ops()
-    ops.set_gqa_decode_enabled(path == "gqa")
-    ops.set_gqa_decode_force(path == "gqa")
-    ops.set_gqa_decode_partition_size(-1 if partition == "auto" else int(partition))
+    ops.set_gqa_mma_decode_force(path == "gqa")
+    ops.set_gqa_mma_decode_partition_size(-1 if partition == "auto" else int(partition))
 
 
-def _time(inputs, *, ctx, kv_heads, hd, calls, reps) -> list[float]:
+def _time(inputs, *, ctx, kv_heads, hd, calls, reps, disabled) -> list[float]:
     """Per-call milliseconds of `reps` serial chains of `calls` calls each.
 
     Every call's query is q + 0 * (previous output), so the calls run one
     after another; each rep subtracts the same chain without attention (the
     dependency ops alone).  Calls rotate over the KV copies and the rotation
     continues across chains, so a copy is read again only after every other
-    copy was.
+    copy was.  ``disabled`` passes the GQA decode kill switch, which keeps
+    the per_token path off both GQA kernels.
     """
     q, k, v, tables, lens, cu = inputs
     ops = get_ops()
@@ -113,8 +113,7 @@ def _time(inputs, *, ctx, kv_heads, hd, calls, reps) -> list[float]:
             qq = q + dep
             out = qq
             if with_attention:
-                out = mx.array(0)
-                ops.paged_attention_primitive(
+                out = ops.paged_attention_primitive(
                     qq,
                     k,
                     v,
@@ -127,7 +126,7 @@ def _time(inputs, *, ctx, kv_heads, hd, calls, reps) -> list[float]:
                     BLOCK,
                     ctx,
                     -1,
-                    out,
+                    gqa_disabled=disabled,
                 )
                 rotation += 1
             dep = out * 0
@@ -195,7 +194,7 @@ def main() -> int:
     header = {
         "gpu": mx.device_info().get("device_name"),
         "gpu_cores": ops.min_decode_grid() // 8,
-        "gqa_decode_min_grid": ops.gqa_decode_min_grid(),
+        "gqa_mma_decode_min_grid": ops.gqa_mma_decode_min_grid(),
         "macos": platform.mac_ver()[0],
         "commit": commit,
         "variant": args.variant,
@@ -247,6 +246,7 @@ def main() -> int:
                             hd=args.head_dim,
                             calls=args.calls,
                             reps=args.reps,
+                            disabled=path == "per_token",
                         )
                         med = statistics.median(s)
                         p10 = sorted(s)[max(0, len(s) // 10)]
@@ -272,8 +272,7 @@ def main() -> int:
                         )
                 del inputs
     finally:
-        _set_path("gqa", "auto")
-        ops.set_gqa_decode_force(False)
+        _set_path("per_token", "auto")
         save()
     return 0
 

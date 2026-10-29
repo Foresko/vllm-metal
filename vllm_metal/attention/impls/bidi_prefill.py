@@ -9,6 +9,12 @@ only knows the causal + window mask, so the rows of image blocks are
 recomputed here with ``mx.fast.scaled_dot_product_attention`` over K/V
 gathered from the paged cache, and spliced into the kernel output.  Text
 rows, decode rows and full-attention layers never enter this module.
+
+DiffusionGemma's decoder canvas is a block too, but its sliding window is
+anchored at the block start (``ctx.bidi_window_at_block_start``): every canvas
+row sees the last ``window - 1`` keys before the canvas plus the whole canvas,
+i.e. ``(b0 - k < window)`` in place of ``(q - k < window)``.  The kernel has no
+such rule, so those rows always come through here on sliding layers.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ import numpy as np
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_INT32_MAX = 2**31 - 1
 
 
 def intersecting_ranges(
@@ -36,19 +44,24 @@ def build_bidi_mask(
     num_keys: int,
     block: tuple[int, int],
     window: int | None,
+    *,
+    window_at_block_start: bool = False,
 ) -> np.ndarray:
     """``(n, num_keys)`` bool mask for query rows ``[q_lo, q_lo + n)`` of one block.
 
     Keys are absolute positions ``[k_lo, k_lo + num_keys)``.  ``(k <= q or
     b0 <= k < b1) and (q - k < window)`` — HF's ``(causal OR blockwise) AND
-    sliding_window`` for rows that lie inside the block.
+    sliding_window`` for rows that lie inside the block.  With
+    ``window_at_block_start`` the window term is ``(b0 - k < window)``: every
+    row keeps the same ``window - 1`` keys before the block and the whole block
+    (mlx_vlm DiffusionGemma ``_make_decoder_masks``).
     """
     q = np.arange(q_lo, q_lo + n, dtype=np.int64)[:, None]
     k = np.arange(k_lo, k_lo + num_keys, dtype=np.int64)[None, :]
     b0, b1 = block
     allowed = (k <= q) | ((k >= b0) & (k < b1))
     if window is not None:
-        allowed &= (q - k) < window
+        allowed &= ((b0 if window_at_block_start else q) - k) < window
     return allowed
 
 
@@ -65,14 +78,31 @@ def slot_indices(
     return blocks * block_size + positions % block_size
 
 
-def gather_kv(cache: mx.array, slots: mx.array, head_dim: int) -> mx.array:
+def gather_kv(
+    cache: mx.array, slots: mx.array, head_dim: int, block_stride: int
+) -> mx.array:
     """Rows ``slots`` of a ``(num_blocks, block_size, kv_heads, cache_hd)`` cache.
 
-    Returns ``(len(slots), kv_heads, head_dim)``: the cache's zero-padded tail
-    beyond the layer's real ``head_dim`` is sliced off.
+    ``block_stride`` is the cache's element stride between blocks.  Returns
+    ``(len(slots), kv_heads, head_dim)``: the cache's zero-padded tail beyond
+    the layer's real ``head_dim`` is sliced off.
     """
-    flat = cache.reshape(-1, cache.shape[-2], cache.shape[-1])
-    return mx.take(flat, slots, axis=0)[:, :, :head_dim]
+    # MLX 0.32.1 gathers with 32-bit source offsets whenever the source holds
+    # at most INT32_MAX elements, even if its strides reach further, as a view
+    # of a pooled cache region does.  Past that offset the rows come back as
+    # garbage, so gather from block ranges whose offsets fit in 32 bits.
+    num_blocks, block_size = cache.shape[:2]
+    blocks_per_take = max(_INT32_MAX // block_stride, 1)
+    rows = None
+    for first in range(0, num_blocks, blocks_per_take):
+        part = cache[first : first + blocks_per_take]
+        flat = part.reshape(-1, part.shape[-2], part.shape[-1])
+        local = slots - first * block_size
+        inside = (local >= 0) & (local < flat.shape[0])
+        taken = mx.take(flat, mx.where(inside, local, 0), axis=0)
+        rows = taken if rows is None else mx.where(inside[:, None, None], taken, rows)
+    assert rows is not None
+    return rows[:, :, :head_dim]
 
 
 def apply_bidirectional_segments(
@@ -83,6 +113,7 @@ def apply_bidirectional_segments(
     *,
     block_tables: mx.array,
     block_size: int,
+    block_stride: int,
     cu_seqlens: list[int],
     context_lens: list[int],
     ctx: Any,
@@ -97,8 +128,11 @@ def apply_bidirectional_segments(
 
     ``out`` and ``q_3d`` are ``(L, heads, cache_head_dim)``; the caches are the
     kernel-format arrays the kernel just read (``block_size`` is the kernel
-    block size and ``block_tables`` its tables).  Only rows inside an active
-    block are recomputed; every other row keeps the kernel result.
+    block size, ``block_stride`` their element stride between blocks and
+    ``block_tables`` their tables).  Only rows inside an active
+    block are recomputed; every other row keeps the kernel result.  The window
+    runs from each row, or from the block start under
+    ``ctx.bidi_window_at_block_start``.
     """
     if turboquant:
         raise RuntimeError(
@@ -112,6 +146,7 @@ def apply_bidirectional_segments(
     per_segment = ctx.segment_bidi_ranges
     if per_segment is None:
         return out
+    anchored = ctx.bidi_window_at_block_start
 
     width = int(out.shape[-1])
     pieces: list[mx.array] = []
@@ -132,11 +167,22 @@ def apply_bidirectional_segments(
             a, b = max(q_lo, b0), min(q_hi, b1)
             if b <= a:
                 continue
-            k_lo = max(0, a - window + 1) if window is not None else 0
+            origin = b0 if anchored else a
+            k_lo = max(0, origin - window + 1) if window is not None else 0
             slots = slot_indices(block_tables[i], block_size, k_lo, b)
-            keys = gather_kv(k_cache, slots, head_dim)
-            values = gather_kv(v_cache, slots, head_dim)
-            mask = mx.array(build_bidi_mask(a, b - a, k_lo, b - k_lo, (b0, b1), window))
+            keys = gather_kv(k_cache, slots, head_dim, block_stride)
+            values = gather_kv(v_cache, slots, head_dim, block_stride)
+            mask = mx.array(
+                build_bidi_mask(
+                    a,
+                    b - a,
+                    k_lo,
+                    b - k_lo,
+                    (b0, b1),
+                    window,
+                    window_at_block_start=anchored,
+                )
+            )
             row_start = q_start + (a - q_lo)
             row_end = q_start + (b - q_lo)
             if row_start < cursor:

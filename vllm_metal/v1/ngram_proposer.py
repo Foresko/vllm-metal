@@ -41,6 +41,8 @@ from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer as VllmNgramProposer
 
+from vllm_metal.v1.proposer import NoOwnKVProposer
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -67,7 +69,7 @@ _MAX_CONSECUTIVE_MISSES = 8
 _COOLDOWN_STEPS = 8
 
 
-class NgramProposer:
+class NgramProposer(NoOwnKVProposer):
     """:class:`vllm_metal.v1.proposer.MetalProposer` backed by vLLM's n-gram kernel."""
 
     def __init__(
@@ -209,6 +211,18 @@ class NgramProposer:
         req_ids: list[str] = []
         draft_token_ids: list[list[int]] = []
         for (req_id, state), draft in zip(drafting, drafts, strict=True):
+            cap = ctx.draft_caps.get(req_id) if ctx.draft_caps is not None else None
+            max_tokens = state.sampling_params.max_tokens
+            if max_tokens is not None:
+                # Verification also emits a correction or bonus token (#1078).
+                remaining = max(0, max_tokens - state.generated_tokens - 1)
+                cap = remaining if cap is None else min(cap, remaining)
+            if cap is not None and len(draft) > cap:
+                draft = draft[:cap]
+                if not draft:
+                    # Trimmed by a positional or length cap, not by missing
+                    # history: not miss evidence for the cooldown.
+                    continue
             if not draft:
                 # A too-short history isn't evidence against repetition --
                 # there just isn't enough of it yet to check.

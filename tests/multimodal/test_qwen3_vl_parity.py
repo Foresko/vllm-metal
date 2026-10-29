@@ -120,7 +120,7 @@ def _reference_logits(model, input_ids, pixel_values, image_grid_thw) -> mx.arra
 
 
 def _adapter_logits(model, input_ids, pixel_values, image_grid_thw) -> mx.array:
-    adapter = Qwen3VLMultimodalAdapter.from_loaded_model(model)
+    adapter = Qwen3VLMultimodalAdapter.from_loaded_model(model, model.config)
     image_token_id = int(model.config.image_token_index)
 
     ids_np = np.asarray(input_ids)[0]

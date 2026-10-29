@@ -1,19 +1,27 @@
 # Speculative Decoding
 
-vllm-metal supports three speculative decoding methods on the paged-attention
+vllm-metal supports the following speculative decoding methods on the paged-attention
 path. Use vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
 for method behavior and configuration details.
 
 | | MTP | Draft model | N-gram |
 |---|---|---|---|
 | `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models and hybrid GDN targets |
 | Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | Draft model | None |
 | Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
 
-All three methods currently have these Metal-specific constraints:
+Experimental [DFlash serving](dflash.md) is also available for a qualified Qwen3
+target/draft pair, with scheduler-owned prefix reuse. It supports fixed widths and
+vLLM's batch-size-based draft schedule, including K=0 pause/resume.
+
+Experimental [DSpark serving](dspark.md) uses the same scheduler-owned cache
+lifecycle with DSpark's own embeddings and Markov prediction head. It supports
+scheduler-owned prefix reuse and verifies greedy proposals on the target.
+
+These methods currently have these Metal-specific constraints:
 
 - Only plain greedy requests (`temperature=0`, without penalties, token
   constraints, or sample logprobs) are drafted. Other requests run without
@@ -21,9 +29,52 @@ All three methods currently have these Metal-specific constraints:
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.
-- Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
+- Multi-token verification is not supported on the multimodal paged path,
+  including text speculative decode sharing a batch with multimodal prefill.
+- Heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
+
+## Hybrid GDN targets
+
+N-gram speculation supports the text-only execution path on hybrid GDN targets
+(Qwen3.5/Qwen3.8-style linear-attention hybrids):
+
+- The verification forward runs the draft span through the same paged kernels
+  as plain decode — full-attention layers take the extra query rows, and the
+  GDN layers run their state scan over the span. No kernels changed.
+- GDN state is *staged*: each verify span defers its span-final state, and a
+  partial acceptance re-scans the accepted prefix from the untouched
+  pre-span state (see `vllm_metal/attention/impls/gdn_spec.py`). When every
+  request in the batch fully accepts its span, no acceptance re-scan runs.
+  A partial acceptance currently re-scans all requests in that batch,
+  including any prefill spans.
+- Hybrid verification requires the lazy GDN kernels
+  (`VLLM_METAL_GDN_LAZY_KERNELS`, on by default); disabling them is rejected
+  at startup.
+- The resolved recurrent-state dtype must be `float32`. Set
+  `--mamba-ssm-cache-dtype float32` if `auto` resolves to a lower precision.
+  Low precision recurrent state is rejected with hybrid speculation because
+  the multi-token scan and ordinary decode round state at different depths;
+  a supported BF16 cache configuration failed exact greedy parity. Model
+  weights and convolution state do not need to be FP32.
+- Hybrid verification requires one window segment per request and attention
+  head sizes of at most 256. An incompatible layout is rejected during
+  model warmup rather than falling back to expanded per-token segments.
+- With align-mode prefix caching, per-request drafts are capped at the
+  state-block boundary so prefix checkpoints stay exact.
+- **When to enable**: n-gram drafting needs repeated token spans in the
+  prompt or generated history, and verification must accept enough drafts
+  to offset its cost. Long-context rejections and mixed-batch state re-scans
+  can make speculation slower than ordinary decode. Measure acceptance and
+  end-to-end serving throughput on representative workloads and concurrency
+  before enabling it.
+
+Draft-model and MTP methods on hybrid targets remain unsupported until their
+proposers are validated with the state staging and boundary caps. Unsupported
+hybrid speculative pairings — a non-ngram method, or a non-GDN hybrid state
+family (mamba2, KDA, shortconv) — are rejected at startup, not at the first
+verification.
 
 ## Gemma4 MTP
 
@@ -134,6 +185,9 @@ cache. Its benefit depends on repeated token spans in the request history.
 ```
 
 ## Benchmarking
+
+The [DFlash guide](dflash.md) covers its experimental serving restrictions and
+standalone checkpoint qualification.
 
 Use vLLM's benchmark CLI for serving workloads. For a reproducible Gemma4
 target-only versus MTP comparison, use the in-tree benchmark:

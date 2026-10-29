@@ -163,16 +163,8 @@ def _run_policy_e2e() -> None:
 
 
 @pytest.mark.slow
-def test_draft_cache_honors_scheduler_cache_policy_e2e() -> None:
-    ctx = mp.get_context("spawn")
-    proc = ctx.Process(target=_run_policy_e2e)
-    proc.start()
-    proc.join()
-    if proc.exitcode != 0:
-        raise AssertionError(
-            "Draft cache-policy e2e test failed in spawned child "
-            f"(exit code: {proc.exitcode})"
-        )
+def test_draft_cache_honors_scheduler_cache_policy_e2e(run_in_spawn_process) -> None:
+    run_in_spawn_process(_run_policy_e2e)
 
 
 def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
@@ -214,25 +206,14 @@ def _run_chunked_identity_e2e(chunk: str, result_q: mp.Queue) -> None:
 
 
 @pytest.mark.slow
-def test_chunked_cold_ingest_token_identity_e2e() -> None:
+def test_chunked_cold_ingest_token_identity_e2e(run_in_spawn_process) -> None:
     """Chunked cold ingest (chunk=16) is lossless: the generated tokens are
     identical to the single-forward control (chunk=0), and both runs took the
     chunked path (first-plan ingest > the 16-token decode threshold)."""
-    ctx = mp.get_context("spawn")
-    result_q = ctx.Queue()
-    procs = [
-        ctx.Process(target=_run_chunked_identity_e2e, args=(chunk, result_q))
-        for chunk in ("16", "0")
-    ]
-    for proc in procs:
-        proc.start()
-    for proc in procs:
-        proc.join()
-    if any(proc.exitcode != 0 for proc in procs):
-        raise AssertionError(
-            "Chunked-ingest e2e failed in a spawned child "
-            f"(exit codes: {[proc.exitcode for proc in procs]})"
-        )
+    result_q = mp.get_context("spawn").Queue()
+    # Sequential spawns keep result_q order deterministic (chunked first).
+    run_in_spawn_process(_run_chunked_identity_e2e, "16", result_q, label="chunk16")
+    run_in_spawn_process(_run_chunked_identity_e2e, "0", result_q, label="control")
 
     chunked, control = (result_q.get(), result_q.get())
     for label, (status, ingest, _) in (("chunked", chunked), ("control", control)):

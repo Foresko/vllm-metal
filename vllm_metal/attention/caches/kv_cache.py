@@ -9,6 +9,7 @@ cache owner. Scheduler block tables determine which pages each request uses.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import mlx.core as mx
@@ -309,6 +310,13 @@ class MetalPagedKVCache:
         if hasattr(self, "_storage"):
             return self._upstream_block_sizes[layer_idx]
         return self.block_size
+
+    def block_stride_for_layer(self, layer_idx: int) -> int:
+        """Return the element stride between blocks of ``layer_idx``'s K/V."""
+        if hasattr(self, "_storage"):
+            _, _, strides, _, _ = self.key_caches.descriptors[layer_idx]
+            return strides[0]
+        return math.prod(self.key_caches[layer_idx].shape[1:])
 
     def replace_layer_cache(
         self, layer_idx: int, key_cache: mx.array, value_cache: mx.array

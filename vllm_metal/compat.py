@@ -42,7 +42,36 @@ def apply_compat_patches() -> None:
     _apply_bytelevel_patch_during_registration()
     _patch_mlx_lm_qwen35_fp8_sanitize()
     _patch_mlx_lm_qwen3_flat_weight_prefix()
+    _patch_mlx_lm_minicpm4_model_type()
     _patch_transformers_exaone4_config()
+
+
+def ensure_vllm_v1_diffusion_guard_patch() -> None:
+    """Let Metal-served diffusion models past vLLM's V1-runner guard.
+
+    vLLM 0.30 rejects diffusion models on Model Runner V1 because its V1 GPU
+    runner lacks the canvas step protocol. ``MetalModelRunner`` implements
+    the V1 contract (vllm-metal pins ``VLLM_USE_V2_MODEL_RUNNER=0``) and
+    serves DiffusionGemma itself (``vllm_metal/v1/diffusion.py``), so drop
+    that one entry for the supported model types; any other diffusion model
+    still fails upstream's check.
+
+    Called from ``MetalPlatform.check_and_update_config``, which runs inside
+    ``VllmConfig.__post_init__`` before the V1 validation: importing
+    ``vllm.config`` at plugin registration is circular.
+    """
+    from vllm_metal.patches.v1_runner_guard import allow_v1_runner_feature
+
+    def serves_diffusion_model(vllm_config: Any) -> bool:
+        from vllm_metal.v1.diffusion import SUPPORTED_DIFFUSION_MODEL_TYPES
+
+        model_config = vllm_config.model_config
+        return (
+            model_config is not None
+            and model_config.hf_config.model_type in SUPPORTED_DIFFUSION_MODEL_TYPES
+        )
+
+    allow_v1_runner_feature("diffusion models", serves_diffusion_model)
 
 
 def _patch_torch_mps_empty_host_cache() -> None:
@@ -517,6 +546,8 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
     is partially initialized, so ``apply_compat_patches`` defers import failure
     and ``MetalPlatform.check_and_update_config`` retries after vLLM imports.
     """
+    import sys
+
     import vllm.tokenizers.registry as tokenizer_registry
     from vllm.tokenizers.protocol import TokenizerLike
 
@@ -525,6 +556,7 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
         return
 
     original_get_tokenizer = tokenizer_registry.get_tokenizer
+    original_cached_get_tokenizer = tokenizer_registry.cached_get_tokenizer
 
     def _patched_get_tokenizer(
         tokenizer_name,
@@ -570,7 +602,26 @@ def ensure_vllm_bytelevel_tokenizer_patch() -> None:
 
     tokenizer_registry.get_tokenizer = _patched_get_tokenizer
     tokenizer_registry.cached_get_tokenizer = lru_cache(_patched_get_tokenizer)
+    _rebind_tokenizer_aliases(
+        sys.modules,
+        {
+            original_get_tokenizer: tokenizer_registry.get_tokenizer,
+            original_cached_get_tokenizer: tokenizer_registry.cached_get_tokenizer,
+        },
+    )
     setattr(tokenizer_registry, sentinel, True)
+
+
+def _rebind_tokenizer_aliases(modules, replacements) -> None:
+    """Point every imported alias of the originals at the patched callables."""
+    for module in list(modules.values()):
+        name = getattr(module, "__name__", "")
+        if module is None or not (name == "vllm" or name.startswith("vllm.")):
+            continue
+        for attr, value in list(getattr(module, "__dict__", {}).items()):
+            for original, patched in replacements.items():
+                if value is original:
+                    setattr(module, attr, patched)
 
 
 def _ceildiv(value: int, divisor: int) -> int:
@@ -958,6 +1009,26 @@ def _qwen3_flat_weight_prefix(
         key if key.startswith("lm_head.") else f"model.{key}": value
         for key, value in weights.items()
     }
+
+
+def _patch_mlx_lm_minicpm4_model_type() -> None:
+    """Load MiniCPM4 checkpoints that declare ``model_type: minicpm4``.
+
+    openbmb's MLX conversions of MiniCPM4 declare ``minicpm4``, but mlx_lm
+    runs MiniCPM4 on its ``minicpm`` module (ml-explore/mlx-lm#212) and has no
+    module by that name, so loading fails before any weight is read. openbmb's
+    own config class declares ``minicpm``, and the checkpoint's tensors match
+    that module name for name.
+
+    TODO: remove when the pinned mlx_lm maps ``minicpm4`` (#1084).
+    """
+    try:
+        from mlx_lm.utils import MODEL_REMAPPING
+    except ImportError as exc:
+        logger.warning("Could not install the MiniCPM4 model type mapping: %s", exc)
+        return
+
+    MODEL_REMAPPING.setdefault("minicpm4", "minicpm")
 
 
 def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:

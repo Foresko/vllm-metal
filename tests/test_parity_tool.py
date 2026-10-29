@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from tools.check_parity import check_parity, compare_results, http_generate, http_result
+from tools.check_parity import (
+    check_parity,
+    compare_results,
+    http_generate,
+    http_result,
+    main,
+)
+from tools.parity_utils import parity_report
 
 
 class TestParityTool:
@@ -50,6 +57,37 @@ class TestParityTool:
         ref = self._result([1], [[1, 6]])
         got = self._result([6], [[6, 1]])
         assert not compare_results([ref], [got], max_tokens=2, top_k=2)
+
+    def test_report_keeps_exact_tolerant_and_failed_counts_separate(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        near = self._result([1, 6], [[1], [6, 5]])
+        wrong = self._result([1, 7], [[1], [7, 8]])
+        report = parity_report([ref] * 3, [ref, near, wrong], max_tokens=2, top_k=2)
+        assert not report["passed"]
+        assert report["counts"] == {"EXACT": 1, "TOP_K_MATCH": 1, "FAIL": 1}
+        assert [r["first_divergence"] for r in report["results"]] == [None, 1, 1]
+
+    def test_top_k_one_still_rejects_divergent_choices(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        got = self._result([1, 6], [[1], [6, 5]])
+        assert not compare_results([ref], [got], max_tokens=2, top_k=1)
+
+    @pytest.mark.parametrize("outputs", [[], [{}]])
+    def test_missing_pairs_cannot_pass(self, outputs):
+        with pytest.raises(ValueError, match="nonempty"):
+            parity_report([], outputs, max_tokens=2, top_k=5)
+
+    def test_different_input_ids_cannot_pass(self):
+        ref = {**self._result([1], []), "input_ids": [10]}
+        got = {**ref, "input_ids": [20]}
+        with pytest.raises(ValueError, match="different token IDs"):
+            parity_report([ref], [got], max_tokens=1)
+
+    def test_missing_divergence_logprobs_cannot_pass(self):
+        ref = self._result([1, 5], [[1], [5, 6]])
+        got = self._result([1, 6], [])
+        with pytest.raises(ValueError, match="Missing logprobs"):
+            parity_report([ref], [got], max_tokens=2, top_k=2)
 
     def test_http_logprobs_exclude_sampled_token_outside_top_k(self):
         choice = {
@@ -136,9 +174,14 @@ class TestParityTool:
         with pytest.raises(ValueError, match="input token IDs"):
             http_generate("http://localhost/v1", "model", [{"input_ids": [1]}], 1)
 
-    def test_canonical_flow_reuses_reference_and_server(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("backend", ["mlx", "mps"])
+    def test_canonical_flow_reuses_reference_and_server(
+        self, monkeypatch, tmp_path, backend
+    ):
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         events = []
-        row = {**self._result([2], []), "input_ids": [1]}
+        row = {**self._result([2], [[2, 3]]), "input_ids": [1]}
 
         def generate_reference(command, **kwargs):
             path = Path(command[command.index("--generate-reference") + 1])
@@ -148,22 +191,40 @@ class TestParityTool:
 
         @contextmanager
         def server(
-            model, max_model_len, max_num_seqs, gpu_memory_utilization, log_path, env
+            model,
+            max_model_len,
+            max_num_seqs,
+            gpu_memory_utilization,
+            log_path,
+            env,
+            additional_config,
+            trust_remote_code,
         ):
+            assert not trust_remote_code
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
+            assert env["VLLM_METAL_BACKEND"] == backend
+            if backend == "mps":
+                assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+            assert additional_config is None
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")
 
         def generate(base_url, model, reference, max_tokens, top_k, batch_size):
             events.append(f"batch size {batch_size}")
-            return reference
+            return [self._result([3], [[3, 2]])]
 
         monkeypatch.setattr("subprocess.run", generate_reference)
         monkeypatch.setattr("tools.check_parity.serving", server)
         monkeypatch.setattr("tools.check_parity.http_generate", generate)
-        assert check_parity(str(tmp_path), ["test prompt"], 1, output_dir=tmp_path)
+        assert check_parity(
+            str(tmp_path),
+            ["test prompt"],
+            1,
+            top_k=2,
+            output_dir=tmp_path,
+        )
         assert events == [
             "reference exited",
             "server started",
@@ -171,3 +232,66 @@ class TestParityTool:
             "batch size 2",
             "server stopped",
         ]
+        report = json.loads((tmp_path / "batch-2.json").read_text())
+        assert report["comparison"]["counts"] == {
+            "EXACT": 0,
+            "TOP_K_MATCH": 1,
+            "FAIL": 0,
+        }
+
+    def test_trust_remote_code_reaches_reference_and_server(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        commands = []
+        trusted = []
+        row = {**self._result([2], []), "input_ids": [1]}
+
+        def generate_reference(command, **kwargs):
+            commands.append(command)
+            path = Path(command[command.index("--generate-reference") + 1])
+            path.write_text(json.dumps([row]))
+
+        @contextmanager
+        def server(*args):
+            trusted.append(args[-1])
+            yield "http://localhost/v1"
+
+        monkeypatch.setattr("subprocess.run", generate_reference)
+        monkeypatch.setattr("tools.check_parity.serving", server)
+        monkeypatch.setattr("tools.check_parity.http_generate", lambda *args: args[2])
+
+        assert check_parity(
+            str(tmp_path),
+            ["test prompt"],
+            1,
+            batch_sizes=(1,),
+            output_dir=tmp_path,
+            trust_remote_code=True,
+        )
+        assert "--trust-remote-code" in commands[0]
+        assert trusted == [True]
+
+    def test_trust_remote_code_is_rejected_with_speculative_method(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "check_parity.py",
+                "--model",
+                "target",
+                "--method",
+                "draft_model",
+                "--draft",
+                "draft",
+                "--trust-remote-code",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+        assert exc.value.code == 2
+        assert "--trust-remote-code cannot be combined with --method" in (
+            capsys.readouterr().err
+        )

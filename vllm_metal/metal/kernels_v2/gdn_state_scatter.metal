@@ -5,7 +5,7 @@ using namespace metal;
 
 // Scatter compact update rows into a slot-indexed GDN state pool, in place.
 //
-//   pool:    [num_slots, row_elems]   flattened; written in place
+//   pool:    [num_slots, ...] or [num_blocks, tokens_per_page, ...]
 //   src:     [n, row_elems]           compact update rows
 //   dst_ids: [n]                      destination slot for each update row
 //
@@ -15,7 +15,7 @@ using namespace metal;
 // Both kernels assume an exact-size grid and therefore carry no bounds check:
 // the host dispatches through MLX's dispatch_threads, which maps to Metal's
 // non-uniform dispatchThreads and launches exactly grid_dims threads. Moving
-// to dispatch_threadgroups -- the style the rest of paged_ops.cpp uses --
+// to dispatch_threadgroups -- the style the rest of gdn.cpp uses --
 // would round the grid up to whole threadgroups and write past the end of a
 // row. Add the bounds checks back first if you ever change the dispatch.
 template <typename T>
@@ -28,10 +28,14 @@ template <typename T>
     constant size_t *strides [[buffer(6)]],
     constant int &ndim [[buffer(7)]],
     constant bool &zero [[buffer(8)]],
+    constant int &tokens_per_page [[buffer(9)]],
+    constant int64_t &token_stride [[buffer(10)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
   const int64_t row = int64_t(gid.y);
-  const int64_t dst = int64_t(dst_ids[gid.y]) * row_stride;
+  const int64_t slot = int64_t(dst_ids[gid.y]);
+  const int64_t dst = (slot / tokens_per_page) * row_stride +
+      (slot % tokens_per_page) * token_stride;
   int64_t offset = i;
   if (ndim > 0) {
     int index = i;
@@ -54,10 +58,14 @@ template <typename T>
     device const int &row_vec4s [[buffer(3)]],
     constant int64_t &row_stride [[buffer(4)]],
     constant bool &zero [[buffer(8)]],
+    constant int &tokens_per_page [[buffer(9)]],
+    constant int64_t &token_stride [[buffer(10)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
   const int64_t row = int64_t(gid.y);
-  const int64_t dst = int64_t(dst_ids[gid.y]) * row_stride;
+  const int64_t slot = int64_t(dst_ids[gid.y]);
+  const int64_t dst = (slot / tokens_per_page) * row_stride +
+      (slot % tokens_per_page) * token_stride;
   reinterpret_cast<device vec<T, 4> *>(pool)[dst + i] =
       zero ? vec<T, 4>(0) :
       reinterpret_cast<const device vec<T, 4> *>(src)[row * row_vec4s + i];
@@ -68,11 +76,13 @@ template <typename T>
   gdn_state_scatter_rows<type>(                                           \
       device type *, const device type *, const device int *,             \
       device const int &, constant int64_t &, constant int *,              \
-      constant size_t *, constant int &, constant bool &, uint2);          \
+      constant size_t *, constant int &, constant bool &,                 \
+      constant int &, constant int64_t &, uint2);                         \
   template [[host_name("gdn_state_scatter_rows_vec4_" #type)]] [[kernel]] \
   void gdn_state_scatter_rows_vec4<type>(                                 \
       device type *, const device type *, const device int *,             \
-      device const int &, constant int64_t &, constant bool &, uint2);
+      device const int &, constant int64_t &, constant bool &,             \
+      constant int &, constant int64_t &, uint2);
 
 instantiate_gdn_state_scatter_rows(float);
 instantiate_gdn_state_scatter_rows(bfloat16_t);

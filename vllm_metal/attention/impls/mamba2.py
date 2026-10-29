@@ -13,14 +13,15 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_metal.attention.caches.state_cache import PagedStateCache
+from vllm_metal.attention.caches.state_cache import (
+    PagedStateCache,
+    StateSlotArraysCache,
+)
 from vllm_metal.attention.context import PagedAttentionContext, get_context
 
 # mlx_lm's single-token ssm_update kernel covers this many state columns per
 # thread; a state width off that grid is left unwritten.
 _SSM_KERNEL_STATE_COLUMNS = 32
-# ``ArraysCache(size=2)`` layout the mixer indexes: conv rows at 0, SSM state at 1.
-_CONV_STATE = 0
 
 
 def is_mamba2_mixer(module: nn.Module) -> bool:
@@ -38,45 +39,6 @@ class _Mamba2Step:
     slot_ids: list[int]
     num_requests: int
     num_decode_requests: int
-
-
-class _SlotArraysCache:
-    """The ``ArraysCache`` surface the mixer reads, backed by state pool rows.
-
-    The four members (``[0]``, ``[1]``, ``lengths``, ``advance``) mirror the
-    pinned mlx-lm mixer; the wrapper tests drive that mixer against its own
-    ``ArraysCache`` so a pin bump that changes the surface fails there.
-    """
-
-    __slots__ = ("_state_cache", "_cache_idx", "_slot_ids")
-    # Slices arrive unpadded, so the mixer's right-padding gather stays off.
-    lengths = None
-
-    def __init__(
-        self, state_cache: PagedStateCache, cache_idx: int, slot_ids: mx.array
-    ) -> None:
-        self._state_cache = state_cache
-        self._cache_idx = cache_idx
-        self._slot_ids = slot_ids
-
-    def __getitem__(self, idx: int) -> mx.array:
-        return self._pool(idx)[self._slot_ids]
-
-    def __setitem__(self, idx: int, rows: mx.array) -> None:
-        if idx == _CONV_STATE:
-            self._state_cache.write_conv_rows(self._cache_idx, rows, self._slot_ids)
-        else:
-            self._state_cache.write_recurrent_rows(
-                self._cache_idx, rows, self._slot_ids
-            )
-
-    def advance(self, num_tokens: int) -> None:
-        """Only ``lengths`` bookkeeping advances, and slices carry none."""
-
-    def _pool(self, idx: int) -> mx.array:
-        if idx == _CONV_STATE:
-            return self._state_cache.conv_states[self._cache_idx]
-        return self._state_cache.recurrent_states[self._cache_idx]
 
 
 class Mamba2PagedStateWrapper(nn.Module):
@@ -142,7 +104,9 @@ class Mamba2PagedStateWrapper(nn.Module):
     def _run_decode(self, x: mx.array, step: _Mamba2Step) -> mx.array:
         rows = x.reshape(step.num_requests, 1, x.shape[-1])
         slot_ids = mx.array(step.slot_ids, dtype=mx.int32)
-        y = self._inner(rows, mask=None, cache=self._slot_cache(slot_ids))
+        cache = self._slot_cache(slot_ids)
+        y = self._inner(rows, mask=None, cache=cache)
+        cache.flush()
         return y.reshape(1, step.num_requests, -1)
 
     def _run_requests(self, x: mx.array, step: _Mamba2Step) -> mx.array:
@@ -152,15 +116,13 @@ class Mamba2PagedStateWrapper(nn.Module):
             start = step.cu_seqlens[request_idx]
             end = step.cu_seqlens[request_idx + 1]
             slot_ids = mx.array([slot], dtype=mx.int32)
-            outputs.append(
-                self._inner(
-                    x[:, start:end], mask=None, cache=self._slot_cache(slot_ids)
-                )
-            )
+            cache = self._slot_cache(slot_ids)
+            outputs.append(self._inner(x[:, start:end], mask=None, cache=cache))
+            cache.flush()
         return mx.concatenate(outputs, axis=1)
 
-    def _slot_cache(self, slot_ids: mx.array) -> _SlotArraysCache:
-        return _SlotArraysCache(
+    def _slot_cache(self, slot_ids: mx.array) -> StateSlotArraysCache:
+        return StateSlotArraysCache(
             self._mamba2_state_cache, self._mamba2_cache_idx, slot_ids
         )
 

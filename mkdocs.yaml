@@ -60,20 +60,29 @@ markdown_extensions:
 plugins:
   - search
 
+hooks:
+  - tools/recipe_docs.py
+
 nav:
   - Home: index.md
   - Getting Started:
     - Installation: installation.md
+    - Recipes by Mac Memory: recipes.md
     - Configuration: configuration.md
   - Models:
     - Supported Models: supported_models.md
   - Features:
+    - Structured Decisions: structured_decisions.md
     - GGUF: gguf.md
     - Speculative Decoding: speculative_decoding.md
     - Text Pooling: text_embedding_pooling.md
     - Speech-to-Text: stt.md
     - Turboquant: turboquant.md
+    - KV Cache Offloading: kv_offloading.md
+    - MoE Expert Offloading: moe_offload.md
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
   - Tools: tools.md
+  - Benchmarking on macOS: benchmarking-macos.md
   - Contributing: CONTRIBUTING.md
+  - PyTorch MPS decisions: pytorch-mps.md

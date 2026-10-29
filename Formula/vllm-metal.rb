@@ -4,10 +4,10 @@ class VllmMetal < Formula
   desc "LLM inference server for Apple Silicon using vLLM"
   homepage "https://github.com/vllm-project/vllm-metal"
   # Pin a stable release; old development release assets are deleted.
-  url "https://github.com/vllm-project/vllm-metal/releases/download/v0.30.0/vllm_metal-0.30.0-cp312-cp312-macosx_15_0_arm64.whl",
+  url "https://github.com/vllm-project/vllm-metal/releases/download/v0.32.0/vllm_metal-0.32.0-cp312-cp312-macosx_15_0_arm64.whl",
       using: :nounzip
-  version "0.30.0"
-  sha256 "3955de8b2c75b633ef889b70fa469a4db661a0c5bb2f78e36272d68b16da9353"
+  version "0.32.0"
+  sha256 "458d34157eb02a6bfb0e293c70485df18f72b7eb1d1ce8f1eefea95ba47ab63c"
   license "Apache-2.0"
 
   depends_on arch: :arm64
@@ -21,8 +21,8 @@ class VllmMetal < Formula
   # Match .github/vllm-release-tag.commit at the plugin tag when updating.
   # The macOS CPU wheel supplies vLLM; this plugin provides Metal execution.
   resource "vllm" do
-    url "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
-    sha256 "fd9adfd566a8afa4ecbdf36b04bab10ebf43cd9ca18eca4b0a0bf2013b8de135"
+    url "https://github.com/vllm-project/vllm/releases/download/v0.32.0/vllm-0.32.0%2Bcpu-cp38-abi3-macosx_11_0_arm64.whl"
+    sha256 "c28cf0fede58f02c4886d2794217ec3c7e4bbd22dfeb16b4b32586a8f230bb75"
   end
 
   def install

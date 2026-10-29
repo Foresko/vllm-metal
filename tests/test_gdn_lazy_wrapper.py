@@ -1149,3 +1149,56 @@ class TestGDNPagedAttentionWrapperLazyKernels:
             np.full(cache.recurrent_states[0].shape, 7, dtype=np.float32),
         )
         assert out.shape == (1, 2, inner.num_v_heads * inner.head_v_dim)
+
+
+class TestSplitAndNormalize:
+    @pytest.mark.parametrize(
+        "dtype,rtol",
+        [
+            (mx.float32, 1e-4),
+            (mx.float16, 2e-3),
+            (mx.bfloat16, 1e-2),
+        ],
+    )
+    def test_q_k_norm_matches_l2norm_with_eps_on_the_sum_of_squares(
+        self, dtype: mx.Dtype, rtol: float
+    ) -> None:
+        inner = _TinyGDNInner()
+        cache = _make_state_cache(
+            conv_kernel_dim=inner.conv_kernel_size,
+            conv_dim=inner.conv_dim,
+            num_v_heads=inner.num_v_heads,
+            value_head_dim=inner.head_v_dim,
+            key_head_dim=inner.head_k_dim,
+        )
+        wrapper = GDNPagedAttentionWrapper(
+            inner, layer_idx=0, cache_idx=0, state_cache=cache
+        )
+        state = attention_linear._GDNForwardState(
+            x=mx.zeros((1, 2, inner.conv_dim), dtype=dtype),
+            cu_seqlens=[0, 2],
+            num_requests=1,
+            total_tokens=2,
+            slot_ids=[0],
+            num_decode_requests=0,
+        )
+        # Elements of 1e-3 put sum(x^2) near the 1e-6 eps, where adding it to
+        # the mean instead of the sum changes the result by tens of percent.
+        packed = np.random.default_rng(0).normal(size=(1, 2, inner.conv_dim))
+        inputs = mx.array((packed * 1e-3).astype(np.float32)).astype(dtype)
+        reference = np.array(inputs.astype(mx.float32), dtype=np.float64)
+
+        q, k, _ = wrapper._split_and_normalize(inputs, state)
+        mx.eval(q, k)
+
+        def l2norm(x: np.ndarray) -> np.ndarray:
+            return x / np.sqrt((x * x).sum(axis=-1, keepdims=True) + 1e-6)
+
+        heads = (1, 2, inner.num_k_heads, inner.head_k_dim)
+        q_in = reference[..., : inner.key_dim].reshape(heads)
+        k_in = reference[..., inner.key_dim : 2 * inner.key_dim].reshape(heads)
+        inv_scale = inner.head_k_dim**-0.5
+        q_out = np.array(q.astype(mx.float32))
+        k_out = np.array(k.astype(mx.float32))
+        np.testing.assert_allclose(q_out, inv_scale * l2norm(q_in), rtol=rtol)
+        np.testing.assert_allclose(k_out, l2norm(k_in), rtol=rtol)

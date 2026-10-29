@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the public statistics RPC with in-process and spawned engines."""
 
-import multiprocessing as mp
 import os
 
 import pytest
@@ -60,19 +59,5 @@ def _run_stats_rpc(engine_multiprocessing):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("engine_multiprocessing", [False, True])
-def test_draft_model_stats_rpc_e2e(engine_multiprocessing):
-    process = mp.get_context("spawn").Process(
-        target=_run_stats_rpc, args=(engine_multiprocessing,)
-    )
-    process.start()
-    try:
-        process.join(timeout=300)
-        assert not process.is_alive(), "Draft statistics RPC timed out"
-        assert process.exitcode == 0, "Draft statistics RPC serving check failed"
-    finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=10)
+def test_draft_model_stats_rpc_e2e(engine_multiprocessing, run_in_spawn_process):
+    run_in_spawn_process(_run_stats_rpc, engine_multiprocessing)

@@ -33,6 +33,7 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
+from tools.attention_bench_utils import attention_tolerances
 from vllm_metal.metal import get_ops
 
 HEAD_SIZE = 128
@@ -42,13 +43,6 @@ GPT_OSS_NUM_Q_HEADS = 64
 GPT_OSS_NUM_KV_HEADS = 8
 GPT_OSS_PREFILL_CTX = 64
 GPT_OSS_PREFILL_LEN = 64
-
-# Matched to the repo's existing paged-attention parity tolerances.
-_TOLERANCES = {
-    mx.bfloat16: (3e-2, 2e-2),
-    mx.float16: (1.5e-2, 2e-2),
-    mx.float32: (1e-3, 1e-3),
-}
 
 
 def _sinks(num_q_heads: int, value: float | None = None) -> mx.array:
@@ -80,8 +74,7 @@ def _run_decode(
     mx.eval(key_cache, value_cache, query)
 
     scale = head_size**-0.5
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -94,7 +87,6 @@ def _run_decode(
         BLOCK_SIZE,
         ctx,
         -1,
-        out,
         sinks=sinks,
     )
     mx.eval(out)
@@ -139,8 +131,7 @@ def _run_prefill(
     mx.eval(key_cache, value_cache, query)
 
     scale = head_size**-0.5
-    out = mx.array(0)
-    get_ops().paged_attention_primitive(
+    out = get_ops().paged_attention_primitive(
         query,
         key_cache,
         value_cache,
@@ -153,7 +144,6 @@ def _run_prefill(
         BLOCK_SIZE,
         kv_len,
         -1,
-        out,
         sinks=sinks,
     )
     mx.eval(out)
@@ -175,7 +165,7 @@ def _run_prefill(
 
 
 def _assert_close(got: mx.array, ref: mx.array, dtype: mx.Dtype) -> None:
-    atol, rtol = _TOLERANCES[dtype]
+    atol, rtol = attention_tolerances(dtype)
     assert mx.allclose(got, ref, atol=atol, rtol=rtol), (
         f"max abs diff {float(mx.max(mx.abs(got - ref))):.3e} exceeds atol={atol}"
     )
@@ -276,8 +266,7 @@ def _run_window(
     tables = [list(range(s * bps, (s + 1) * bps)) for s in range(len(windows))]
 
     def dispatch(tab, seq, cu, wq):
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
+        out = get_ops().paged_attention_primitive(
             query,
             key_cache,
             value_cache,
@@ -290,7 +279,6 @@ def _run_window(
             BLOCK_SIZE,
             max_kv,
             -1,
-            out,
             window_seqlen_q=wq,
             sinks=sinks,
         )
@@ -352,7 +340,6 @@ class TestSinkValidation:
         kc = mx.zeros((blocks, BLOCK_SIZE, nkv, HEAD_SIZE))
         vc = mx.zeros((blocks, BLOCK_SIZE, nkv, HEAD_SIZE))
         q = mx.zeros((1, nq, HEAD_SIZE))
-        out = mx.array(0)
         get_ops().paged_attention_primitive(
             q,
             kc,
@@ -366,7 +353,6 @@ class TestSinkValidation:
             BLOCK_SIZE,
             ctx,
             -1,
-            out,
             sinks=sinks,
             **kwargs,
         )

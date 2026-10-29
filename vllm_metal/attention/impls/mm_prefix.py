@@ -20,7 +20,7 @@ import numpy as np
 
 import vllm_metal.envs as envs
 
-MM_PREFIX_PATHS = ("kernel", "recompute")
+MM_PREFIX_PATHS = envs.MM_PREFIX_PATHS
 
 
 def build_mm_prefix_rows(
@@ -31,11 +31,13 @@ def build_mm_prefix_rows(
     """``(L, 2)`` int32 rows of inclusive absolute block bounds, ``(-1, -1)`` elsewhere.
 
     Ranges are half-open ``[r0, r1)`` on input (the runner's convention) and
-    stored inclusive as ``(r0, r1 - 1)``; degenerate ranges (``r1 <= r0``) are
-    skipped.  Returns ``None`` when no query row lies inside a block, so the
-    caller keeps the kernel's plain path.  A one-token block ``(p, p + 1)``
-    yields ``(p, p)`` here, whereas vLLM drops an inclusive ``(p, p)``; Gemma 4
-    blocks are never that short.
+    stored inclusive as ``(r0, r1 - 1)``.  Degenerate ranges (``r1 <= r0``) and
+    one-token blocks are skipped: a lone token's block row is its causal row,
+    and vLLM likewise drops an inclusive ``(p, p)``.  Returns ``None`` when no
+    query row lies inside a block, so the caller keeps the kernel's plain path;
+    a batch of one-token blocks (a DiffusionGemma canvas of length 1, or one
+    truncated at ``max_model_len``) must not reach the tiled kernel, which
+    refuses ranges without a multi-token segment.
     """
     total = cu_seqlens[-1]
     rows = np.full((total, 2), -1, dtype=np.int32)
@@ -47,7 +49,7 @@ def build_mm_prefix_rows(
         n = cu_seqlens[i + 1] - q_start
         q_lo = context_lens[i] - n
         for r0, r1 in ranges:
-            if r1 <= r0:
+            if r1 - r0 <= 1:
                 continue
             a, b = max(r0, q_lo), min(r1, q_lo + n)
             if b <= a:

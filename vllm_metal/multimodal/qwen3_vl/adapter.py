@@ -8,14 +8,20 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import cache
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import mlx.core as mx
 import torch
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.multimodal.text_backbone import (
+    resolve_backbone_embed_tokens,
+    resolve_text_backbone,
+)
+from vllm_metal.tensor_bridge import torch_to_mlx
+from vllm_metal.v1.lora.model_manager import EncoderLoRATarget
 
 
 @dataclass(frozen=True)
@@ -24,6 +30,21 @@ class Qwen3VLVisionEncodeResult:
 
     hidden_states: mx.array
     deepstack_visual_embeds: Sequence[mx.array] | None
+
+
+class _VisionTokenIds(NamedTuple):
+    """Token ids that delimit each video frame in a Qwen3-VL prompt."""
+
+    video_token_id: int
+    vision_start_token_id: int
+    vision_end_token_id: int
+
+
+# Feature keys for each modality the vision tower encodes.
+_PIXEL_KEYS = {
+    "image": ("pixel_values", "image_grid_thw"),
+    "video": ("pixel_values_videos", "video_grid_thw"),
+}
 
 
 class Qwen3VLMultimodalAdapter:
@@ -37,6 +58,10 @@ class Qwen3VLMultimodalAdapter:
     """Qwen3-VL attention applies RoPE from the paged context
     (``apply_packed_rope`` + ``ctx.offsets``), so text-only batches are
     safe on the plain text path."""
+
+    text_path_selective_logits_ok: bool = True
+    """``text_model()`` is the very object the runner profiles for the
+    split backbone/head path."""
 
     _SUPPORTED_EMBEDS_KWARGS: tuple[str, ...] = (
         "inputs_embeds",
@@ -57,6 +82,9 @@ class Qwen3VLMultimodalAdapter:
         embeds_kwarg: str | None = None,
         embed_tokens_fn: Callable[[Any], Any] | None = None,
         supports_deepstack: bool = False,
+        backbone: Any | None = None,
+        backbone_embeds_kwarg: str | None = None,
+        vision_token_ids: _VisionTokenIds | None = None,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
@@ -68,19 +96,48 @@ class Qwen3VLMultimodalAdapter:
         self._embeds_kwarg = embeds_kwarg
         self._embed_tokens_fn = embed_tokens_fn
         self._supports_deepstack = supports_deepstack
+        self._backbone = backbone
+        self._backbone_embeds_kwarg = backbone_embeds_kwarg
+        self._vision_token_ids = vision_token_ids
+
+    # HF checkpoint names -> the module names the runner wraps for LoRA: the
+    # language model's own tree, and the vision tower under ``visual.``.
+    lora_weights_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.visual.": "visual.",
+            "model.language_model.": "model.",
+        }
+    )
 
     def text_model(self) -> Any:
         """Return the loaded Qwen3-VL language model."""
         return self._language_model
 
+    def lora_encoder_target(self) -> EncoderLoRATarget:
+        """Expose the vision tower and merger to tower/connector LoRA."""
+        if self._vision_tower is None:
+            raise RuntimeError("vision_tower not loaded; cannot attach LoRA to it.")
+        return EncoderLoRATarget(module=self._vision_tower, prefix="visual.")
+
     @classmethod
-    def from_loaded_model(cls, model: Any) -> Qwen3VLMultimodalAdapter:
-        """Create an adapter from an mlx-vlm Qwen3-VL/Qwen3.5 composite."""
+    def from_loaded_model(cls, model: Any, hf_config: Any) -> Qwen3VLMultimodalAdapter:
+        """Create an adapter from an mlx-vlm Qwen3-VL/Qwen3.5 composite.
+
+        Video token ids come from vLLM's ``hf_config``: mlx-vlm's config
+        defaults for them differ from some checkpoints'.
+        """
         vision_tower = model.vision_tower
         language_model = model.language_model
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
         embeds_kwarg = cls._detect_embeds_kwarg(language_model)
+        backbone = resolve_text_backbone(language_model, owner="mlx_vlm")
+        if not callable(backbone):
+            raise RuntimeError(
+                "language_model.model is not callable; mlx_vlm version "
+                "drift detected.  Expected the headless Qwen3-VL backbone."
+            )
         embed_tokens_fn = cls._resolve_embed_tokens(language_model)
+        backbone_embeds_kwarg = cls._detect_embeds_kwarg(backbone)
         supports_deepstack = cls._detect_deepstack_kwargs(language_model)
         return cls(
             spatial_merge_size=spatial_merge_size,
@@ -89,29 +146,21 @@ class Qwen3VLMultimodalAdapter:
             embeds_kwarg=embeds_kwarg,
             embed_tokens_fn=embed_tokens_fn,
             supports_deepstack=supports_deepstack,
+            backbone=backbone,
+            backbone_embeds_kwarg=backbone_embeds_kwarg,
+            vision_token_ids=_VisionTokenIds(
+                video_token_id=int(hf_config.video_token_id),
+                vision_start_token_id=int(hf_config.vision_start_token_id),
+                vision_end_token_id=int(hf_config.vision_end_token_id),
+            ),
         )
 
     @classmethod
     def _resolve_embed_tokens(cls, language_model: Any) -> Callable[[Any], Any]:
-        """Return ``language_model.model.embed_tokens`` or raise.
-
-        Resolving at load time turns any rename/restructure into a clear
-        init-time error instead of an attribute-error mid-forward.
-        """
-        inner = getattr(language_model, "model", None)
-        if inner is None:
-            raise RuntimeError(
-                "language_model.model attribute missing; mlx_vlm version "
-                "drift detected.  Expected the bottom-level LM module that "
-                "exposes embed_tokens."
-            )
-        embed_tokens = getattr(inner, "embed_tokens", None)
-        if embed_tokens is None or not callable(embed_tokens):
-            raise RuntimeError(
-                "language_model.model.embed_tokens missing or not callable; "
-                "mlx_vlm version drift detected."
-            )
-        return embed_tokens
+        """Return ``language_model.model.embed_tokens`` or raise."""
+        return resolve_backbone_embed_tokens(
+            resolve_text_backbone(language_model, owner="mlx_vlm"), owner="mlx_vlm"
+        )
 
     @classmethod
     def _detect_embeds_kwarg(cls, language_model: Any) -> str:
@@ -132,7 +181,7 @@ class Qwen3VLMultimodalAdapter:
             if candidate in params:
                 return candidate
         raise RuntimeError(
-            "language_model.__call__ accepts none of "
+            "The sniffed callable accepts none of "
             f"{cls._SUPPORTED_EMBEDS_KWARGS}; mlx_vlm version drift detected. "
             f"Got parameters: {sorted(params)}"
         )
@@ -200,12 +249,14 @@ class Qwen3VLMultimodalAdapter:
 
         outputs: list[Qwen3VLVisionEncodeResult] = []
         for feature in features:
-            if feature.modality != "image":
+            keys = _PIXEL_KEYS.get(feature.modality)
+            if keys is None:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: encode_multimodal only "
-                    "supports image features; got "
+                    "supports image and video features; got "
                     f"modality={feature.modality!r}."
                 )
+            pixel_key, grid_key = keys
             if feature.data is None:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: feature.data is required "
@@ -213,18 +264,18 @@ class Qwen3VLMultimodalAdapter:
                 )
 
             pixel_values = self._as_mlx(
-                self._feature_value(feature.data, "pixel_values")
+                self._feature_value(feature.data, pixel_key)
             ).astype(target_dtype)
             # vLLM delivers per-feature grid_thw as a 1D ``(3,)`` row, but
             # the mlx_vlm vision tower indexes ``grid_thw[i, 1:]`` and reads
             # ``grid_thw.shape[0]``; reshape back to ``(1, 3)``.
-            image_grid_thw = self._as_mlx(
-                self._feature_value(feature.data, "image_grid_thw")
+            grid_thw = self._as_mlx(
+                self._feature_value(feature.data, grid_key)
             ).reshape(1, 3)
 
             hidden_states, deepstack_visual_embeds = self._vision_tower(
                 pixel_values,
-                image_grid_thw,
+                grid_thw,
             )
             outputs.append(
                 Qwen3VLVisionEncodeResult(
@@ -265,11 +316,26 @@ class Qwen3VLMultimodalAdapter:
                 "Qwen3VLMultimodalAdapter.from_loaded_model so the language "
                 "model signature is sniffed at load time."
             )
-        extra_kwargs: dict[str, Any] = {}
+        return self._language_model(
+            input_ids,
+            cache=cache,
+            position_ids=position_ids,
+            **{self._embeds_kwarg: inputs_embeds},
+            **self._deepstack_kwargs(visual_pos_masks, deepstack_visual_embeds),
+        )
+
+    def _deepstack_kwargs(
+        self,
+        visual_pos_masks: Any | None,
+        deepstack_visual_embeds: Any | None,
+    ) -> dict[str, Any]:
+        """Deepstack kwargs for the LM call, gated on the sniffed signature."""
         if self._supports_deepstack:
-            extra_kwargs["visual_pos_masks"] = visual_pos_masks
-            extra_kwargs["deepstack_visual_embeds"] = deepstack_visual_embeds
-        elif deepstack_visual_embeds is not None:
+            return {
+                "visual_pos_masks": visual_pos_masks,
+                "deepstack_visual_embeds": deepstack_visual_embeds,
+            }
+        if deepstack_visual_embeds is not None:
             raise RuntimeError(
                 "deepstack_visual_embeds were produced by the vision tower "
                 "but language_model.__call__ does not declare "
@@ -277,12 +343,40 @@ class Qwen3VLMultimodalAdapter:
                 "signature mismatch.  Refusing to drop deepstack residuals "
                 "silently."
             )
-        return self._language_model(
+        return {}
+
+    def call_lm_hidden_states(
+        self,
+        input_ids: mx.array,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> mx.array:
+        """:meth:`call_lm` without the output head: the backbone's final hidden states.
+
+        ``language_model.__call__`` forwards the runner-built ``position_ids``
+        to ``language_model.model`` unchanged, so calling the backbone
+        directly skips only the ``lm_head`` projection.
+        """
+        if (
+            self._backbone is None
+            or not callable(self._backbone)
+            or self._backbone_embeds_kwarg is None
+        ):
+            raise RuntimeError(
+                "backbone not resolved; call_lm_hidden_states unavailable. "
+                "Construct via Qwen3VLMultimodalAdapter.from_loaded_model so "
+                "the language model backbone is sniffed at load time."
+            )
+        return self._backbone(
             input_ids,
             cache=cache,
             position_ids=position_ids,
-            **{self._embeds_kwarg: inputs_embeds},
-            **extra_kwargs,
+            **{self._backbone_embeds_kwarg: inputs_embeds},
+            **self._deepstack_kwargs(visual_pos_masks, deepstack_visual_embeds),
         )
 
     @staticmethod
@@ -314,46 +408,47 @@ class Qwen3VLMultimodalAdapter:
         if not input_tokens:
             return mx.zeros((3, 1, 0), dtype=mx.int32), 0
 
-        self._validate_image_features(mm_features)
+        self._validate_features(mm_features)
 
         torch_positions, mrope_position_delta = (
             self._qwen3_vl_cls()._get_mrope_input_positions(
                 input_tokens=input_tokens,
                 mm_features=mm_features,
-                config=self._image_config(),
+                config=self._mrope_config(),
             )
         )
         llm_positions = torch_positions.cpu().numpy()
         positions = mx.array(llm_positions, dtype=mx.int32)
         return positions[:, None, :], int(mrope_position_delta)
 
-    def _validate_image_features(
+    def _validate_features(
         self,
         features: list[MultiModalFeatureSpec],
     ) -> None:
-        """Validate the image-only feature shape accepted by the adapter."""
+        """Validate the image and video feature shapes the adapter accepts."""
         for feature in sorted(features, key=lambda feature: feature.mm_position.offset):
             modality = feature.modality
-            if modality == "video":
-                raise NotImplementedError(
-                    f"Feature {feature.identifier!r}: Video multimodal "
-                    "features are not yet supported."
-                )
-            if modality != "image":
+            keys = _PIXEL_KEYS.get(modality)
+            if keys is None:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: Unsupported modality: {modality}"
                 )
+            if modality == "video" and self._vision_token_ids is None:
+                raise NotImplementedError(
+                    f"Feature {feature.identifier!r}: video needs the model's "
+                    "frame token ids; construct the adapter with from_loaded_model."
+                )
             if feature.data is None:
                 raise ValueError(
-                    f"Feature {feature.identifier!r}: Image feature data is "
-                    "required to read image_grid_thw."
+                    f"Feature {feature.identifier!r}: {modality} feature data is "
+                    f"required to read {keys[1]}."
                 )
 
             try:
-                t, h, w = self._grid_thw(feature.data, "image_grid_thw")
+                t, h, w = self._grid_thw(feature.data, keys[1])
             except ValueError as exc:
                 raise ValueError(f"Feature {feature.identifier!r}: {exc}") from exc
-            if t != 1:
+            if modality == "image" and t != 1:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: Multi-frame images are "
                     f"not yet supported, got t={t}"
@@ -361,23 +456,24 @@ class Qwen3VLMultimodalAdapter:
 
             llm_grid_h = h // self._spatial_merge_size
             llm_grid_w = w // self._spatial_merge_size
-            num_grid_tokens = llm_grid_h * llm_grid_w
+            num_grid_tokens = t * llm_grid_h * llm_grid_w
             num_embeds = feature.mm_position.get_num_embeds()
             if num_embeds != num_grid_tokens:
                 raise ValueError(
-                    f"Feature {feature.identifier!r}: image_grid_thw implies "
+                    f"Feature {feature.identifier!r}: {keys[1]} implies "
                     f"{num_grid_tokens} multimodal embeddings, got "
                     f"mm_position.get_num_embeds()={num_embeds}"
                 )
 
-    def _image_config(self) -> SimpleNamespace:
-        """Build the minimal config read by Qwen3-VL's image-only M-RoPE path."""
-        # The token-id fields are only read for video; keep sentinels here so the
-        # static upstream helper can be reused without constructing a full model.
+    def _mrope_config(self) -> SimpleNamespace:
+        """Build the minimal config read by Qwen3-VL's M-RoPE helper."""
+        # The frame token ids are only read for video; without them the adapter
+        # rejects video in _validate_features, so sentinels are never read.
+        ids = self._vision_token_ids or _VisionTokenIds(-1, -1, -1)
         return SimpleNamespace(
-            video_token_id=-1,
-            vision_start_token_id=-1,
-            vision_end_token_id=-1,
+            video_token_id=ids.video_token_id,
+            vision_start_token_id=ids.vision_start_token_id,
+            vision_end_token_id=ids.vision_end_token_id,
             vision_config=SimpleNamespace(
                 spatial_merge_size=self._spatial_merge_size,
             ),

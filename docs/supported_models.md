@@ -15,11 +15,14 @@ the paged backend.
 
 Each row tracks a model family. The **Example checkpoint** is one configuration
 we have actually run on Metal — a starting point, not the only checkpoint that
-works. Other sizes and quantizations of the same family generally work too;
+works. For MLX, other sizes and quantizations of the same family generally work too;
 per-machine details (chip, RAM, macOS, reference match) and the full change
 history live in the project's PRs, not in this table. If a model or checkpoint
 does not work, please open an issue rather than adding more rows or example
 checkpoints.
+
+The **PyTorch MPS** column covers the opt-in `VLLM_METAL_BACKEND=mps` path;
+blank MPS cells are unverified.
 
 <!-- Keep this a high-level support matrix. Add a feature column only once at
 least one shipped model uses it (e.g. speculative decoding, tensor parallel) —
@@ -32,39 +35,46 @@ Metal V1 has experimental text-only pooling support. See
 validation guidance. The reranker requires Qwen3 sequence-classification
 `hf_overrides`.
 
-| Model | Support | Runner | Example checkpoint |
-| --- | --- | --- | --- |
-| Qwen3-Embedding | 🔵 | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
-| Qwen3-Reranker | 🔵 | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
-| BGE-M3 | 🔵 | `pooling` / `embed`, `token_classify` (encoder) | `BAAI/bge-m3` |
-| Multilingual E5 Base | 🔵 | `pooling` / `embed` (encoder) | `intfloat/multilingual-e5-base` |
+| Model | MLX | PyTorch MPS | Runner | Example checkpoint |
+| --- | --- | --- | --- | --- |
+| Qwen3-Embedding | 🔵 | | `pooling` / `embed` (paged) | `mlx-community/Qwen3-Embedding-0.6B-8bit` |
+| Qwen3-Reranker | 🔵 | | `pooling` / `classify` (paged) | `mku64/Qwen3-Reranker-0.6B-mlx-8Bit` |
+| BGE-M3 | 🔵 | | `pooling` / `embed`, `token_classify` (encoder) | `BAAI/bge-m3` |
+| Multilingual E5 Base | 🔵 | | `pooling` / `embed` (encoder) | `intfloat/multilingual-e5-base` |
 
 ## Multimodal Language Models
 
-Native multimodal support currently targets image-only vision-language requests on the paged backend.
+Native multimodal support uses the paged backend. Video token pruning is
+unsupported; leave `--video-pruning-rate` unset.
 
-| Model | Support | Runner | Scope | Example checkpoint |
-| --- | --- | --- | --- | --- |
-| Qwen3-VL | 🔵 | native multimodal paged generation | image input, no video | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
-| Qwen3.5 (dense) | 🔵 | native multimodal paged generation | image input, no video; FP8 checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
-| PaddleOCR-VL | 🔵 | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
-| Gemma 4 | 🔵 | mlx_lm text backbone + mlx-vlm vision sidecar, paged generation | image input, no video/audio, bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4` |
+| Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-VL | 🔵 | | native multimodal paged generation | image and video input | `mlx-community/Qwen3-VL-4B-Instruct-4bit` |
+| Qwen3.5 (dense) | 🔵 | | native multimodal paged generation | image and video input; FP8 and GGUF checkpoints stay text-only | `mlx-community/Qwen3.5-4B-MLX-4bit` |
+| PaddleOCR-VL | 🔵 | | native multimodal paged generation | image input, no video | `PaddlePaddle/PaddleOCR-VL-1.6` |
+| Gemma 4 | 🔵 | | mlx_lm text backbone + mlx-vlm encoder sidecar, paged generation | image input; audio and video input on E2B/E4B; bidirectional attention inside image blocks on sliding-window layers | `mlx-community/unsloth-gemma-4-26B-A4B-it-qat-oQ4`, `mlx-community/gemma-4-e2b-it-4bit` (audio, video) |
 
 Gemma 4 keeps its text path exactly as on the text-only table (mlx_lm model,
 selective logits, intermediate forward); only `vision_tower` and `embed_vision`
-are loaded from the checkpoint through mlx-vlm. The sidecar activates in
+are loaded from the checkpoint through mlx-vlm, plus `audio_tower` and
+`embed_audio` on checkpoints whose config has an `audio_config` (E2B and E4B).
+Those checkpoints accept audio input; audio soft tokens attend causally, as in
+HF. E2B and E4B also accept video: vLLM's processor samples up to 32 frames
+at 70 soft tokens each, and the sidecar encodes them through the same vision
+tower, two frames at a time. The 26B and 31B checkpoints keep video off,
+since their bidirectional image attention needs a whole video (up to 2,496
+tokens) inside one prefill step. The sidecar activates in
 `VLLM_METAL_MULTIMODAL_MODE=auto` when the checkpoint resolves to a local
 safetensors directory with `vision_tower.*` weights, the HF `Gemma4Processor`
 builds (the checkpoint's `processor_config.json` needs a `video_processor`
-block with transformers 5.14+), the text config has no per-layer inputs, and
-no speculative decoding is configured; otherwise the model stays text-only and
-the reason is logged. A repo id such as the example above only resolves when
-it is already fully cached locally (`hf download <repo>` first) — the sidecar
-never triggers a download itself, and an uncached repo id falls back to
-text-only with a logged reason exactly like a nonexistent local path. Not
-every conversion meets these conditions: `mlx-community/gemma-4-12B-it-4bit`
-ships no vision weights and the `gemma-4-e2b-it-4bit` / `gemma-4-e4b-it-4bit`
-conversions have per-layer inputs, so all three serve text-only.
+block with transformers 5.14+), and no speculative decoding is configured;
+otherwise the model stays text-only and the reason is logged. A repo id such
+as the example above only resolves when it is already fully cached locally
+(`hf download <repo>` first) — the sidecar never triggers a download itself,
+and an uncached repo id falls back to text-only with a logged reason exactly
+like a nonexistent local path. Not every conversion meets these conditions:
+`mlx-community/gemma-4-12B-it-4bit` ships no vision weights, so it serves
+text-only.
 
 Image soft tokens attend bidirectionally to each other inside their own image
 block on sliding-window layers, matching HF's
@@ -110,57 +120,92 @@ for Qwen2.5, Llama 3, and Mistral
 GGUF checkpoints serve by detection like AWQ, with no env flag:
 vllm-metal's GGUF engine integration sets `quantization=gguf` from the file
 (vLLM 0.24 moved its in-tree GGUF support to the CUDA/ROCm-only
-[vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). A
-`.gguf` carries weights only, so it pairs with a companion config dir
-(`--tokenizer`) and needs the `gguf` extra; remote `repo_id:quant` references
-download one matching unsharded `.gguf` file. The weights stay quantized
-(Q8_0/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K, not a dense fallback), and one file may mix
-them the way llama.cpp's Q4_K_M and Q5_K_M exports and bartowski's Q4_K_L do;
-remote reference tags cover only Q8_0/Q4_0/Q4_1 and the plain types. Scope is
-dense `qwen2`/`qwen3`/`llama`/`mistral` (mistral converts under the llama GGUF
-arch); Q5_0/Q5_1, Q2_K/Q3_K, IQ quants, fused-QKV, MoE, SSM/hybrid, vision,
-ambiguous remote matches, and sharded remote GGUF files are rejected with a
-clear error. See [GGUF](gguf.md) for serve examples and source precedence. A
-tied model's unused `output.weight` is skipped whatever its qtype. Verified
-end-to-end on Qwen3-0.6B Q4_K_M, Q5_K_M, Q4_K_L, and Q4_1, on
-Llama-3.2-1B-Instruct and Mistral-7B-Instruct-v0.3 Q4_K_M, and on Qwen3-0.6B,
-Llama-3.2-1B-Instruct, and Mistral-7B-Instruct-v0.3 Q8_0
+[vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)). Dense
+`qwen2`/`qwen3`/`llama`/`mistral` and text-only Qwen3.5 (`qwen35`) checkpoints
+load from a local `.gguf` (including llama.cpp's Q4_K_M and Q5_K_M exports) or a
+remote `repo_id:quant` reference and stay quantized in memory. See
+[GGUF](gguf.md) for the supported qtypes, exclusions, and serve examples.
+Verified end-to-end on Qwen3-0.6B, Llama-3.2-1B-Instruct, and
+Mistral-7B-Instruct-v0.3 in Q8_0 and Q4_K_M, and on Qwen3.5-0.8B Q8_0, 4B
+Q5_K_M, and 9B Q4_K_M
 ([#415](https://github.com/vllm-project/vllm-metal/issues/415),
 [#761](https://github.com/vllm-project/vllm-metal/issues/761)).
 
-| Model | Support | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
-| --- | --- | --- | --- | --- |
-| Qwen3 | ✅ | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
-| Qwen3.5 / 3.6 / 3.8 | ✅ | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
-| Qwen3-Next | ✅ | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
-| LFM2 / LFM2.5 | ✅ | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
-| Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
-| Granite 4.0-h-micro | 🔵 | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
-| Gemma 4 | ✅ | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-E2B-it` |
-| Gemma 3 | ✅ | GQA + per-layer sliding window (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
-| Llama 3 | ✅ | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
-| Mistral-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
-| Mistral-Small-24B | 🔵 | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
-| StableLM 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
-| Phi 1.5 / Phi 2 | ✅ | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
-| GPT-OSS | 🔵 | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
-| GLM-4.5 | Not verified | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
-| MiniCPM3-4B | ✅ | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
-| GLM-4.7-Flash | 🔵 | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
-| DeepSeek-R1-Distill-Qwen | ✅ | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
-| Phi-4-mini | ✅ | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
-| Phi-3.5-mini | ✅ | MHA packed qkv (paged) | ✅ | `mlx-community/Phi-3.5-mini-instruct-4bit` |
-| Qwen2.5 | ✅ | GQA (paged) | ✅ | `mlx-community/Qwen2.5-7B-Instruct-4bit` |
-| Qwen2-7B | ✅ | GQA (paged) | ✅ | `mlx-community/Qwen2-7B-Instruct-4bit` |
-| Yi-1.5-9B | ✅ | GQA (paged, LlamaForCausalLM) | ✅ | `mlx-community/Yi-1.5-9B-Chat-4bit` |
-| SmolLM3-3B | ✅ | GQA (paged) | ✅ | `mlx-community/SmolLM3-3B-4bit` |
-| Granite 3.3 | 🔵 | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
-| EXAONE 4.0 | 🔵 | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
-| Laguna | ✅  | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
-| Hunyuan (dense) | ✅ | GQA + QK norm (paged) | ✅ | `mlx-community/Hunyuan-1.8B-Instruct-4bit` |
-| MiniMax M2 | 🟡 | GQA + full-projection QK norm (paged) | Not verified | — |
-| OLMo 2 | ✅ | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
-| OLMoE | ✅ | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
-| OLMo 3 | 🔵 | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
+Mistral Small 3.1 (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit`) is
+a vision-language model. By default vllm-metal serves its text backbone through
+mlx_lm and rejects image input. Ministral 3 and Devstral Small 2 take the same
+path but fail at load on `attn_scale`
+([#1130](https://github.com/vllm-project/vllm-metal/issues/1130)).
+
+Ling-3.0 Tiny supports the official BF16 checkpoint and MLX-native MXFP8
+checkpoints converted from it. Direct loading of the official serialized
+block-FP8 checkpoint is not supported.
+
+Muse Glimmer checkpoints are vision-language, but vllm-metal serves only their
+text backbone: auto mode loads the mlx-lm text model and the frontend rejects
+image input. DFlash and DSpark speculative decoding need a Qwen3 target, so
+Glimmer's DFlash assistant is not supported; n-gram and draft-model speculation
+and TurboQuant are not validated.
+
+| Model | MLX | PyTorch MPS | Attention Kernel | Automatic Prefix Cache | Example checkpoint |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3 | ✅ | 🔵 | GQA (paged) | ✅ | `Qwen/Qwen3-0.6B` |
+| Qwen3.5 / 3.6 / 3.8 | ✅ | | Hybrid SDPA + GDN linear (3.6 adds MoE) | 🔵 | `mlx-community/Qwen3.8-27B-8bit` |
+| Qwen3-Next | ✅ | | Hybrid SDPA + GDN linear | 🔵 | `mlx-community/Qwen3-Next-80B-A3B-Instruct-8bit` |
+| LFM2 / LFM2.5 | ✅ | 🔵 | Hybrid SDPA + ShortConv | ✅ | `LiquidAI/LFM2.5-1.2B-Instruct` |
+| Nemotron-H (Nemotron 3.5 Lightning) | 🔵 | | Hybrid SDPA + Mamba-2 (MoE) | ❌ | `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` |
+| Granite 4.0-h-micro | 🔵 | | Hybrid SDPA + Mamba-2 | ❌ | `mlx-community/granite-4.0-h-micro-4bit` |
+| Gemma 4 | ✅ | | GQA + per-layer sliding window + YOCO | ✅ | `mlx-community/gemma-4-e2b-it-4bit` |
+| Gemma 3 | ✅ | | GQA + per-layer sliding window (paged) | ✅ | `mlx-community/gemma-3-1b-it-qat-4bit` |
+| Llama 3 | ✅ | | GQA (paged) | ✅ | `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit` |
+| Mistral-7B | ✅ | | GQA (paged) | ✅ | `mlx-community/Mistral-7B-Instruct-v0.3-4bit` |
+| Mistral-Small-24B | 🔵 | | GQA (paged) | ✅ | `mlx-community/Mistral-Small-24B-Instruct-2501-4bit` |
+| StableLM 2 | ✅ | | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
+| Phi 1.5 / Phi 2 | ✅ | | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
+| GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
+| GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
+| MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |
+| MiniCPM4 | ✅ | | GQA (paged) | ✅ | `openbmb/MiniCPM4-0.5B-mlx` (needs `--trust-remote-code`) |
+| GLM-4.7-Flash | 🔵 | | GQA (paged) | ✅ | `mlx-community/GLM-4.7-Flash-4bit` |
+| DeepSeek-R1-Distill-Qwen | ✅ | | GQA (paged) | ✅ | `mlx-community/DeepSeek-R1-Distill-Qwen-7B-3bit` |
+| Phi-4-mini | ✅ | | GQA packed qkv (paged) | ✅ | `microsoft/Phi-4-mini-instruct` |
+| Phi-3.5-mini | ✅ | | MHA packed qkv (paged) | ✅ | `mlx-community/Phi-3.5-mini-instruct-4bit` |
+| Qwen2.5 | ✅ | | GQA (paged) | ✅ | `mlx-community/Qwen2.5-7B-Instruct-4bit` |
+| Qwen2-7B | ✅ | | GQA (paged) | ✅ | `mlx-community/Qwen2-7B-Instruct-4bit` |
+| Yi-1.5-9B | ✅ | | GQA (paged, LlamaForCausalLM) | ✅ | `mlx-community/Yi-1.5-9B-Chat-4bit` |
+| SmolLM3-3B | ✅ | | GQA (paged) | ✅ | `mlx-community/SmolLM3-3B-4bit` |
+| Granite 3.3 | 🔵 | | GQA (paged) | ✅ | `mlx-community/granite-3.3-8b-instruct-4bit` |
+| EXAONE 4.0 | 🔵 | | GQA (paged) | ✅ | `mlx-community/exaone-4.0-1.2b-4bit` |
+| Laguna | ✅  | | GQA (paged) | ✅ | `poolside/Laguna-XS-2.1-NVFP4-mlx` |
+| Hunyuan (dense) | ✅ | 🔵 | GQA + QK norm (paged) | ✅ | `tencent/Hunyuan-1.8B-Instruct` |
+| MiniMax M2 | 🟡 | | GQA + full-projection QK norm (paged) | Not verified | — |
+| OLMo 2 | ✅ | 🔵 | MHA + full-projection QK norm (paged) | ✅ | `allenai/OLMo-2-0425-1B-Instruct` |
+| OLMoE | ✅ | | MHA + full-projection QK norm (paged) | ✅ | `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit` |
+| OLMo 3 | 🔵 | | MHA + per-layer sliding window (paged) | ✅ | `mlx-community/Olmo-3-7B-Instruct-4bit` |
+| Muse Glimmer | 🔵 | | GQA + per-layer sliding window, gated attention with QK norm (paged) | ✅ | `mlx-community/Muse-Glimmer-30B-4bit` |
+
+**Hunyuan on MPS:** use `--generation-config vllm` to override the checkpoint’s unsupported `repetition_penalty=1.05` default.
 
 sliding-window attention (SWA) is not fully optimized.
+
+## Diffusion Language Models
+
+Block-diffusion LMs generate a whole canvas of tokens per block through
+iterative denoising. DiffusionGemma also supports sample logprobs and
+[structured decisions](structured_decisions.md) for yes/no, choice, and score questions.
+
+| Model | MLX | PyTorch MPS | Runner | Scope | Example checkpoint |
+| --- | --- | --- | --- | --- | --- |
+| DiffusionGemma | 🔵 | | mlx-vlm model, paged block diffusion | text input only, synchronous scheduling, no prompt logprobs or LoRA | `mlx-community/diffusiongemma-26B-A4B-it-4bit` |
+
+```bash
+vllm serve mlx-community/diffusiongemma-26B-A4B-it-4bit \
+  --diffusion-config '{"canvas_length": 32}'
+```
+
+The canvas sampler follows the checkpoint's `generation_config.json`
+(temperature schedule, entropy-bound acceptance, convergence thresholds);
+top-k and top-p are unsupported, and penalties are ignored with a warning.
+Async scheduling is turned off automatically, since each step's canvas must
+reach the scheduler before the next one is scheduled.

@@ -11,7 +11,11 @@ import torch
 from vllm.multimodal.inputs import MultiModalKwargsItem
 
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.multimodal.text_backbone import (
+    resolve_backbone_embed_tokens,
+    resolve_text_backbone,
+)
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,10 @@ class PaddleOCRVLMultimodalAdapter:
     (arange from 0), so every batch — text-only included — must carry
     runner-built ``position_ids`` via the multimodal forward."""
 
+    text_path_selective_logits_ok: bool = True
+    """``text_model()`` is the very object the runner profiles for the
+    split backbone/head path."""
+
     def __init__(
         self,
         *,
@@ -40,6 +48,7 @@ class PaddleOCRVLMultimodalAdapter:
         visual: Any | None = None,
         language_model: Any | None = None,
         embed_tokens_fn: Any | None = None,
+        backbone: Any | None = None,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError(
@@ -49,6 +58,7 @@ class PaddleOCRVLMultimodalAdapter:
         self._visual = visual
         self._language_model = language_model
         self._embed_tokens_fn = embed_tokens_fn
+        self._backbone = backbone
 
     @classmethod
     def from_loaded_model(cls, model: Any) -> PaddleOCRVLMultimodalAdapter:
@@ -56,29 +66,26 @@ class PaddleOCRVLMultimodalAdapter:
         visual = model.visual
         language_model = model.language_model
         spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
+        backbone = resolve_text_backbone(language_model, owner="mlx_vlm")
+        if not callable(backbone):
+            raise RuntimeError(
+                "language_model.model is not callable; mlx_vlm version "
+                "drift detected. Expected the PaddleOCR text backbone."
+            )
         embed_tokens_fn = cls._resolve_embed_tokens(language_model)
         return cls(
             spatial_merge_size=spatial_merge_size,
             visual=visual,
             language_model=language_model,
             embed_tokens_fn=embed_tokens_fn,
+            backbone=backbone,
         )
 
-    @staticmethod
-    def _resolve_embed_tokens(language_model: Any) -> Any:
-        inner = getattr(language_model, "model", None)
-        if inner is None:
-            raise RuntimeError(
-                "language_model.model attribute missing; mlx_vlm version "
-                "drift detected. Expected the PaddleOCR text backbone."
-            )
-        embed_tokens = getattr(inner, "embed_tokens", None)
-        if embed_tokens is None or not callable(embed_tokens):
-            raise RuntimeError(
-                "language_model.model.embed_tokens missing or not callable; "
-                "mlx_vlm version drift detected."
-            )
-        return embed_tokens
+    @classmethod
+    def _resolve_embed_tokens(cls, language_model: Any) -> Any:
+        return resolve_backbone_embed_tokens(
+            resolve_text_backbone(language_model, owner="mlx_vlm"), owner="mlx_vlm"
+        )
 
     def text_model(self) -> Any:
         return self._language_model
@@ -196,16 +203,46 @@ class PaddleOCRVLMultimodalAdapter:
     ) -> Any:
         """Invoke the PaddleOCR-VL language model with runner-built embeds."""
         del visual_pos_masks
+        self._check_lm_ready("call_lm", deepstack_visual_embeds)
+        return self._language_model(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            cache=cache,
+            position_ids=position_ids,
+        )
+
+    def _check_lm_ready(self, call: str, deepstack_visual_embeds: Any | None) -> None:
+        """Guard shared by ``call_lm`` and ``call_lm_hidden_states``."""
         if self._language_model is None:
             raise RuntimeError(
-                "language_model not loaded; call_lm unavailable. "
+                f"language_model not loaded; {call} unavailable. "
                 "Construct via PaddleOCRVLMultimodalAdapter.from_loaded_model."
             )
         if deepstack_visual_embeds is not None:
             raise RuntimeError(
                 "PaddleOCR-VL does not expose deepstack visual residuals."
             )
-        return self._language_model(
+
+    def call_lm_hidden_states(
+        self,
+        input_ids: mx.array,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+        *,
+        visual_pos_masks: Any | None = None,
+        deepstack_visual_embeds: Any | None = None,
+    ) -> mx.array:
+        """:meth:`call_lm` without the output head: the backbone's final hidden states."""
+        del visual_pos_masks
+        self._check_lm_ready("call_lm_hidden_states", deepstack_visual_embeds)
+        if self._backbone is None or not callable(self._backbone):
+            raise RuntimeError(
+                "language_model.model attribute missing or not callable; "
+                "mlx_vlm version drift detected. Expected the PaddleOCR "
+                "text backbone."
+            )
+        return self._backbone(
             input_ids,
             inputs_embeds=inputs_embeds,
             cache=cache,

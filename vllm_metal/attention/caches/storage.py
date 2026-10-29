@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import mlx.core as mx
 import torch
@@ -14,13 +15,64 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheLayout,
     UniformTypeKVCacheSpecs,
+    create_kv_cache_views,
 )
 from vllm.v1.worker.utils import allocate_kv_cache
 
-from vllm_metal.pytorch_backend.tensor_bridge import (
+from vllm_metal.tensor_bridge import (
     TORCH_TO_MLX_DTYPE,
     torch_to_mlx,
 )
+
+
+def allocate_kv_cache_lazily(
+    config: KVCacheConfig,
+    layout: KVCacheLayout,
+    specs: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Allocate the KV backing store without committing its pages.
+
+    ``vllm.v1.worker.utils.allocate_kv_cache`` fills the whole backing buffer
+    with zeros (``torch.zeros``). Metal runs on unified memory, so that memset
+    writes every page of a multi-GB pool and the entire pool becomes resident
+    from the first step — even though a serving run only ever touches the
+    blocks it actually allocates (a 16 GB Mac serving a 0.6B model pays ~5 GB
+    of RSS for a pool that is ~90% unused).
+
+    The zero fill is only load-bearing where vLLM says it is:
+    ``KVCacheConfig.needs_kv_cache_zeroing`` marks Mamba state (read before it
+    is written) and mixed-precision caches (a block reinterpreted under another
+    precision would decode stale bytes as NaN/Inf). Uniform-precision attention
+    caches skip per-block zeroing upstream, and their kernels mask every slot
+    past the sequence length, so unwritten memory never reaches an output. Keep
+    vLLM's allocation verbatim in that case.
+
+    The layer views are built by vLLM's own :func:`create_kv_cache_views`, so
+    the layout (sizes, strides, offsets, dtype) is identical either way;
+    ``tests/attention/test_lazy_kv_allocation.py`` pins that equality.
+    """
+    if config.needs_kv_cache_zeroing:
+        return allocate_kv_cache(config, torch.device("cpu"), layout)
+
+    sizes = {tensor.size for tensor in config.kv_cache_tensors}
+    if len(sizes) != 1:
+        raise ValueError("KV cache tensors must share one backing allocation.")
+    backing = torch.empty(sizes.pop(), dtype=torch.int8, device="cpu")
+    caches: dict[str, torch.Tensor] = {}
+    for tensor in config.kv_cache_tensors:
+        spec = specs[tensor.layers[0]]
+        if not spec.has_layer_views:
+            caches.update((name, backing) for name in tensor.layers)
+            continue
+        views = create_kv_cache_views(
+            backing,
+            spec,
+            config.num_blocks_of(tensor),
+            layout,
+            tensor,
+        )
+        caches.update(zip(tensor.layers, views, strict=True))
+    return caches
 
 
 class CacheViews(Sequence[mx.array]):
@@ -65,10 +117,23 @@ class KVCacheStorage:
 
     def __init__(self, config: KVCacheConfig):
         self.config = config
-        self.tensors = allocate_kv_cache(
+        self.specs = {
+            name: (
+                group.kv_cache_spec.kv_cache_specs[name]
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else group.kv_cache_spec
+            )
+            for group in config.kv_cache_groups
+            for name in group.layer_names
+        }
+        self._bind()
+
+    def _bind(self) -> None:
+        config = self.config
+        self.tensors = allocate_kv_cache_lazily(
             config,
-            torch.device("cpu"),
             KVCacheLayout[config.kv_cache_layout],
+            self.specs,
         )
         first = next(iter(self.tensors.values()))
         backing = first.untyped_storage()
@@ -89,15 +154,6 @@ class KVCacheStorage:
             torch_to_mlx(raw[start:end].view(config.num_blocks, -1))
             for start, end in zip(self.region_offsets, ends, strict=True)
         ]
-        self.specs = {
-            name: (
-                group.kv_cache_spec.kv_cache_specs[name]
-                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                else group.kv_cache_spec
-            )
-            for group in config.kv_cache_groups
-            for name in group.layer_names
-        }
         # CoW/zeroing cover physical bytes exactly once. Layer-outer layouts
         # place a logical block in disjoint regions of this one allocation.
         regions = {}
@@ -109,6 +165,22 @@ class KVCacheStorage:
                     raw, (config.num_blocks, size), (tensor.block_stride, 1), offset
                 )
         self.pages = CacheViews(self, list(regions.values()))
+
+    @property
+    def released(self) -> bool:
+        return not self.buffers
+
+    def release(self) -> None:
+        """Free the backing memory. Its contents are discarded."""
+        self.tensors = {}
+        self.buffers = []
+
+    def reallocate(self) -> None:
+        """Re-create the backing memory with the layout vLLM scheduled against."""
+        nbytes, region_offsets = self.nbytes, self.region_offsets
+        self._bind()
+        if (self.nbytes, self.region_offsets) != (nbytes, region_offsets):
+            raise RuntimeError("Reallocated KV cache changed its layout")
 
     def depend(self, arrays: Sequence[mx.array]) -> None:
         if arrays:
@@ -151,3 +223,24 @@ class KVCacheStorage:
         indices = mx.array(ids, dtype=mx.int32)
         for i, page in enumerate(self.pages):
             self.pages[i] = get_ops().gdn_state_scatter(page, page, indices, zero=True)
+
+    def scatter_rows(self, rows: Sequence[mx.array], block_ids: Sequence[int]) -> None:
+        """Scatter ``rows[i]`` into page ``i`` at the ``block_ids`` slots.
+
+        One entry in ``rows`` per page, as the KV offloading worker's loads
+        provide. An MLX index-assign on a page view would never reach the
+        backing buffer, so the write goes through the native scatter like
+        ``copy_blocks`` does.
+        """
+        if len(rows) != len(self.pages):
+            raise ValueError(
+                f"scatter_rows takes one row array per page: got {len(rows)} "
+                f"for {len(self.pages)} pages"
+            )
+        if not rows:
+            return
+        from vllm_metal.metal import get_ops
+
+        dst = mx.array(block_ids, dtype=mx.int32)
+        for i, page_rows in enumerate(rows):
+            self.pages[i] = get_ops().gdn_state_scatter(self.pages[i], page_rows, dst)

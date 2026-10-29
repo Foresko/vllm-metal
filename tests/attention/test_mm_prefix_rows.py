@@ -34,7 +34,7 @@ def _random_batch(
             cursor = max(0, seq_len - n - 100)  # blocks may start in the context
             for _ in range(int(rng.integers(0, 4))):
                 start = cursor + int(rng.integers(0, 40))
-                length = int(rng.integers(2, 80))  # never a one-token block
+                length = int(rng.integers(1, 80))
                 seg_ranges.append((start, start + length))
                 cursor = start + length + 1
         cu.append(cu[-1] + n)
@@ -83,11 +83,15 @@ def test_block_head_in_context_is_clipped_to_the_chunk_rows() -> None:
     assert rows.tolist() == [[4, 7], [4, 7], [-1, -1], [-1, -1]]
 
 
-def test_one_token_block_yields_an_inclusive_pair() -> None:
-    """Our contract keeps a 1-token block; vLLM would drop the inclusive (p, p)."""
-    rows = build_mm_prefix_rows([0, 3], [3], [[(1, 2)]])
+def test_one_token_blocks_are_dropped() -> None:
+    """A lone token's block row is causal; vLLM drops the inclusive (p, p) too."""
+    assert build_mm_prefix_rows([0, 3], [3], [[(1, 2)]]) is None
+    # DiffusionGemma: every canvas in the batch is one token long, which the
+    # tiled kernel would refuse (no multi-token segment).
+    assert build_mm_prefix_rows([0, 1, 2], [11, 31], [[(10, 11)], [(30, 31)]]) is None
+    rows = build_mm_prefix_rows([0, 1, 4], [11, 33], [[(10, 11)], [(30, 33)]])
     assert rows is not None
-    assert rows.tolist() == [[-1, -1], [1, 1], [-1, -1]]
+    assert rows.tolist() == [[-1, -1], [30, 32], [30, 32], [30, 32]]
 
 
 def test_decode_rows_and_text_segments_stay_minus_one() -> None:
@@ -115,10 +119,14 @@ def _fallback_warnings(caplog, calls) -> int:
     metal_logger = logging.getLogger("vllm_metal")
     mm_prefix_module._warn_kernel_path_unavailable.cache_clear()
     metal_logger.addHandler(caplog.handler)
+    propagate = metal_logger.propagate
+    # Count each record once, whether or not vLLM has configured logging.
+    metal_logger.propagate = False
     try:
         for value, supported in calls:
             resolve_mm_prefix_path(value, supported)
     finally:
+        metal_logger.propagate = propagate
         metal_logger.removeHandler(caplog.handler)
     return caplog.text.count("predate mm_prefix")
 

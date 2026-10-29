@@ -9,12 +9,19 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+import torch
 from mlx_lm.models.base import scaled_dot_product_attention
 
 import vllm_metal.attention.runtime.mla as mla_runtime
+from tests.stub_runner import (
+    initialize_hybrid_runtime,
+    initialize_mla_runtime,
+    make_bailing_hybrid_plan,
+)
 from vllm_metal.attention import context as pac
 from vllm_metal.attention.caches.mla_cache import MLAPagedLatentCache
 from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 
@@ -548,6 +555,83 @@ class TestMLAPagedAttentionWrapperPagedPath:
 
         assert bool(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
 
+    def test_bailing_shared_padded_cache_matches_mlx_lm(self) -> None:
+        from mlx_lm.models.bailing_moe_v3 import BailingMLA, ModelArgs
+        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.models.cache import KVCache
+
+        mx.random.seed(29)
+        args = ModelArgs(
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=4,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            max_position_embeddings=32,
+        )
+        inner = BailingMLA(args)
+        reference_cache = KVCache()
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=make_bailing_hybrid_plan(
+                2, state_dtypes=(torch.float32, torch.float32)
+            ),
+            dtype=mx.float32,
+        )
+        initialize_hybrid_runtime(
+            runtime,
+            3,
+            block_size=4,
+            head_dim=args.kv_lora_rank + args.qk_rope_head_dim,
+            mla=True,
+        )
+        runtime.zero_blocks([0, 1, 2])
+        mx.eval(*runtime.storage.buffers)
+        paged_cache = runtime.kv_cache
+        assert not paged_cache.has_dense_pages
+        wrapper = MLAPagedAttentionWrapper(inner, 0, paged_cache)
+
+        def run_paged(tokens: mx.array, *, offset: int, context_len: int) -> mx.array:
+            num_tokens = tokens.shape[1]
+            pac.set_context(
+                pac.PagedAttentionContext(
+                    slot_mapping=list(range(offset, offset + num_tokens)),
+                    block_tables=[[0, 1]],
+                    context_lens=[context_len],
+                    offsets=[offset],
+                    cu_seqlens=[0, num_tokens],
+                )
+            )
+            try:
+                return wrapper(tokens)
+            finally:
+                pac.clear_context()
+
+        prefill = mx.random.normal((1, 5, args.hidden_size)).astype(mx.float32)
+        expected_prefill = inner(
+            prefill,
+            mask=create_causal_mask(prefill.shape[1]),
+            cache=reference_cache,
+        )
+        actual_prefill = run_paged(prefill, offset=0, context_len=5)
+
+        decode = mx.random.normal((1, 1, args.hidden_size)).astype(mx.float32)
+        expected_decode = inner(decode, cache=reference_cache)
+        actual_decode = run_paged(decode, offset=5, context_len=6)
+        mx.eval(actual_prefill, expected_prefill, actual_decode, expected_decode)
+
+        assert bool(mx.allclose(actual_prefill, expected_prefill, rtol=1e-5, atol=1e-5))
+        assert bool(mx.allclose(actual_decode, expected_decode, rtol=1e-5, atol=1e-5))
+        rebound = MLAPagedLatentCache.from_upstream(
+            runtime.storage, ["layers.1.self_attn"]
+        )
+        mx.eval(rebound.latent_caches[0])
+        assert bool(
+            mx.array_equal(rebound.latent_caches[0], paged_cache.latent_caches[0])
+        )
+
 
 # Single-pass kernel dimensions (matches mla.metal instantiation).
 _KERNEL_KV_RANK = 512
@@ -611,6 +695,7 @@ class TestDecodePathLog:
         *,
         kernel_env: bool,
         kv_lora_rank: int = _KERNEL_KV_RANK,
+        patches: int = 1,
     ) -> list[str]:
         monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", kernel_env)
         inners = [_KernelDimsAbsorbedInner() for _ in range(2)]
@@ -625,7 +710,8 @@ class TestDecodePathLog:
             dtype=mx.float16,
         )
         backend.initialize(4)
-        backend.patch_model(model)
+        for _ in range(patches):
+            backend.patch_model(model)
         info = MagicMock()
         monkeypatch.setattr(mla_runtime.logger, "info", info)
         backend.warm_up()
@@ -634,13 +720,23 @@ class TestDecodePathLog:
     def test_logs_the_kernel(self, monkeypatch) -> None:
         lines = self._warm_up(monkeypatch, kernel_env=True)
 
-        assert "Metal: MLA decode uses the single-pass Metal kernel" in lines
+        assert "Metal: MLA decode-only batches take the single-pass Metal kernel" in (
+            lines
+        )
 
     def test_logs_the_env_switch_when_off(self, monkeypatch) -> None:
         lines = self._warm_up(monkeypatch, kernel_env=False)
 
         assert (
-            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
+            "(VLLM_METAL_MLA_KERNEL is off)"
+        ) in lines
+
+    def test_a_repatch_counts_each_layer_once(self, monkeypatch) -> None:
+        lines = self._warm_up(monkeypatch, kernel_env=False, patches=2)
+
+        assert (
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
             "(VLLM_METAL_MLA_KERNEL is off)"
         ) in lines
 
@@ -648,7 +744,7 @@ class TestDecodePathLog:
         lines = self._warm_up(monkeypatch, kernel_env=True, kv_lora_rank=256)
 
         assert (
-            "Metal: MLA decode uses the MLX SDPA path on 2 of 2 layers "
+            "Metal: MLA decode-only batches take the MLX SDPA path on 2 of 2 layers "
             "(kv_lora_rank 256, the kernel takes 512)"
         ) in lines
 
@@ -678,6 +774,24 @@ class TestSinglePassRouting:
                 wrapper._inner, wrapper._mla_latent_cache, _make_decode_ctx()
             )
             is True
+        )
+
+    @pytest.mark.parametrize("padded", [False, True])
+    def test_shared_cache_requires_dense_pages(self, monkeypatch, padded) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        runtime = HybridPagedAttentionRuntime(
+            hybrid_plan=make_bailing_hybrid_plan(2, head_dim=128 if padded else 4),
+            dtype=mx.float16,
+        )
+        initialize_hybrid_runtime(
+            runtime, 2, block_size=16, head_dim=_LATENT_DIM, mla=True
+        )
+        cache = runtime.kv_cache
+        wrapper = MLAPagedAttentionWrapper(_KernelDimsAbsorbedInner(), 0, cache)
+
+        assert (
+            wrapper._can_use_kernel(wrapper._inner, cache, _make_decode_ctx())
+            is not padded
         )
 
     def test_non_absorbed_rejects(self, monkeypatch) -> None:
@@ -776,6 +890,42 @@ class TestSinglePassRouting:
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch_size)
             == expected_g
         )
+
+
+class TestSharedStorageRuntime:
+    """Standalone MLA binds latent views of vLLM's shared KV allocation."""
+
+    def _make_backend(self) -> MLAPagedAttentionRuntime:
+        return initialize_mla_runtime(6, num_layers=2)
+
+    def test_binds_dense_views_the_kernel_admits(self, monkeypatch) -> None:
+        monkeypatch.setattr("vllm_metal.envs.VLLM_METAL_MLA_KERNEL", True)
+        backend = self._make_backend()
+        cache = backend._cache
+
+        assert backend.num_blocks() == 6
+        assert backend.kv_scheduler_group_indices() == (0,)
+        assert backend.kv_group_block_sizes() == (16,)
+        assert cache.latent_caches[1].shape == (6, 16, _LATENT_DIM)
+        wrapper = MLAPagedAttentionWrapper(_KernelDimsAbsorbedInner(), 0, cache)
+        assert wrapper._can_use_kernel(wrapper._inner, cache, _make_decode_ctx())
+
+    def test_copy_blocks_reach_the_shared_backing(self) -> None:
+        backend = self._make_backend()
+        cache = backend._cache
+        rows = mx.random.normal((16, _LATENT_DIM)).astype(mx.float16)
+        for layer in range(2):
+            cache.write_slots(layer, mx.arange(16, 32), rows + layer)  # block 1
+
+        backend.copy_blocks([(1, 4)])
+        outputs: list[mx.array] = []
+        backend.extend_forward_eval_outputs(outputs)
+        mx.eval(*outputs)
+
+        names = ["layers.0.self_attn", "layers.1.self_attn"]
+        rebound = MLAPagedLatentCache.from_upstream(backend.storage, names)
+        for layer in range(2):
+            assert bool(mx.array_equal(rebound.latent_caches[layer][4], rows + layer))
 
 
 class TestMLAPerForwardMetadata:

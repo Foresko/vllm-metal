@@ -5,7 +5,6 @@ Run explicitly with ``pytest -m slow tests/test_draft_lookahead_e2e.py``.
 Each case owns one engine in a spawned process; Metal is not fork-safe.
 """
 
-import multiprocessing as mp
 import os
 
 import pytest
@@ -141,19 +140,7 @@ def _run_lookahead_lifecycle(prefix_caching, target_model="Qwen/Qwen3-0.6B"):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("prefix_caching", [False, True])
-def test_draft_lookahead_preemption_and_cancellation_e2e(prefix_caching):
-    process = mp.get_context("spawn").Process(
-        target=_run_lookahead_lifecycle, args=(prefix_caching,)
-    )
-    process.start()
-    try:
-        process.join(timeout=300)
-        assert not process.is_alive(), "Draft lookahead serving test timed out"
-        assert process.exitcode == 0, "Draft lookahead serving test failed"
-    finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=10)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=10)
+def test_draft_lookahead_preemption_and_cancellation_e2e(
+    prefix_caching, run_in_spawn_process
+):
+    run_in_spawn_process(_run_lookahead_lifecycle, prefix_caching)

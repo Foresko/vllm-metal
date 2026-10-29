@@ -71,6 +71,32 @@ class _RecordingLanguageModel:
         return SimpleNamespace(logits=mx.zeros((1, input_ids.shape[1], 8)))
 
 
+class _RecordingBackbone:
+    """Headless ``language_model.model`` stub for ``call_lm_hidden_states``."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.embed_tokens = lambda input_ids: input_ids + 1
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        *,
+        inputs_embeds: mx.array,
+        cache: list[Any],
+        position_ids: mx.array,
+    ) -> Any:
+        self.calls.append(
+            {
+                "input_ids": input_ids,
+                "inputs_embeds": inputs_embeds,
+                "cache": cache,
+                "position_ids": position_ids,
+            }
+        )
+        return mx.zeros((1, input_ids.shape[1], 4))
+
+
 class _RecordingVisual:
     def __init__(self, *, weight_dtype: mx.Dtype = mx.float32) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -156,6 +182,7 @@ def _adapter(
         visual=visual,
         language_model=language_model,
         embed_tokens_fn=language_model.model.embed_tokens,
+        backbone=language_model.model,
     )
 
 
@@ -468,9 +495,68 @@ class TestPaddleOCRVLMultimodalAdapterCallLm:
             )
 
 
+class TestPaddleOCRVLMultimodalAdapterCallLmHiddenStates:
+    def test_calls_backbone_without_head(self) -> None:
+        language_model = _RecordingLanguageModel()
+        backbone = _RecordingBackbone()
+        language_model.model = backbone
+        adapter = _adapter(language_model=language_model)
+        input_ids = mx.array([[1, 2]], dtype=mx.int32)
+        inputs_embeds = mx.ones((1, 2, 8), dtype=mx.float32)
+        position_ids = mx.zeros((3, 1, 2), dtype=mx.int32)
+        cache = [object()]
+
+        output = adapter.call_lm_hidden_states(
+            input_ids, inputs_embeds, cache, position_ids
+        )
+
+        assert output.shape == (1, 2, 4)
+        assert language_model.call_lm_calls == []
+        call = backbone.calls[0]
+        assert call["input_ids"] is input_ids
+        assert call["inputs_embeds"] is inputs_embeds
+        assert call["cache"] is cache
+        assert call["position_ids"] is position_ids
+
+    def test_rejects_unexpected_deepstack(self) -> None:
+        adapter = _adapter()
+
+        with pytest.raises(RuntimeError, match="does not expose deepstack"):
+            adapter.call_lm_hidden_states(
+                mx.array([[1]], dtype=mx.int32),
+                mx.ones((1, 1, 8), dtype=mx.float32),
+                [None],
+                mx.zeros((3, 1, 1), dtype=mx.int32),
+                deepstack_visual_embeds=[mx.ones((1, 8))],
+            )
+
+    def test_raises_when_language_model_missing(self) -> None:
+        adapter = PaddleOCRVLMultimodalAdapter(spatial_merge_size=_SPATIAL_MERGE_SIZE)
+
+        with pytest.raises(RuntimeError, match="language_model not loaded"):
+            adapter.call_lm_hidden_states(
+                mx.array([[1]], dtype=mx.int32),
+                mx.ones((1, 1, 8), dtype=mx.float32),
+                [None],
+                mx.zeros((3, 1, 1), dtype=mx.int32),
+            )
+
+    def test_raises_when_backbone_missing_or_not_callable(self) -> None:
+        adapter = _adapter()
+
+        with pytest.raises(RuntimeError, match="language_model.model"):
+            adapter.call_lm_hidden_states(
+                mx.array([[1]], dtype=mx.int32),
+                mx.ones((1, 1, 8), dtype=mx.float32),
+                [None],
+                mx.zeros((3, 1, 1), dtype=mx.int32),
+            )
+
+
 class TestPaddleOCRVLMultimodalAdapterFromLoadedModel:
     def test_from_loaded_model_resolves_components(self) -> None:
         language_model = _RecordingLanguageModel()
+        language_model.model = _RecordingBackbone()
         visual = _RecordingVisual()
         model = SimpleNamespace(
             config=SimpleNamespace(
@@ -486,7 +572,30 @@ class TestPaddleOCRVLMultimodalAdapterFromLoadedModel:
         input_ids = mx.array([[1]], dtype=mx.int32)
         assert adapter.embed_tokens(input_ids).tolist() == [[2]]
 
+    def test_from_loaded_model_requires_callable_backbone(self) -> None:
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+            ),
+            visual=_RecordingVisual(),
+            language_model=_RecordingLanguageModel(),
+        )
+
+        with pytest.raises(RuntimeError, match="not callable"):
+            PaddleOCRVLMultimodalAdapter.from_loaded_model(model)
+
     def test_requires_explicit_positions(self) -> None:
         # PaddleOCR-VL's LM derives positions from model-level state, so
         # the runner must route text-only batches through the mm forward.
         assert PaddleOCRVLMultimodalAdapter.requires_explicit_positions is True
+
+    def test_text_path_selective_logits_flag(self) -> None:
+        # ``text_model()`` returns the very object the runner's
+        # ``supports_selective_logits`` probe exercises, so the gate
+        # ``call_lm_hidden_states`` rides on stays open.
+        assert PaddleOCRVLMultimodalAdapter.text_path_selective_logits_ok is True
+
+        from vllm_metal.v1.model_runner import text_path_selective_logits_allowed
+
+        adapter = PaddleOCRVLMultimodalAdapter(spatial_merge_size=2)
+        assert text_path_selective_logits_allowed(True, adapter) is True
